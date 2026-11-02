@@ -1,0 +1,9 @@
+/target
+/build-ref-sp
+/build-ref-dp
+/xfoil-ref
+/bench/out
+/work
+/refsrc
+*.foiley.tmp
+/bench/*.log
