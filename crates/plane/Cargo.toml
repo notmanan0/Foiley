@@ -1,0 +1,13 @@
+[package]
+name = "foiley-plane"
+description = "Wing and plane geometry, meshing and 3D potential-flow analysis (LLT, VLM, panel method, stability) for Foiley"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foiley-core.workspace = true
+foiley-foil.workspace = true
+rayon.workspace = true
+serde.workspace = true
+quick-xml.workspace = true
