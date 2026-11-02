@@ -1,0 +1,22 @@
+[package]
+name = "foiley-gui"
+description = "Foiley Studio - graphical interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "foiley-studio"
+path = "src/main.rs"
+
+[dependencies]
+foiley-core.workspace = true
+foiley-foil.workspace = true
+foiley-plane.workspace = true
+foiley-app.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mimalloc.workspace = true
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui_plot = "0.34"
+rfd = "0.15"
