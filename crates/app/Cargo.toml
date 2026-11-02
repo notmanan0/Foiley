@@ -1,0 +1,14 @@
+[package]
+name = "foiley-app"
+description = "Project model, background job manager and file exchange shared by the Foiley CLI and GUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foiley-core.workspace = true
+foiley-foil.workspace = true
+foiley-plane.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
