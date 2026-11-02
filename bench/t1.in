@@ -1,0 +1,13 @@
+PLOP
+G F
+
+NACA 2412
+OPER
+VISC 1e6
+ITER 100
+PACC
+pol_ref.txt
+
+ASEQ -4 12 1
+
+QUIT
