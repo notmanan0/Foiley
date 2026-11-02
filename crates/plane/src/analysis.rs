@@ -758,7 +758,7 @@ pub fn mesh_options(def: &PlanePolarDef, extra_flaps: &HashMap<(usize, usize), f
     for (k, v) in extra_flaps {
         *flaps.entry(*k).or_insert(0.0) += v;
     }
-    MeshOptions { thick: def.method.is_panel(), include_fuse: def.include_fuse, flaps, tilts: tilts.clone(), allow_missing_foils: def.allow_missing_foils, triangulate: matches!(def.method, Method::TriPanel | Method::TriLinear), fuse_in_thin: false }
+    MeshOptions { thick: def.method.is_panel(), include_fuse: def.include_fuse, flaps, tilts: tilts.clone(), allow_missing_foils: def.allow_missing_foils, triangulate: matches!(def.method, Method::TriPanel | Method::TriLinear), fuse_in_thin: false, flap_normals: matches!(def.method, Method::Vlm1 | Method::Vlm2) }
 }
 
 /// Build and factor the solver for a mesh.

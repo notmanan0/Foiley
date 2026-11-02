@@ -362,3 +362,38 @@ fn tri_panels_with_fuselage_consistent_with_quads() {
         assert!(b.cdi >= 0.0 && a.cdi >= 0.0);
     }
 }
+
+#[test]
+fn part_span_flap_increment_is_linear_and_matches_between_lattices() {
+    // a flap with plain wing inboard and outboard of it: its lift increment
+    // must not depend on alpha (a lattice is linear), and VLM1 and VLM2 agree
+    let mut ff = Foil::naca("0012").unwrap();
+    ff.name = "flap 0012".into();
+    ff.hinge = Some((0.7, 0.5));
+    let mut dbx = db().clone();
+    dbx.add_foil(&ff);
+    let sec = |y: f64, foil: &str| {
+        let mut s = WingSection::new(y, 1.0, 0.0, foil);
+        s.nx = 12;
+        s.ny = 6;
+        s.ydist = Spacing::Uniform;
+        s
+    };
+    let secs = vec![sec(0.0, "NACA 0012"), sec(1.0, "flap 0012"), sec(2.0, "flap 0012"), sec(3.0, "NACA 0012")];
+    let p = Plane { name: "part-span flap".into(), description: String::new(), wings: vec![Wing::new("w", WingKind::Main, secs)], fuses: vec![], point_masses: vec![] };
+    let dcl = |method: Method| -> Vec<f64> {
+        let cl = |d: f64| {
+            let def = PlanePolarDef { method, viscous: false, reference: RefDims::Planform, flaps: vec![((0, 0), d), ((0, 1), d)], range: Range { from: -6.0, to: 10.0, step: 8.0 }, ..Default::default() };
+            run_polar(&p, &dbx, &def, &Progress::none(), &|_| {}).unwrap().points.iter().map(|q| q.cl).collect::<Vec<_>>()
+        };
+        cl(10.0).iter().zip(cl(0.0)).map(|(a, b)| a - b).collect()
+    };
+    let (v1, v2) = (dcl(Method::Vlm1), dcl(Method::Vlm2));
+    for d in [&v1, &v2] {
+        assert!(d[0] > 0.1, "flap down must add lift: {d:?}");
+        assert!((d[2] - d[0]).abs() < 0.02 * d[0], "flap increment changes with alpha: {d:?}");
+    }
+    for (a, b) in v1.iter().zip(&v2) {
+        assert!((a - b).abs() < 0.03 * a, "VLM1 {v1:?} vs VLM2 {v2:?}");
+    }
+}
