@@ -320,4 +320,23 @@ mod tests {
         assert_eq!(m.wait(c.id, |_| {}), JobStatus::Cancelled);
         assert!(matches!(a.take_output(), Some(JobOutput::FoilPolar { .. })));
     }
+
+    #[test]
+    fn running_batch_job_cancels_promptly() {
+        let mut m = JobManager::new(0);
+        let foils = vec![Foil::naca("4412").unwrap()];
+        let cases = foiley_foil::batch::re_list_geometric(5e4, 1e6, 40).into_iter().flat_map(|re| [7.0, 8.0, 9.0].map(|ncrit| BatchCase { re, mach: 0.0, ncrit })).collect();
+        let j = m.submit("batch", JobKind::Batch { foils, cases, settings: AnalysisSettings::default(), sweep: Sweep::Alpha { from: -10.0, to: 12.0, step: 0.5 } });
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(j.status(), JobStatus::Running);
+        let t = Instant::now();
+        let before = j.progress.fraction();
+        j.cancel();
+        assert_eq!(m.wait(j.id, |_| {}), JobStatus::Cancelled);
+        let after = j.progress.fraction();
+        println!("batch job stopped {:.2} s after cancel, progress {:.0}% -> {:.0}%", t.elapsed().as_secs_f64(), before * 100.0, after * 100.0);
+        assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
+        // polars skipped by the cancel must not count as done
+        assert!(after < 0.9, "progress jumped to {after}");
+    }
 }

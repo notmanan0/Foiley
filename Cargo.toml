@@ -36,8 +36,8 @@ rayon = "1.10"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 4
+lto = "fat"
+codegen-units = 1
 # unwind (not abort) so that a numerical failure inside one solve can be
 # caught and reported instead of taking down the GUI or a long batch run.
 panic = "unwind"
