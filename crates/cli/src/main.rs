@@ -1446,7 +1446,9 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
                     print!("{}", plane_polar_table(&pol));
                     if let Some(d) = &outdir {
                         std::fs::write(d.join(format!("{}_{}.csv", pol.plane.replace(' ', "_"), pol.name)), pol.to_csv()).map_err(|e| e.to_string())?;
-                        std::fs::write(d.join(format!("{}_{}_strips.csv", pol.plane.replace(' ', "_"), pol.name)), strips_csv(&pol)).map_err(|e| e.to_string())?;
+                        if pol.points.iter().any(|q| !q.strips.is_empty()) {
+                            std::fs::write(d.join(format!("{}_{}_strips.csv", pol.plane.replace(' ', "_"), pol.name)), strips_csv(&pol)).map_err(|e| e.to_string())?;
+                        }
                     }
                     proj.add_plane_polar(pol);
                 }
