@@ -448,7 +448,7 @@ impl App {
                 check(ui, "stability derivatives at every point", &mut d.derivatives, "computes derivatives and modes for each point (needs mass); always on for T7");
                 check(ui, "keep panel Cp for 3D colour maps", &mut d.keep_cp, "uses memory for large meshes");
                 if matches!(d.method, Method::Vlm1 | Method::Vlm2) {
-                    int(ui, "free-wake iterations", &mut d.free_wake, 0..=20, "0 = rigid wake along x (fast, linear). >0 relaxes the trailing vortices along the local flow at every point (slower; shown in the 3D view)");
+                    int(ui, "free-wake iterations", &mut d.free_wake, 0..=usize::MAX,"0 = rigid wake along x (fast, linear). >0 relaxes the trailing vortices along the local flow at every point (slower; shown in the 3D view)");
                 }
             });
         });

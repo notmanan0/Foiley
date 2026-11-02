@@ -827,8 +827,11 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
                     .enumerate()
                     .map(|(k, &(a, b, v))| {
                         rest.check()?;
-                        let r = solve_point(&ctx, &sys, &mesh, cog, mass, a, b, v);
-                        rest.part(k, n).set(1.0);
+                        let part = rest.part(k, n);
+                        let r = solve_point(&ctx, &sys, &mesh, cog, mass, a, b, v, &part);
+                        if !matches!(r, Err(PlaneError::Cancelled)) {
+                            part.set(1.0);
+                        }
                         match &r {
                             Ok(Some(p)) => {
                                 rest.count_ok();
@@ -868,7 +871,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
 }
 
 #[allow(clippy::too_many_arguments)]
-fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha: f64, beta: f64, v_spec: f64) -> Result<Option<PlaneOpp>, PlaneError> {
+fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha: f64, beta: f64, v_spec: f64, prog: &Progress) -> Result<Option<PlaneOpp>, PlaneError> {
     let def = ctx.def;
     let wd = wind_dir(alpha, beta);
     let v = match def.kind {
@@ -883,7 +886,7 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
     };
     let (raw, wake) = match (sys, def.free_wake) {
         (System::Vlm(s), it) if it > 0 => {
-            let (g, fw) = s.solve_free_wake(wd * v, it, def.wake_length * ctx.c_ref, 24, &Progress::none())?;
+            let (g, fw) = s.solve_free_wake(wd * v, it, def.wake_length * ctx.c_ref, 24, prog)?;
             (s.loads(&g, wd * v, Vec3::ZERO), fw.lines.iter().map(|l| l.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect()).collect())
         }
         _ => (sys.loads(wd * v, Vec3::ZERO), vec![]),
