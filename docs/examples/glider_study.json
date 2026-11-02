@@ -1,0 +1,22 @@
+{
+  "save": "glider_study.foiley",
+  "output_dir": "glider_results",
+  "steps": [
+    { "naca": "2412" },
+    { "naca": "0009" },
+    { "foil_polar": { "foil": "NACA 2412",
+                      "settings": { "re": 300000, "ncrit": 9 },
+                      "sweep": { "Alpha": { "from": -4, "to": 14, "step": 0.5 } } } },
+    { "batch": { "foils": ["NACA 2412", "NACA 0009"],
+                 "re": [50000, 100000, 200000, 400000, 800000],
+                 "sweep": { "Alpha": { "from": -8, "to": 16, "step": 0.5 } } } },
+    { "import": "glider.xml" },
+    { "plane_polar": { "def": { "kind": "FixedLift", "method": "Vlm2",
+                                "range": { "from": 0, "to": 10, "step": 1 } } } },
+    { "plane_polar": { "def": { "kind": "Stability", "method": "Vlm2",
+                                "range": { "from": 0, "to": 0, "step": 1 } } } },
+    { "plane_polar": { "def": { "kind": "Control", "method": "Vlm2", "alpha": 3, "velocity": 12,
+                                "range": { "from": 0, "to": 1, "step": 0.5 },
+                                "ranges": [ { "target": "CogX", "min": 0.12, "max": 0.17 } ] } } }
+  ]
+}
