@@ -265,6 +265,9 @@ pub struct PlanePolarDef {
     pub llt: LltSettings,
     /// keep panel Cp in the results (memory heavy for big meshes)
     pub keep_cp: bool,
+    /// keep the span distributions (strips) in the results; turn off for
+    /// large sweeps, where they dominate memory and project size
+    pub keep_strips: bool,
     /// VLM free-wake relaxation iterations (0 = rigid wake along x)
     pub free_wake: usize,
     /// treat foils without loaded geometry as flat plates
@@ -300,6 +303,7 @@ impl Default for PlanePolarDef {
             wake_ratio: 1.1,
             llt: LltSettings::default(),
             keep_cp: true,
+            keep_strips: true,
             allow_missing_foils: false,
             free_wake: 0,
         }
@@ -801,6 +805,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
         let pts = crate::llt::run(&ctx, prog, on_point, &mut polar.failed)?;
         polar.points = pts;
         polar.unknowns = def.llt.stations;
+        drop_strips(&mut polar);
         return Ok(polar);
     }
     match def.kind {
@@ -866,8 +871,18 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
     for f in &polar.failed {
         prog.warn(f.clone());
     }
+    drop_strips(&mut polar);
     prog.set(1.0);
     Ok(polar)
+}
+
+/// Remove the span distributions when the definition does not keep them.
+fn drop_strips(polar: &mut PlanePolar) {
+    if polar.def.as_ref().is_some_and(|d| !d.keep_strips) {
+        for p in &mut polar.points {
+            p.strips = Vec::new();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
