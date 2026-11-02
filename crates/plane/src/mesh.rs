@@ -125,7 +125,8 @@ pub struct Strip {
     pub te_low: usize,
     #[serde(default)]
     pub te_up: usize,
-    /// second TE panel of a triangulated quad (Kutta uses the mean)
+    /// second triangle of a TE quad (uniform doublets use the mean; linear
+    /// doublets take the trace from the triangle that owns the TE segment)
     #[serde(default)]
     pub te_low2: Option<usize>,
     #[serde(default)]

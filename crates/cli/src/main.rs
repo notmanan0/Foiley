@@ -401,7 +401,7 @@ enum PlaneCmd {
         /// t1 fixed speed, t2 fixed lift, t3 glide, t4 fixed alpha, t5 sideslip, t7 stability, t8 list
         #[arg(long = "type", default_value = "t1")]
         ptype: String,
-        /// llt, vlm1, vlm2, panel (quads) or tripanel (triangles)
+        /// llt, vlm1, vlm2, panel (quads), tripanel (uniform triangles), trilinear (Galerkin)
         #[arg(long, default_value = "vlm2")]
         method: String,
         /// VLM free-wake relaxation iterations (0 = rigid wake)
@@ -1159,7 +1159,8 @@ fn real_main() -> Result<(), String> {
                     "vlm2" | "vlm" => Method::Vlm2,
                     "panel" | "panels" | "3dpanel" => Method::Panel,
                     "tripanel" | "triangles" | "tri" => Method::TriPanel,
-                    m => return Err(format!("unknown method '{m}' (llt, vlm1, vlm2, panel)")),
+                    "trilinear" => Method::TriLinear,
+                    m => return Err(format!("unknown method '{m}' (llt, vlm1, vlm2, panel, tripanel, trilinear)")),
                 };
                 let (a, b, s) = parse_range(&range)?;
                 let fluid = if water { Fluid::water() } else { let air = isa(altitude, 0.0); Fluid { rho: air.rho, mu: air.mu, a: air.a } };

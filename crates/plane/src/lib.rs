@@ -8,6 +8,7 @@
 //! * [`llt`]: nonlinear lifting-line theory using the 2D polars.
 //! * [`vlm`]: vortex-lattice (horseshoe VLM1 and ring VLM2).
 //! * [`panel`]: constant source/doublet panel method (Dirichlet).
+//! * [`linear_panel`]: Galerkin linear-doublet triangles and a linear TE wake.
 //! * [`analysis`]: polar definitions (types 1-8) and the drivers.
 //! * [`stability`]: stability derivatives, state matrices, modes, time response.
 //! * [`xml`]: import of xflr5 / flow5 plane XML files.
@@ -18,6 +19,7 @@ pub mod export;
 pub mod foildb;
 pub mod geom;
 pub mod llt;
+pub mod linear_panel;
 pub mod mesh;
 pub mod panel;
 pub mod stability;

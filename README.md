@@ -76,6 +76,7 @@ foiley plane info glider.xml                     # xflr5 / flow5 XML or a .foile
 foiley plane analyze glider.xml --type t2 --method vlm2 --range=-2:10:1 --strips span.csv
 foiley plane analyze glider.xml --type t7 --gain 1,0,5 --gain 1,1,5 --response doublet:0.5 --response-out r.csv
 foiley plane analyze glider.xml --method tripanel --inviscid --speed 20 -f json -o out.json
+foiley plane analyze glider.xml --method trilinear --inviscid --range=0:6:2  # Galerkin linear doublets
 foiley plane analyze glider.xml --free-wake 4 --range 2:8:2            # relaxed VLM wake
 foiley plane import-fuselage glider.xml --file body.step --units auto --mass 0.3 --save g.foiley
 foiley plane export g.foiley --avl g.avl --mass g.mass --stl g.stl --xml g.xml
@@ -147,7 +148,7 @@ files.
 | Foil optimiser: MOPSO and genetic algorithm, Hicks–Henne bumps, flap, multi-objective with Pareto archive | ✔ |
 | Planes: multi-section wings, dihedral, twist, sweep, fins, flaps (control surfaces), point masses, inertia | ✔ |
 | Fuselages: elliptic frames, NURBS (xflr5/flow5 frames), STL and STEP surfaces | ✔ (STEP: B-spline/NURBS surfaces and planar faces; other analytic surface types are skipped with a note) |
-| LLT, VLM1, VLM2, 3D panels on quads and on triangles (uniform source + doublet, Dirichlet), ground effect | ✔ (flow5's linear-doublet Galerkin triangle variant is not included) |
+| LLT, VLM1, VLM2, 3D panels on quads and triangles, Galerkin linear-doublet triangles, ground effect | ✔ |
 | Free (relaxed) wake for VLM | ✔ |
 | Polar types T1 fixed speed, T2 fixed lift, T3 glide, T4 fixed α, T5 sideslip, T6 control, T7 stability, T8 list | ✔ |
 | Stability derivatives, control derivatives, state matrices, modes, root locus, modal and forced time responses | ✔ |
@@ -193,6 +194,10 @@ in xflr5 and flow5; use VLM or panels for swept or dihedral wings.
 * With a fuselage, the induced drag stays positive and scales with CL², because
   circulation is carried across the fuselage.
 * Ground effect reduces induced drag and increases lift.
+* Galerkin linear-doublet triangles (`crates/plane/tests/trilinear.rs`) pass
+  thin-wing lift-slope, trailing-edge pressure, mesh and quadrature refinement,
+  symmetry, camber, ground, fuselage and flap checks. See
+  [the formulation and validation limits](docs/TRILINEAR.md).
 * The free wake stays within 5% of the rigid-wake lift and trails downwards.
 * The sideslip response is antisymmetric.
 * LLT and VLM agree to within 12% in the linear range.
@@ -248,6 +253,11 @@ pressures, as flow5 does. Far-field forces converge much faster with
 chordwise panel count. In the default 3D methods all operating points of a
 polar share one LU factorisation. `docs/PORTING.md` documents the XFoil port
 conventions.
+
+`trilinear` uses three independent doublet values per triangle, linear
+Galerkin test functions, and a wake tied to the actual trailing-edge values.
+Select it in the GUI's method list or use `"method": "TriLinear"` in JSON jobs.
+It needs more memory and computation than `tripanel`; start with fewer panels.
 
 ## Reference sources
 
