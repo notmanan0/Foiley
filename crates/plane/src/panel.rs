@@ -129,6 +129,20 @@ pub struct WakeColumn {
     pub panels: Vec<Panel>,
 }
 
+/// Doublets for one operating point from the unit solutions u, v, w, p, q, r.
+pub(crate) fn combine_unit(unit: &[Vec<f64>; 6], vinf: Vec3, omega: Vec3) -> Vec<f64> {
+    let c = [vinf.x, vinf.y, vinf.z, omega.x, omega.y, omega.z];
+    let mut mu = vec![0.0; unit[0].len()];
+    for k in 0..6 {
+        if c[k] != 0.0 {
+            for (m, u) in mu.iter_mut().zip(&unit[k]) {
+                *m += c[k] * u;
+            }
+        }
+    }
+    mu
+}
+
 fn mean_mu(mu: &[f64], ids: &[usize]) -> f64 {
     ids.iter().map(|&i| mu[i]).sum::<f64>() / ids.len().max(1) as f64
 }
@@ -198,7 +212,7 @@ pub struct PanelSystem<'a> {
     pub mesh: &'a Mesh,
     pub cog: Vec3,
     pub wake: Vec<WakeColumn>,
-    /// unit doublet solutions: u, v, w, p, q, r (per panel, or per vertex for linear doublets)
+    /// unit doublet solutions: u, v, w, p, q, r (one value per panel)
     pub unit_mu: [Vec<f64>; 6],
     pub ground: Option<f64>,
 }
@@ -326,17 +340,7 @@ impl<'a> PanelSystem<'a> {
     }
 
     pub fn solve(&self, vinf: Vec3, omega: Vec3) -> Vec<f64> {
-        let c = [vinf.x, vinf.y, vinf.z, omega.x, omega.y, omega.z];
-        let n = self.unit_mu[0].len();
-        let mut mu = vec![0.0; n];
-        for k in 0..6 {
-            if c[k] != 0.0 {
-                for (m, u) in mu.iter_mut().zip(&self.unit_mu[k]) {
-                    *m += c[k] * u;
-                }
-            }
-        }
-        mu
+        combine_unit(&self.unit_mu, vinf, omega)
     }
 
     /// Tangential gradient of mu on each panel (least squares on neighbours).

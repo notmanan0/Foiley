@@ -364,7 +364,8 @@ impl App {
                 Method::Llt => "Fast and nonlinear (captures stall from the 2D polars); main wing only, no sweep/dihedral effects.",
                 Method::Vlm1 | Method::Vlm2 => "Thin-surface vortex lattice: whole plane, fuselage ignored. Good default for performance and stability.",
                 Method::Panel => "Thick surfaces with source/doublet panels; includes the fuselage. Slower; use fewer panels.",
-                Method::TriPanel => "Like 3D panels, on triangles (as flow5); required for STL/STEP fuselages.",
+                Method::TriPanel => "Like 3D panels, on triangles (as flow5). STL/STEP fuselages need a triangle method: this one or linear doublets.",
+                Method::TriLinear => "Linear doublets on triangles with Galerkin testing and a linear trailing-edge wake. Three unknowns per triangle; use a coarser mesh initially.",
             },
         );
         egui::Grid::new("def3").num_columns(2).show(ui, |ui| {

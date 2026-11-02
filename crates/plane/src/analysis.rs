@@ -3,6 +3,7 @@
 
 use crate::foildb::FoilDb;
 use crate::geom::{Inertia, Plane};
+use crate::linear_panel::LinearPanelSystem;
 use crate::mesh::{build, Mesh, MeshOptions};
 use crate::panel::PanelSystem;
 use crate::stability::{self, StabilityResult};
@@ -28,13 +29,19 @@ pub enum Method {
     Panel,
     /// 3D source/doublet panels on triangles (flow5 default; also STL/STEP bodies)
     TriPanel,
+    /// Discontinuous linear-doublet triangles with Galerkin testing.
+    TriLinear,
 }
 
 impl Method {
-    pub const ALL: [Method; 5] = [Method::Llt, Method::Vlm1, Method::Vlm2, Method::Panel, Method::TriPanel];
+    pub const ALL: [Method; 6] = [Method::Llt, Method::Vlm1, Method::Vlm2, Method::Panel, Method::TriPanel, Method::TriLinear];
     /// Thick-surface methods (panels on both sides of the wings, fuselage included).
     pub fn is_panel(self) -> bool {
-        matches!(self, Method::Panel | Method::TriPanel)
+        matches!(self, Method::Panel | Method::TriPanel | Method::TriLinear)
+    }
+    /// Number of algebraic unknowns for a panel mesh (LLT uses its station count).
+    pub fn unknowns(self, panels: usize) -> usize {
+        panels * if self == Method::TriLinear { 3 } else { 1 }
     }
     pub fn label(self) -> &'static str {
         match self {
@@ -43,6 +50,7 @@ impl Method {
             Method::Vlm2 => "VLM2 - ring vortices (recommended)",
             Method::Panel => "3D panels - thick surfaces + fuselage",
             Method::TriPanel => "3D panels on triangles (uniform doublets)",
+            Method::TriLinear => "3D panels on triangles (linear doublets, Galerkin)",
         }
     }
     pub fn short(self) -> &'static str {
@@ -52,6 +60,7 @@ impl Method {
             Method::Vlm2 => "VLM2",
             Method::Panel => "Panel",
             Method::TriPanel => "TriPanel",
+            Method::TriLinear => "TriLinear",
         }
     }
 }
@@ -366,21 +375,27 @@ impl RawLoads {
             }
         }
         let wdir = vinf.normalized();
-        let mut ind = Vec3::ZERO;
-        for (s, (g, w)) in mesh.strips.iter().zip(sg.iter().zip(&tre)) {
-            let f = w.cross(s.te_b - s.te_a) * *g;
-            ind += wdir * f.dot(wdir);
-        }
-        // circulation carried across fuselages
-        for (a, b, g) in crate::vlm::carry_segments(mesh, &sg) {
-            let w = crate::vlm::trefftz_velocity(mesh, &sg, (a + b) * 0.5, wdir, None);
-            let f = w.cross(b - a) * g;
-            ind += wdir * f.dot(wdir);
-        }
+        let ind = trefftz_force(mesh, &sg, &tre, wdir, &crate::vlm::carry_segments(mesh, &sg), |m| crate::vlm::trefftz_velocity(mesh, &sg, m, wdir, None));
         let v2 = vinf.norm2().max(1e-30);
         let cp = mesh.panels.iter().zip(&panel_force).map(|(p, f)| -f.dot(p.normal) / (0.5 * v2 * p.area.max(1e-30))).collect();
         RawLoads { panel_force, force, moment, strip_gamma: sg, strip_wi: tre, strip_force, induced_force: ind, cp, mu: vec![] }
     }
+}
+
+/// Induced-drag force from the half-Trefftz velocities `tre` at the strips and
+/// `carry_w` at the centre of each fuselage carry-through segment (a, b, gamma).
+pub(crate) fn trefftz_force(mesh: &Mesh, sg: &[f64], tre: &[Vec3], wdir: Vec3, carry: &[(Vec3, Vec3, f64)], carry_w: impl Fn(Vec3) -> Vec3) -> Vec3 {
+    let mut ind = Vec3::ZERO;
+    for (s, (g, w)) in mesh.strips.iter().zip(sg.iter().zip(tre)) {
+        let f = w.cross(s.te_b - s.te_a) * *g;
+        ind += wdir * f.dot(wdir);
+    }
+    // circulation carried across fuselages
+    for &(a, b, g) in carry {
+        let f = carry_w((a + b) * 0.5).cross(b - a) * g;
+        ind += wdir * f.dot(wdir);
+    }
+    ind
 }
 
 /// Results for one spanwise strip.
@@ -517,6 +532,7 @@ pub fn wind_side(alpha: f64, beta: f64) -> Vec3 {
 pub enum System<'a> {
     Vlm(VlmSystem<'a>),
     Panel(PanelSystem<'a>),
+    TriLinear(LinearPanelSystem<'a>),
 }
 
 impl<'a> System<'a> {
@@ -527,18 +543,21 @@ impl<'a> System<'a> {
                 s.loads(&g, vinf, omega)
             }
             System::Panel(s) => s.loads(vinf, omega),
+            System::TriLinear(s) => s.loads(vinf, omega),
         }
     }
     pub fn mesh(&self) -> &Mesh {
         match self {
             System::Vlm(s) => s.lat.mesh,
             System::Panel(s) => s.mesh,
+            System::TriLinear(s) => s.mesh,
         }
     }
     pub fn cog(&self) -> Vec3 {
         match self {
             System::Vlm(s) => s.cog,
             System::Panel(s) => s.cog,
+            System::TriLinear(s) => s.cog,
         }
     }
 }
@@ -739,7 +758,7 @@ pub fn mesh_options(def: &PlanePolarDef, extra_flaps: &HashMap<(usize, usize), f
     for (k, v) in extra_flaps {
         *flaps.entry(*k).or_insert(0.0) += v;
     }
-    MeshOptions { thick: def.method.is_panel(), include_fuse: def.include_fuse, flaps, tilts: tilts.clone(), allow_missing_foils: def.allow_missing_foils, triangulate: def.method == Method::TriPanel, fuse_in_thin: false }
+    MeshOptions { thick: def.method.is_panel(), include_fuse: def.include_fuse, flaps, tilts: tilts.clone(), allow_missing_foils: def.allow_missing_foils, triangulate: matches!(def.method, Method::TriPanel | Method::TriLinear), fuse_in_thin: false }
 }
 
 /// Build and factor the solver for a mesh.
@@ -747,6 +766,7 @@ pub fn make_system<'a>(def: &PlanePolarDef, mesh: &'a Mesh, cog: Vec3, c_ref: f6
     Ok(match def.method {
         Method::Vlm1 | Method::Vlm2 => System::Vlm(VlmSystem::build(mesh, def.method == Method::Vlm2, cog, def.ground_height, prog)?),
         Method::Panel | Method::TriPanel => System::Panel(PanelSystem::build(mesh, cog, def.wake_length * c_ref, def.wake_panels, def.wake_ratio, def.ground_height, prog)?),
+        Method::TriLinear => System::TriLinear(LinearPanelSystem::build(mesh, cog, def.wake_length * c_ref, def.wake_panels, def.wake_ratio, def.ground_height, prog)?),
         Method::Llt => return Err(PlaneError::Input("LLT has no panel system".into())),
     })
 }
@@ -789,7 +809,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
         _ => {
             prog.stage("Meshing");
             let mesh = build(plane, db, &mesh_options(def, &HashMap::new(), &HashMap::new()))?;
-            polar.unknowns = mesh.panels.len();
+            polar.unknowns = def.method.unknowns(mesh.panels.len());
             prog.info(format!("mesh: {} panels, {} strips", mesh.panels.len(), mesh.strips.len()));
             let sys = make_system(def, &mesh, cog, ctx.c_ref, &prog.sub(0.0, 0.5))?;
             let ops: Vec<(f64, f64, f64)> = match def.kind {
@@ -934,7 +954,7 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
             }
         }
         let mesh = build(ctx.plane, ctx.db, &mesh_options(def, &flaps, &tilts))?;
-        polar.unknowns = mesh.panels.len();
+        polar.unknowns = def.method.unknowns(mesh.panels.len());
         let sys = make_system(def, &mesh, inertia.cog, ctx.c_ref, &sub.sub(0.0, 0.9))?;
         let raw = sys.loads(wind_dir(a, b) * v, Vec3::ZERO);
         let mut opp = ctx.reduce(&mesh, &raw, inertia.cog, a, b, v, inertia.mass);
@@ -975,7 +995,7 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
             }
         }
         let mesh = build(ctx.plane, ctx.db, &mesh_options(def, &flaps, &tilts))?;
-        polar.unknowns = mesh.panels.len();
+        polar.unknowns = def.method.unknowns(mesh.panels.len());
         let sys = make_system(def, &mesh, cog, ctx.c_ref, &sub.sub(0.0, 0.7))?;
         match stability::trim(ctx, &sys, cog, def.beta) {
             Some((alpha, u0)) => {
