@@ -65,7 +65,10 @@ pub fn run_batch(
                 Err(FoilError::Cancelled) => {}
                 Err(e) => sub.error(format!("failed: {e}")),
             }
-            sub.set(1.0);
+            // skipped polars must not advance the bar, or a cancelled batch reads 100%
+            if !matches!(polar, Err(FoilError::Cancelled)) {
+                sub.set(1.0);
+            }
             let r = BatchResult { foil: f.name.clone(), case: c, polar };
             on_done(&r);
             r
@@ -95,5 +98,23 @@ mod tests {
             }
         }
         assert!((p.fraction() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn low_re_batch_cancels_promptly() {
+        let foils = vec![Foil::naca("4412").unwrap()];
+        let cases: Vec<BatchCase> = re_list_geometric(5e4, 1e6, 40).into_iter().flat_map(|re| [7.0, 8.0, 9.0].map(|ncrit| BatchCase { re, mach: 0.0, ncrit })).collect();
+        let p = Progress::new();
+        let started = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                p.cancel();
+            });
+            run_batch(&foils, &cases, &AnalysisSettings::default(), &Sweep::Alpha { from: -10.0, to: 12.0, step: 0.5 }, &p, &|_| {});
+        });
+        let t = started.elapsed();
+        println!("batch returned {:.2} s after start (cancelled at 0.3 s)", t.as_secs_f64());
+        assert!(t.as_secs_f64() < 1.5, "cancellation took {t:?}");
     }
 }
