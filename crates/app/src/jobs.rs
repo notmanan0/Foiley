@@ -335,7 +335,9 @@ mod tests {
         assert_eq!(m.wait(j.id, |_| {}), JobStatus::Cancelled);
         let after = j.progress.fraction();
         println!("batch job stopped {:.2} s after cancel, progress {:.0}% -> {:.0}%", t.elapsed().as_secs_f64(), before * 100.0, after * 100.0);
-        assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
+        // cancellation lands between points; unoptimised builds solve ~10x slower
+        let limit = Duration::from_secs(if cfg!(debug_assertions) { 15 } else { 2 });
+        assert!(t.elapsed() < limit, "took {:?}", t.elapsed());
         // polars skipped by the cancel must not count as done
         assert!(after < 0.9, "progress jumped to {after}");
     }

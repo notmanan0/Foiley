@@ -658,7 +658,7 @@ impl App {
                     egui::Grid::new("batch").num_columns(2).show(ui, |ui| {
                         num(ui, "Re from", &mut self.fui.batch_re[0], 1e3, 1e3..=1e9, "lowest Reynolds number");
                         num(ui, "Re to", &mut self.fui.batch_re[1], 1e4, 1e3..=1e9, "highest Reynolds number");
-                        int(ui, "count (geometric)", &mut self.fui.batch_count, 1..=40, "number of Reynolds numbers, geometrically spaced");
+                        int(ui, "count (geometric)", &mut self.fui.batch_count, 1..=usize::MAX, "number of Reynolds numbers, geometrically spaced (rounded to 1000; duplicates are dropped)");
                         ui.label("Mach list");
                         ui.text_edit_singleline(&mut self.fui.batch_mach);
                         ui.end_row();
