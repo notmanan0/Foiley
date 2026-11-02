@@ -1,0 +1,12 @@
+[package]
+name = "foiley-foil"
+description = "Airfoil geometry and robust XFoil-based 2D analysis for Foiley"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+foiley.workspace = true
+foiley-core.workspace = true
+rayon.workspace = true
+serde.workspace = true
