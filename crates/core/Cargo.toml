@@ -1,0 +1,11 @@
+[package]
+name = "foiley-core"
+description = "Shared math, progress reporting and cancellation for Foiley"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+faer.workspace = true
+rayon.workspace = true
