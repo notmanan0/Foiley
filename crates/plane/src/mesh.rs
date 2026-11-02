@@ -193,6 +193,14 @@ pub struct MeshOptions {
     pub triangulate: bool,
     /// display only: add fuselage panels to thin meshes too
     pub fuse_in_thin: bool,
+    /// thin meshes: deflect flaps by turning the flap panels' normals about
+    /// the hinge instead of moving their nodes (the small-disturbance model
+    /// of AVL).  The vortex lattices use it: with the nodes moved, the ring
+    /// sides of a deflected flap and of the undeflected wing beside it,
+    /// which carry the chordwise running sum of circulation, separate at the
+    /// flap's side edge into a close vortex pair whose strength grows with
+    /// the lift, so VLM2's flap increments fell with angle of attack.
+    pub flap_normals: bool,
 }
 
 struct SurfGrid {
@@ -326,6 +334,7 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                 }
                 // flap
                 let mut flap_id = None;
+                let mut normal_turn: Option<(Vec3, f64)> = None;
                 if let (Some((xh, ya, yb)), Some(_)) = (hinge, flap_from) {
                     let ha = fi.point(xh, sha.lower_at(xh) + ya * (sha.upper_at(xh) - sha.lower_at(xh)));
                     let hb = fo.point(xh, shb.lower_at(xh) + yb * (shb.upper_at(xh) - shb.lower_at(xh)));
@@ -338,7 +347,11 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                     mesh.flaps.push(FlapInfo { wing: iw, index: idx, name: format!("{} flap {} ({side})", wing.name, idx + 1), hinge_a: h_a, hinge_b: h_b });
                     flap_id = Some(id);
                     if let Some(d) = opt.flaps.get(&(iw, idx)) {
-                        if d.abs() > 1e-9 {
+                        if d.abs() > 1e-9 && opt.flap_normals && !opt.thick {
+                            // vortex-lattice model: the sheet stays where it is and
+                            // the flap panels' normals turn (see MeshOptions::flap_normals)
+                            normal_turn = Some(((h_b - h_a).normalized(), d * DEG));
+                        } else if d.abs() > 1e-9 {
                             let axis = (h_b - h_a).normalized();
                             let ang = d * DEG;
                             let ff = g.flap_from.unwrap();
@@ -406,6 +419,10 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                         p.trailing = trail;
                         if flap {
                             p.flap = flap_id;
+                            if let Some((axis, ang)) = normal_turn {
+                                p.normal = p.normal.rot_axis(axis, ang);
+                                p.l = p.m.cross(p.normal);
+                            }
                         }
                         mesh.panels.push(p);
                         mesh.panels.len() - 1
