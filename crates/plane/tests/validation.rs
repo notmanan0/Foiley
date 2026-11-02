@@ -291,6 +291,28 @@ fn free_wake_close_to_rigid_and_rolls_down() {
 }
 
 #[test]
+fn long_free_wake_cancels() {
+    let p = rect("thin", 8.0, 4, 16);
+    let mut d = inviscid(Method::Vlm2, 6.0);
+    d.free_wake = 1_000_000;
+    let db = db(); // built lazily (2D polars): keep it out of the timing
+    let prog = Progress::new();
+    let t = std::time::Instant::now();
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            prog.cancel();
+        });
+        run_polar(&p, db, &d, &prog, &|_| {})
+    });
+    assert!(matches!(r, Err(foiley_plane::PlaneError::Cancelled)), "{r:?}");
+    // cancellation lands between iterations (a full rebuild and LU each)
+    let limit = if cfg!(debug_assertions) { 10.0 } else { 1.0 };
+    assert!(t.elapsed().as_secs_f64() < 0.3 + limit, "took {:?}", t.elapsed());
+    assert!(prog.fraction() < 0.9, "cancelled point counted as done: {}", prog.fraction());
+}
+
+#[test]
 fn control_derivatives_and_forced_response() {
     let mut p = Plane::default_plane("NACA 2412", "NACA 0009");
     let mut ff = Foil::naca("0009").unwrap();
