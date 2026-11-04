@@ -127,8 +127,9 @@ mod tests {
         });
         let t = started.elapsed();
         println!("batch returned {:.2} s after start (cancelled at 0.3 s)", t.as_secs_f64());
-        // cancellation lands between points; unoptimised builds solve ~10x slower
-        let limit = if cfg!(debug_assertions) { 15.0 } else { 1.5 };
+        // cancellation lands between points; unoptimised builds solve ~10x slower,
+        // and shared CI runners take 2-3 s for what takes 0.5 s here.
+        let limit = if cfg!(debug_assertions) { 15.0 } else if std::env::var_os("CI").is_some() { 6.0 } else { 1.5 };
         assert!(t.as_secs_f64() < limit, "cancellation took {t:?}");
     }
 }
