@@ -644,6 +644,9 @@ pub struct PlaneOpp {
     pub cp: Vec<f32>,
     pub warnings: Vec<String>,
     pub stability: Option<StabilityResult>,
+    /// why `stability` is missing when derivatives were asked for
+    #[serde(default)]
+    pub stability_error: Option<String>,
     /// root bending moment of the main wing, N.m
     pub root_bending: f64,
     /// relaxed wake lines (free-wake VLM), for display
@@ -938,6 +941,7 @@ impl<'a> Ctx<'a> {
             cp: if self.def.keep_cp { raw.cp.iter().map(|c| *c as f32).collect() } else { vec![] },
             warnings,
             stability: None,
+            stability_error: None,
             root_bending,
             wake: vec![],
             balance_residual: None,
@@ -962,6 +966,26 @@ pub fn make_system<'a>(def: &PlanePolarDef, mesh: &'a Mesh, cog: Vec3, c_ref: f6
         Method::TriLinear => System::TriLinear(LinearPanelSystem::build(mesh, cog, def.wake_length * c_ref, def.wake_panels, def.wake_ratio, def.ground_height, prog)?),
         Method::Llt => return Err(PlaneError::Input("LLT has no panel system".into())),
     })
+}
+
+/// Run the stability analysis for a point, recording a failure on the point
+/// (`stability_error` plus a warning) instead of dropping it.
+fn attach_stability(opp: &mut PlaneOpp, res: Result<StabilityResult, PlaneError>) {
+    match res {
+        Ok(s) => opp.stability = Some(s),
+        Err(e) => {
+            let msg = format!("stability analysis failed: {e}");
+            opp.warnings.push(msg.clone());
+            opp.stability_error = Some(msg);
+        }
+    }
+}
+
+/// Stability needs a mass; say so on the point when it is missing.
+fn stability_needs_mass(opp: &mut PlaneOpp) {
+    let msg = "stability derivatives not computed: the plane has no mass (set masses or an inertia override)".to_string();
+    opp.warnings.push(msg.clone());
+    opp.stability_error = Some(msg);
 }
 
 /// Why an operating point is not reportable, if any coefficient is not finite.
@@ -1140,8 +1164,13 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
     if let Some(why) = nonfinite_reason(&opp) {
         return Ok(Err(why));
     }
-    if def.derivatives && mass > 0.0 {
-        opp.stability = stability::analyse(ctx, sys, cog, alpha, opp.velocity).ok();
+    if def.derivatives {
+        if mass > 0.0 {
+            let res = stability::analyse(ctx, sys, cog, alpha, opp.velocity);
+            attach_stability(&mut opp, res);
+        } else {
+            stability_needs_mass(&mut opp);
+        }
     }
     Ok(Ok(opp))
 }
@@ -1197,9 +1226,13 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
             polar.failed.push(format!("ctrl {t:.3}: {why}"));
             continue;
         }
-        if def.derivatives && inertia.mass > 0.0 {
-            let c2 = Ctx { inertia, ..Ctx::new(ctx.plane, ctx.db, def)? };
-            opp.stability = stability::analyse(&c2, &sys, inertia.cog, a, v).ok();
+        if def.derivatives {
+            if inertia.mass > 0.0 {
+                let c2 = Ctx { inertia, ..Ctx::new(ctx.plane, ctx.db, def)? };
+                attach_stability(&mut opp, stability::analyse(&c2, &sys, inertia.cog, a, v));
+            } else {
+                stability_needs_mass(&mut opp);
+            }
         }
         sub.set(1.0);
         prog.count_ok();
@@ -1266,15 +1299,15 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
                                     _ => {}
                                 }
                             }
-                            if let Ok(m2) = build(ctx.plane, ctx.db, &mesh_options(def, &f2, &t2)) {
-                                if let Ok(s2) = make_system(def, &m2, cog, ctx.c_ref, &Progress::none()) {
-                                    stability::add_control_derivatives(ctx, &sys, &s2, &mut s, dt);
-                                }
+                            match build(ctx.plane, ctx.db, &mesh_options(def, &f2, &t2)).and_then(|m2| make_system(def, &m2, cog, ctx.c_ref, &Progress::none()).map(|s2| stability::add_control_derivatives(ctx, &sys, &s2, &mut s, dt))) {
+                                Ok(()) => {}
+                                Err(PlaneError::Cancelled) => return Err(PlaneError::Cancelled),
+                                Err(e) => opp.warnings.push(format!("control derivatives not computed: {e}")),
                             }
                         }
                         opp.stability = Some(s)
                     }
-                    Err(e) => opp.warnings.push(format!("stability analysis failed: {e}")),
+                    Err(e) => attach_stability(&mut opp, Err(e)),
                 }
                 prog.count_ok();
                 prog.info(format!("ctrl {t:.3}: trimmed at alpha={alpha:.3} deg, V={u0:.3} m/s, CL={:.4}", opp.cl));
