@@ -228,7 +228,8 @@ fn panel_method_with_fuselage_runs() {
     assert!(r.points.iter().all(|o| o.cp.iter().all(|c| c.is_finite())));
 }
 
-const FLOW5_EX: &str = "../../refsrc/flow5/API_examples";
+/// flow5 example CAD files (GPL-3.0, copied from flow5's API_examples)
+const CAD_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/cad");
 
 #[test]
 fn triangle_panels_match_quad_panels() {
@@ -258,9 +259,9 @@ fn nurbs_fuselage_and_cad_imports() {
     let r = run(&p, &PlanePolarDef { method: Method::Panel, viscous: false, range: Range { from: 2.0, to: 2.0, step: 1.0 }, ..Default::default() });
     assert_eq!(r.points.len(), 1);
     // CAD fuselages (flow5 example files): STL and STEP of the same body
-    let stl = std::path::Path::new(FLOW5_EX).join("PlaneRun5/stl/pw5_fuse.stl");
-    let stp = std::path::Path::new(FLOW5_EX).join("PlaneRun6/step/pw5_2024-06-27T20_19_49.010Z.stp");
-    if stl.exists() && stp.exists() {
+    let stl = std::path::Path::new(CAD_DIR).join("pw5_fuse.stl");
+    let stp = std::path::Path::new(CAD_DIR).join("pw5_2024-06-27T20_19_49.010Z.stp");
+    {
         let t1 = foiley_plane::cad::read_stl(&std::fs::read(&stl).unwrap()).unwrap();
         let (t2, notes) = foiley_plane::cad::read_step(&std::fs::read_to_string(&stp).unwrap(), 3).unwrap();
         let (a, b) = (foiley_plane::cad::bbox(&t1), foiley_plane::cad::bbox(&t2));
