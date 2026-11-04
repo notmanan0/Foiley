@@ -168,7 +168,7 @@ pub fn required(plane: &Plane, db: &FoilDb, def: &PlanePolarDef) -> Result<Cover
             let mut alpha = s.alpha;
             if s.trim {
                 // first stable Cm = 0 crossing on a 1 deg scan
-                let cm = |a: f64| ctx.reduce(&mesh, &sys.loads(wind_dir(a, s.beta), Vec3::ZERO), cog, a, s.beta, 1.0, s.mass).cm;
+                let cm = |a: f64| ctx.reduce(&mesh, &sys.loads(wind_dir(a, s.beta), Vec3::ZERO), cog, a, s.beta, 1.0, s.mass, None).cm;
                 let mut prev = (-10.0, cm(-10.0));
                 let mut found = None;
                 let mut a = -9.0;
@@ -202,7 +202,7 @@ pub fn required(plane: &Plane, db: &FoilDb, def: &PlanePolarDef) -> Result<Cover
             }
             n += 1;
             let raw = sys.loads(wind_dir(alpha, s.beta) * v, Vec3::ZERO);
-            let opp = ctx.reduce(&mesh, &raw, cog, alpha, s.beta, v, s.mass);
+            let opp = ctx.reduce(&mesh, &raw, cog, alpha, s.beta, v, s.mass, None);
             for (st, r) in mesh.strips.iter().zip(&opp.strips) {
                 amin = amin.min(r.alpha_eff);
                 amax = amax.max(r.alpha_eff);
