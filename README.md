@@ -135,8 +135,9 @@ the Jobs and Log panel is always visible at the bottom.
   sine control inputs (T7 gains give the control derivatives).
 
 `foiley-studio project.foiley --module 3d` opens a project in a given
-workspace. File › Import also reads xflr5 `.xfl`, flow5 `.fl5` and `.plr`
-files.
+workspace. File › Import also reads xflr5 `.xfl`, flow5 `.fl5`, `.plr` and
+AVL `.avl` files, and shows a conversion report (what was mapped,
+approximated and skipped, and why); `foiley project` prints the same report.
 
 ## Feature coverage compared with xflr5 / flow5
 
@@ -152,7 +153,7 @@ files.
 | Free (relaxed) wake for VLM | ✔ |
 | Polar types T1 fixed speed, T2 fixed lift, T3 glide, T4 fixed α, T5 sideslip, T6 control, T7 stability, T8 list | ✔ |
 | Stability derivatives, control derivatives, state matrices, modes, root locus, modal and forced time responses | ✔ |
-| Import: xflr5 `.xfl` and flow5 `.fl5` projects (foils, polars, planes), `.plr` polars, plane/wing XML, `.dat`, XFoil polar text | ✔ (projects' 3D polars and operating points are not imported; the readers were tested against byte streams built from the C++ write code, not real project files) |
+| Import: xflr5 `.xfl` and flow5 `.fl5` projects (foils, polars, planes, plane polar definitions), `.plr` polars, AVL `.avl` geometry, plane/wing XML, `.dat`, XFoil polar text | ✔ (plane polar results and operating points are not imported; every import lists what it mapped, approximated and skipped; the readers were tested against byte streams built from the C++ write code and hand-written minimal files, not real project files) |
 | Export: AVL `.avl` and `.mass`, STL mesh, xflr5 XML, `.dat`, XFoil polar text, CSV, JSON | ✔ |
 
 LLT treats the wing as straight and planar (sweep and dihedral are ignored), as

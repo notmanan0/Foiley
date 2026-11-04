@@ -98,6 +98,12 @@ pub struct FoilPolar {
     /// taken from the stored fields and its hash computed on load
     #[serde(default)]
     pub legacy: bool,
+    /// panel nodes the points were solved on (0 = not recorded)
+    #[serde(default)]
+    pub nodes: usize,
+    /// `foil::node_hash` of those nodes (0 = not recorded)
+    #[serde(default)]
+    pub node_hash: u64,
 }
 
 impl FoilPolar {

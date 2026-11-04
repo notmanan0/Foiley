@@ -203,6 +203,26 @@ impl Foil {
         Ok(xf)
     }
 
+    /// Build an XFoil engine with the panel nodes `input` asks for: PANGEN
+    /// ([`Foil::engine`]) or the coordinates themselves (XFoil LOAD + PCOP).
+    pub fn engine_nodes(&self, input: &NodeInput) -> Result<XFoil, FoilError> {
+        if let NodeInput::Pangen(p) = input {
+            return self.engine(p);
+        }
+        self.validate()?;
+        let n = self.n();
+        if n > IQX - 5 {
+            return Err(FoilError::Geometry(format!("'{}' has {n} points: preserving them as panel nodes allows at most {}; use PANGEN paneling", self.name, IQX - 5)));
+        }
+        let mut xf = quiet_engine();
+        xf.set_buffer(&one_based(&self.x), &one_based(&self.y), n, &self.name);
+        xf.abcopy(false);
+        if xf.n < 10 {
+            return Err(FoilError::Geometry(format!("'{}': fewer than 10 distinct panel nodes", self.name)));
+        }
+        Ok(xf)
+    }
+
     /// Repanel with XFoil's curvature-based distribution.
     pub fn repaneled(&self, pan: &Paneling) -> Result<Foil, FoilError> {
         let xf = self.engine(pan)?;
@@ -441,6 +461,76 @@ impl Default for Paneling {
     fn default() -> Self {
         Paneling { panels: 160, le_bunching: 1.0, te_bunching: 0.15, refined_ratio: 0.2 }
     }
+}
+
+/// Where the solver's panel nodes come from (`AnalysisSettings::paneling`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NodeInput {
+    /// XFoil PANE: PANGEN repanels the input coordinates by curvature
+    Pangen(Paneling),
+    /// XFoil LOAD + PCOP: the input coordinates are the panel nodes
+    /// (repeated consecutive points are dropped, as PCOP does)
+    Preserve,
+}
+
+impl Default for NodeInput {
+    fn default() -> Self {
+        NodeInput::Pangen(Paneling::default())
+    }
+}
+
+impl NodeInput {
+    /// PANGEN parameters, if any.
+    pub fn pangen(&self) -> Option<&Paneling> {
+        match self {
+            NodeInput::Pangen(p) => Some(p),
+            NodeInput::Preserve => None,
+        }
+    }
+}
+
+/// Serialized as the PANGEN parameters (as `Paneling` was before) or as the
+/// string "preserve".
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum NodeInputRepr {
+    Pangen(Paneling),
+    Mode(String),
+}
+
+impl Serialize for NodeInput {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            NodeInput::Pangen(p) => NodeInputRepr::Pangen(*p),
+            NodeInput::Preserve => NodeInputRepr::Mode("preserve".into()),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeInput {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match NodeInputRepr::deserialize(d)? {
+            NodeInputRepr::Pangen(p) => Ok(NodeInput::Pangen(p)),
+            NodeInputRepr::Mode(m) if m.eq_ignore_ascii_case("preserve") => Ok(NodeInput::Preserve),
+            NodeInputRepr::Mode(m) => Err(serde::de::Error::custom(format!("unknown paneling '{m}' (expected PANGEN parameters or \"preserve\")"))),
+        }
+    }
+}
+
+/// FNV-1a (64 bit) over the IEEE bits of the node coordinates, in order
+/// x1, y1, x2, y2, ...: identical nodes give the same hash on every platform.
+pub fn node_hash(x: &[f64], y: &[f64]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (a, b) in x.iter().zip(y) {
+        for v in [a.to_bits(), b.to_bits()] {
+            for byte in v.to_le_bytes() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    h
 }
 
 #[cfg(test)]

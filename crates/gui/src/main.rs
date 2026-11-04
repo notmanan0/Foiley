@@ -10,6 +10,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod body_list;
 mod foil_ui;
 mod plane_ui;
 mod view3d;
@@ -175,7 +176,7 @@ impl App {
                     Err(e) => app.notify(e, true),
                 }
             } else {
-                match app.project.import(&f) {
+                match import_file(&mut app.project, &f) {
                     Ok(m) => app.notify(format!("imported {m}"), false),
                     Err(e) => app.notify(e, true),
                 }
@@ -268,8 +269,9 @@ impl App {
 
     fn import_dialog(&mut self) {
         if let Some(files) = rfd::FileDialog::new()
-            .add_filter("All supported", &["dat", "txt", "xml", "pol", "foiley", "json", "xfl", "fl5", "plr"])
+            .add_filter("All supported", &["dat", "txt", "xml", "pol", "foiley", "json", "xfl", "fl5", "plr", "avl"])
             .add_filter("xflr5 / flow5 projects and polars", &["xfl", "fl5", "plr"])
+            .add_filter("AVL geometry", &["avl"])
             .add_filter("Airfoil coordinates", &["dat", "txt"])
             .add_filter("xflr5 / flow5 plane", &["xml"])
             .add_filter("XFoil polar", &["txt", "pol"])
@@ -277,7 +279,7 @@ impl App {
         {
             self.snapshot();
             for f in files {
-                match self.project.import(&f) {
+                match import_file(&mut self.project, &f) {
                     Ok(m) => {
                         self.notify(format!("imported {m}"), false);
                         if f.extension().map(|e| e == "xml").unwrap_or(false) {
@@ -744,4 +746,14 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("Foiley Studio", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+
+/// Import a file into the project.  xflr5 / flow5 projects, .plr polars and
+/// AVL geometry return their full conversion report as the message.
+fn import_file(p: &mut Project, f: &std::path::Path) -> Result<String, String> {
+    if foiley_app::legacy_io::is_interchange(f) {
+        foiley_app::legacy_io::import_into(p, f).map(|r| r.text().trim_end().to_string())
+    } else {
+        p.import(f)
+    }
 }

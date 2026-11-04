@@ -16,7 +16,7 @@
 //! attached-flow branch.  Long sweeps are split into independent chunks that
 //! run on separate threads (each chunk again marching away from zero).
 
-use crate::foil::{Foil, Paneling};
+use crate::foil::{node_hash, Foil, NodeInput};
 use crate::polar::{FoilPoint, FoilPolar};
 use crate::FoilError;
 use foiley::sweep::{polar_point, solve_point};
@@ -125,8 +125,9 @@ pub struct AnalysisSettings {
     pub max_iter: usize,
     /// viscous acceleration parameter (XFoil VACC, default 0.01)
     pub vaccel: f64,
-    /// paneling
-    pub paneling: Paneling,
+    /// panel nodes: PANGEN repaneling (XFoil PANE) or the input
+    /// coordinates as they are (XFoil LOAD + PCOP)
+    pub paneling: NodeInput,
     /// recover unconverged points (re-init BL, sub-stepping)
     pub recover: bool,
     /// start sweeps from the point nearest zero lift and march outwards
@@ -156,7 +157,7 @@ impl Default for AnalysisSettings {
             flap_hinge: (0.75, 0.5),
             max_iter: 100,
             vaccel: 0.01,
-            paneling: Paneling::default(),
+            paneling: NodeInput::default(),
             recover: true,
             from_zero: true,
             parallel: true,
@@ -282,7 +283,7 @@ fn extract_detail(xf: &XFoil, p: FoilPoint) -> PointDetail {
 
 /// Configure a fresh engine for these settings.
 fn setup_engine(foil: &Foil, st: &AnalysisSettings, re: f64) -> Result<XFoil, FoilError> {
-    let mut xf = foil.engine(&st.paneling)?;
+    let mut xf = foil.engine_nodes(&st.paneling)?;
     xf.lvisc = st.viscous;
     xf.reinf1 = re;
     xf.minf1 = st.mach;
@@ -525,7 +526,15 @@ pub fn analyze(foil: &Foil, st: &AnalysisSettings, sweep: &Sweep, prog: &Progres
         foil_hash: Some(foil.geom_hash()),
         manifest: Some(foiley_core::provenance::RunManifest::new(foiley_core::provenance::hash_json("foiley.settings2d.v1", st), foil.geom_hash())),
         legacy: false,
+        nodes: 0,
+        node_hash: 0,
     };
+    // the nodes every point is solved on (each chunk builds the same engine)
+    {
+        let xf = foil.engine_nodes(&st.paneling)?;
+        polar.nodes = xf.n;
+        polar.node_hash = node_hash(&xf.x[1..=xf.n], &xf.y[1..=xf.n]);
+    }
     let values = sweep.values();
     if values.is_empty() {
         return Ok((polar, vec![]));

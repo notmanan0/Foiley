@@ -3,7 +3,13 @@
 //! * xflr5 v6 project files (`.xfl`, archive formats 200001 / 200002);
 //! * flow5 project files (`.fl5`, archive formats 500001 ..= 501000);
 //! * xflr5 / flow5 2D polar files (`.plr`: xflr5 "v1.99+" format 100000+ and
-//!   the flow5 v7 format 500001).
+//!   the flow5 v7 format 500001);
+//! * AVL geometry files (`.avl`, through `foiley_plane::export::import_avl`).
+//!
+//! Plane polar *definitions* are imported where they map onto Foiley's
+//! (xflr5 `WPolar`, flow5 v7.50+ `PlanePolar`); their computed points are not.
+//! Every reader fills a [`ConversionReport`]: what was mapped, approximated
+//! and skipped, with reasons.  [`import_into`] merges a file into a project.
 //!
 //! All of them are Qt `QDataStream`s.  The project files use the default
 //! stream settings (big-endian, Qt >= 4.6 version, so `float`s are written as
@@ -28,9 +34,12 @@
 use std::fmt::Display;
 use std::path::Path;
 
+use foiley_core::atmosphere::Fluid;
 use foiley_core::{Spacing, Vec3};
 use foiley_foil::{Foil, FoilPoint, FoilPolar};
-use foiley_plane::geom::{FuseFrame, NurbsBody, NurbsFrame};
+use foiley_plane::analysis::{ExtraDrag, Method, PlanePolar, PlanePolarDef, PolarKind, RefDims};
+pub use foiley_plane::export::{ConversionReport, ReportEntry};
+use foiley_plane::geom::{FuseFrame, Inertia, NurbsBody, NurbsFrame};
 use foiley_plane::{Fuse, Plane, PointMass, Wing, WingKind, WingSection};
 
 /// The objects read from a legacy file.
@@ -39,8 +48,12 @@ pub struct LegacyImport {
     pub foils: Vec<Foil>,
     pub polars: Vec<FoilPolar>,
     pub planes: Vec<Plane>,
+    /// plane polar definitions (no results), attached to `planes` by name
+    pub plane_polars: Vec<PlanePolar>,
     /// Non-fatal remarks: skipped objects, approximations, ignored settings.
     pub warnings: Vec<String>,
+    /// what was mapped, approximated and skipped, with reasons
+    pub report: ConversionReport,
 }
 
 type Res<T> = Result<T, String>;
@@ -429,6 +442,211 @@ fn pm(tag: String, mass: f64, position: Vec3) -> PointMass {
 }
 
 // ---------------------------------------------------------------------------
+// plane polar definitions and the conversion report
+// ---------------------------------------------------------------------------
+
+/// A plane polar definition as stored by xflr5 (`WPolar`) or flow5
+/// (`PlanePolar`), before mapping.
+#[derive(Default)]
+struct RawWPolar {
+    source: &'static str,
+    plane: String,
+    name: String,
+    method: Option<Method>,
+    kind: Option<PolarKind>,
+    kind_code: i32,
+    thin: bool,
+    tilted: bool,
+    neumann: bool,
+    viscous: bool,
+    on_the_fly: bool,
+    visc_from_cl: Option<bool>,
+    ignore_body: bool,
+    ground: bool,
+    free_surface: bool,
+    height: f64,
+    density: f64,
+    /// kinematic viscosity, m^2/s
+    kin_visc: f64,
+    refdim: i32,
+    ref_area: f64,
+    ref_chord: f64,
+    ref_span: f64,
+    auto_inertia: bool,
+    mass: f64,
+    cog: Vec3,
+    ixx: f64,
+    iyy: f64,
+    izz: f64,
+    ixz: f64,
+    /// xflr5 stability-polar control gains
+    gains: Vec<f64>,
+    inertia_gains: bool,
+    nx_wake: i32,
+    wake_len: f64,
+    wake_factor: f64,
+    qinf: f64,
+    alpha: f64,
+    beta: f64,
+    phi: f64,
+    extra: Vec<(String, f64, f64)>,
+    /// flow5 preset flap angles, per wing then per flap
+    flaps: Vec<Vec<f64>>,
+    avl_controls: usize,
+    ranges: usize,
+    fuse_drag: bool,
+    vorton: bool,
+    npts: usize,
+}
+
+/// Map a stored plane polar onto a Foiley definition, reporting what does
+/// not map.  `wings` is the number of wings of the imported plane.
+fn map_wpolar(p: RawWPolar, wings: usize, rep: &mut ConversionReport) -> PlanePolar {
+    let id = format!("plane polar '{}' / '{}'", p.plane, p.name);
+    let src = p.source;
+    let mut d = PlanePolarDef { name: p.name.trim().to_string(), ..Default::default() };
+    match p.kind {
+        Some(k) => d.kind = k,
+        None => rep.approx(format!("{id}: polar type {}", p.kind_code), format!("unknown {src} polar type; imported as T1 (fixed speed)")),
+    }
+    match p.method {
+        Some(m) => d.method = m,
+        None => rep.approx(format!("{id}: analysis method"), format!("unknown {src} method; imported as VLM2")),
+    }
+    if p.thin && matches!(d.method, Method::Panel | Method::TriPanel | Method::TriLinear) {
+        rep.approx(format!("{id}: thin-surface panels"), "Foiley's panel methods model thick wing surfaces");
+    }
+    if p.qinf > 0.0 && p.qinf.is_finite() {
+        d.velocity = p.qinf;
+    }
+    d.alpha = p.alpha;
+    d.beta = p.beta;
+    d.viscous = p.viscous;
+    if let Some(v) = p.visc_from_cl {
+        d.viscous_from_cl = v;
+    }
+    d.include_fuse = !p.ignore_body;
+    d.ground_height = p.ground.then_some(p.height);
+    if p.density > 0.0 && p.kin_visc > 0.0 {
+        d.fluid = Fluid { rho: p.density, mu: p.density * p.kin_visc, ..Fluid::default() };
+    } else {
+        rep.approx(format!("{id}: fluid"), "density or viscosity missing; sea-level ISA used");
+    }
+    d.reference = match p.refdim {
+        2 => RefDims::Projected,
+        3 => RefDims::Custom { area: p.ref_area, span: p.ref_span, chord: p.ref_chord },
+        _ => RefDims::Planform,
+    };
+    if !p.auto_inertia {
+        d.inertia = Some(Inertia { mass: p.mass, cog: p.cog, ixx: p.ixx, iyy: p.iyy, izz: p.izz, ixz: p.ixz, ..Default::default() });
+    }
+    if p.nx_wake > 0 {
+        d.wake_panels = p.nx_wake as usize;
+    }
+    if p.wake_len > 0.0 && p.wake_len.is_finite() {
+        d.wake_length = p.wake_len;
+    }
+    if p.wake_factor > 0.0 && p.wake_factor.is_finite() {
+        d.wake_ratio = p.wake_factor;
+    }
+    d.extra_drag = p.extra.iter().filter(|e| e.1 * e.2 != 0.0).map(|e| ExtraDrag { name: e.0.clone(), area: e.1, cd: e.2 }).collect();
+    d.fuse_drag = p.fuse_drag;
+    if p.fuse_drag {
+        rep.approx(format!("{id}: fuselage friction drag"), "Foiley's own estimate (turbulent flat plate x form factor) replaces the stored method");
+    }
+    for (iw, vals) in p.flaps.iter().enumerate() {
+        for (k, v) in vals.iter().enumerate() {
+            if *v != 0.0 {
+                if iw < wings {
+                    d.flaps.push(((iw, k), *v));
+                } else {
+                    rep.skip(format!("{id}: flap angle {v} deg on wing {}", iw + 1), "the plane has no such wing");
+                }
+            }
+        }
+    }
+    if !d.flaps.is_empty() {
+        rep.map(format!("{id}: {} preset flap angle(s) (flaps numbered from the left tip, as in {src})", d.flaps.len()));
+    }
+    if p.tilted {
+        rep.skip(format!("{id}: tilted geometry"), "Foiley turns the freestream, not the geometry");
+    }
+    if p.neumann {
+        rep.skip(format!("{id}: Neumann boundary condition"), "Foiley's panel methods have their own boundary condition");
+    }
+    if p.gains.iter().any(|g| *g != 0.0) {
+        rep.skip(format!("{id}: {} control gain(s)", p.gains.len()), "xflr5 orders stability-polar gains by wing tilt and flap; set the T7 gains in the definition");
+    }
+    if p.inertia_gains {
+        rep.skip(format!("{id}: inertia gains"), "mass and CoG control gains have no T7 equivalent; use a T6 range");
+    }
+    if p.avl_controls > 0 {
+        rep.skip(format!("{id}: {} AVL-type control(s)", p.avl_controls), "set the T7 gains in the definition");
+    }
+    if p.ranges > 0 {
+        rep.skip(format!("{id}: {} control range(s)", p.ranges), "set the T6 ranges in the definition");
+    }
+    if p.on_the_fly {
+        rep.approx(format!("{id}: viscous data computed on the fly"), "Foiley interpolates the project's 2D polars (generate them with the auto-polar tool)");
+    }
+    if p.vorton {
+        rep.skip(format!("{id}: vorton wake"), "use the free-wake relaxation instead");
+    }
+    if p.free_surface {
+        rep.skip(format!("{id}: free-surface effect"), "no free-surface model");
+    }
+    if p.phi != 0.0 {
+        rep.skip(format!("{id}: bank angle {} deg", p.phi), "no bank angle in Foiley definitions");
+    }
+    if d.kind == PolarKind::List {
+        rep.approx(format!("{id}: T8 point list"), "the list is not stored in the definition; add the points in Foiley");
+    }
+    if p.npts > 0 {
+        rep.skip(format!("{id}: {} computed point(s)", p.npts), "results are not imported; run the polar in Foiley");
+    }
+    rep.approx(format!("{id}: sweep range"), format!("{src} does not store the sweep with the definition; the default range is used"));
+    rep.map(format!("{id} -> T{} {} definition", d.kind.number(), d.method.short()));
+    PlanePolar { name: d.name.clone(), plane: p.plane.trim().to_string(), def: Some(d), ..Default::default() }
+}
+
+/// Attach a polar definition to its plane, or report it skipped.
+fn push_wpolar(imp: &mut LegacyImport, p: RawWPolar) {
+    let plane = p.plane.trim().to_string();
+    match imp.planes.iter().find(|pl| pl.name == plane).map(|pl| pl.wings.len()) {
+        Some(nw) => {
+            let mut rep = std::mem::take(&mut imp.report);
+            let pp = map_wpolar(p, nw, &mut rep);
+            imp.report = rep;
+            imp.plane_polars.retain(|q| !(q.plane == pp.plane && q.name == pp.name));
+            imp.plane_polars.push(pp);
+        }
+        None => imp.report.skip(format!("plane polar '{plane}' / '{}'", p.name), "its plane was not imported"),
+    }
+}
+
+/// Fill the report with the objects kept and the reader's remarks.
+fn finish_report(imp: &mut LegacyImport) {
+    let mut mapped: Vec<String> = imp.foils.iter().map(|f| format!("foil '{}'", f.name)).collect();
+    mapped.extend(imp.polars.iter().map(|p| format!("2D polar '{}' / '{}' ({} points)", p.foil, p.name, p.points.len())));
+    mapped.extend(imp.planes.iter().map(|p| format!("plane '{}' ({} wing(s), {} body(ies), {} point mass(es))", p.name, p.wings.len(), p.fuses.len(), p.point_masses.len())));
+    mapped.append(&mut imp.report.mapped);
+    imp.report.mapped = mapped;
+    for w in &imp.warnings {
+        let (item, reason) = match w.split_once(": ") {
+            Some((a, b)) => (a.to_string(), b.to_string()),
+            None => (w.clone(), String::new()),
+        };
+        let l = w.to_lowercase();
+        if l.contains("skipped") || l.contains("ignored") {
+            let reason = if reason.is_empty() { "not supported".to_string() } else { reason };
+            imp.report.skip(item, reason);
+        } else {
+            imp.report.approx(item, reason);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // shared pieces
 // ---------------------------------------------------------------------------
 
@@ -474,7 +692,7 @@ pub fn read_xfl(bytes: &[u8]) -> Result<LegacyImport, String> {
         r.skip_f64s(2, w)?; // alpha, beta
         r.skip_bools(2, w)?;
     } else {
-        xfl_wpolar(&mut r)?;
+        xfl_wpolar(&mut r)?; // the polar dialog's defaults
     }
     let n = r.count("number of planes", 1)?;
     for _ in 0..n {
@@ -486,11 +704,15 @@ pub fn read_xfl(bytes: &[u8]) -> Result<LegacyImport, String> {
     }
     let n = r.count("number of plane polars", 1)?;
     for _ in 0..n {
-        xfl_wpolar(&mut r)?;
+        let p = xfl_wpolar(&mut r)?;
+        push_wpolar(&mut imp, p);
     }
     let n = r.count("number of plane operating points", 1)?;
     for _ in 0..n {
         xfl_popp(&mut r)?;
+    }
+    if n > 0 {
+        imp.report.skip(format!("{n} plane operating point(s)"), "results are not imported; run the polars in Foiley");
     }
     let n = r.count("number of foils", 1)?;
     for _ in 0..n {
@@ -504,6 +726,11 @@ pub fn read_xfl(bytes: &[u8]) -> Result<LegacyImport, String> {
     }
     // foil operating points, the spline foil and the unit provisions follow:
     // nothing we need.
+    if r.remaining() > 0 {
+        imp.report.skip("foil operating points", "results are not imported; rerun the 2D analyses in Foiley");
+    }
+    imp.report.source = "xflr5 v6 project".into();
+    finish_report(&mut imp);
     Ok(imp)
 }
 
@@ -587,13 +814,14 @@ fn xfl_polar(r: &mut Rd) -> Res<RawPolar> {
     Ok(RawPolar { foil, name, ptype, re, mach, ncrit, xtop, xbot, viscous: true, te_flap: 0.0, pts })
 }
 
-/// `WPolar::serializeWPlrXFL` (parsed and discarded).
-fn xfl_wpolar(r: &mut Rd) -> Res<()> {
+/// `WPolar::serializeWPlrXFL`.
+fn xfl_wpolar(r: &mut Rd) -> Res<RawWPolar> {
     let w = "xfl plane polar";
     let fmt = r.fmt(w, 200000, 205000)?;
-    r.qstr(w)?;
-    r.qstr(w)?;
-    r.skip_f64s(3, w)?;
+    let mut p = RawWPolar { source: "xflr5", plane: r.qstr(w)?, name: r.qstr(w)?, ..Default::default() };
+    p.ref_area = r.f64(w)?;
+    p.ref_chord = r.f64(w)?;
+    p.ref_span = r.f64(w)?;
     if fmt < 200014 {
         r.skip_i32s(2, w)?;
         r.color(w)?;
@@ -601,31 +829,81 @@ fn xfl_wpolar(r: &mut Rd) -> Res<()> {
     } else {
         style_xfl(r)?;
     }
-    r.skip_i32s(2, w)?; // method, type
-    r.skip_bools(7, w)?;
-    r.skip_f64s(3, w)?; // height, density, viscosity
-    r.i32(w)?; // reference dimensions
-    r.bool(w)?; // auto inertia
-    r.skip_f64s(8, w)?; // mass, CoG, inertia
+    let method = r.i32(w)?;
+    let ty = r.i32(w)?;
+    let vlm1 = r.bool(w)?;
+    p.thin = r.bool(w)?;
+    p.tilted = r.bool(w)?;
+    p.neumann = !r.bool(w)?;
+    p.viscous = r.bool(w)?;
+    p.ignore_body = r.bool(w)?;
+    p.ground = r.bool(w)?;
+    p.height = r.f64(w)?;
+    p.density = r.f64(w)?;
+    p.kin_visc = r.f64(w)?;
+    p.refdim = r.i32(w)?;
+    p.auto_inertia = r.bool(w)?;
+    p.mass = r.f64(w)?;
+    p.cog = r.v3(w)?;
+    p.ixx = r.f64(w)?;
+    p.iyy = r.f64(w)?;
+    p.izz = r.f64(w)?;
+    p.ixz = r.f64(w)?;
     let at = r.p;
     let nc = r.loose_count("plane polar control count", 8)?;
     if nc > 100 {
         return r.fail(at, w, format_args!("{nc} controls (max 100)"));
     }
-    r.skip_f64s(nc, w)?;
-    r.i32(w)?; // wake panels
-    r.skip_f64s(2, w)?;
-    r.skip_f64s(3, w)?; // QInf, alpha, beta
+    for _ in 0..nc {
+        p.gains.push(r.f64(w)?);
+    }
+    p.nx_wake = r.i32(w)?;
+    p.wake_len = r.f64(w)?;
+    p.wake_factor = r.f64(w)?;
+    p.qinf = r.f64(w)?;
+    p.alpha = r.f64(w)?;
+    p.beta = r.f64(w)?;
     let at = r.p;
     let n = r.i32(w)?;
     if n.abs() > 10000 {
         return r.fail(at, w, format_args!("{n} data points"));
     }
-    let n = n.max(0) as usize;
-    r.skip_f64s(n * 36, w)?;
+    p.npts = n.max(0) as usize;
+    r.skip_f64s(p.npts * 36, w)?;
     r.skip_i32s(20, w)?;
-    r.skip_f64s(35 + 4 + 4 + 7, w)?;
-    Ok(())
+    r.skip_f64s(35, w)?;
+    let mut extra = [(0.0, 0.0); 4];
+    for e in extra.iter_mut() {
+        e.0 = r.f64(w)?;
+    }
+    for e in extra.iter_mut() {
+        e.1 = r.f64(w)?;
+    }
+    if fmt >= 200013 {
+        p.extra = extra.iter().enumerate().filter(|(_, e)| e.0 * e.1 != 0.0).map(|(k, e)| (format!("extra drag {}", k + 1), e.0, e.1)).collect();
+    }
+    for _ in 0..7 {
+        let g = r.f64(w)?;
+        if g != 0.0 && !(g > 42.0 && g < 51.0) {
+            p.inertia_gains = true;
+        }
+    }
+    p.method = match method {
+        1 => Some(Method::Llt),
+        3 => Some(Method::Panel),
+        2 => Some(if vlm1 { Method::Vlm1 } else { Method::Vlm2 }),
+        _ => None,
+    };
+    p.kind_code = ty;
+    p.kind = match ty {
+        1 => Some(PolarKind::FixedSpeed),
+        2 => Some(PolarKind::FixedLift),
+        4 => Some(PolarKind::FixedAlpha),
+        5 => Some(PolarKind::Sideslip),
+        7 => Some(PolarKind::Stability),
+        _ => None,
+    };
+    Ok(p)
 }
 
 /// `PlaneOpp::serializePOppXFL` (parsed and discarded).
@@ -927,6 +1205,13 @@ fn xfl_plane(r: &mut Rd) -> Res<(Option<Plane>, Vec<String>)> {
 
 /// Read a `.plr` polar file (xflr5 v1.99+ / v6 format, or flow5 v7 format).
 pub fn read_plr(bytes: &[u8]) -> Result<LegacyImport, String> {
+    let mut imp = read_plr_raw(bytes)?;
+    imp.report.source = "xflr5 / flow5 polar file".into();
+    finish_report(&mut imp);
+    Ok(imp)
+}
+
+fn read_plr_raw(bytes: &[u8]) -> Result<LegacyImport, String> {
     match read_plr_stream(bytes) {
         Ok(r) => Ok(r),
         Err(e) => {
@@ -1168,8 +1453,41 @@ pub fn read_fl5(bytes: &[u8]) -> Result<LegacyImport, String> {
             k => return r.fail(r.p - 4, "plane type", format_args!("unknown plane type {k}")),
         }
     }
-    // plane polars, plane operating points and boats follow: not needed.
+    // plane polars: v7.50+ definitions are imported; a polar that does not
+    // parse is reported and ends the import of polars (the planes are kept)
+    if r.remaining() > 0 {
+        match fl5_plane_polars(&mut r, fmt) {
+            Ok(list) => {
+                for p in list {
+                    push_wpolar(&mut imp, p);
+                }
+            }
+            Err(e) => imp.report.skip("plane polars", format!("could not be read ({e})")),
+        }
+        if r.remaining() > 0 {
+            imp.report.skip("plane operating points and boats", "results and boats are not imported");
+        }
+    }
+    imp.report.source = "flow5 project".into();
+    finish_report(&mut imp);
     Ok(imp)
+}
+
+/// The project's plane polars (`FileIO::serializeProjectFl5`, after the planes).
+fn fl5_plane_polars(r: &mut Rd, fmt: i32) -> Res<Vec<RawWPolar>> {
+    let n = r.count("number of plane polars", 1)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        if fmt < 500750 {
+            fl5_planepolar_v726(r)?;
+        } else {
+            out.push(fl5_planepolar_v750(r)?);
+        }
+    }
+    if fmt < 500750 && n > 0 {
+        return Err(format!("{n} plane polar(s) in the flow5 v7.26 format are not imported"));
+    }
+    Ok(out)
 }
 
 /// `serial::serializeFoilFl5`.
@@ -1369,23 +1687,32 @@ fn fl5_splinefoil(r: &mut Rd) -> Res<()> {
     r.spares(w)
 }
 
-/// `serial::serializeAngleControlFl5`.
-fn fl5_angle_control(r: &mut Rd) -> Res<()> {
+/// `serial::serializeAngleControlFl5`: the values (one per flap or control).
+fn fl5_angle_control(r: &mut Rd) -> Res<Vec<f64>> {
     let w = "fl5 angle control";
     r.i32(w)?;
     r.qstr(w)?;
     let n = r.loose_count("fl5 angle control value count", 8)?;
-    r.skip_f64s(n, w)
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(r.f64(w)?);
+    }
+    Ok(v)
 }
 
-/// A list of (name, min, max) control ranges.
-fn fl5_ranges(r: &mut Rd, w: &str) -> Res<()> {
+/// A list of (name, min, max) control ranges; returns the number of ranges
+/// with a nonzero span.
+fn fl5_ranges(r: &mut Rd, w: &str) -> Res<usize> {
     let n = r.loose_count(w, 20)?;
+    let mut active = 0;
     for _ in 0..n {
         r.qstr(w)?;
-        r.skip_f64s(2, w)?;
+        let (a, b) = (r.f64(w)?, r.f64(w)?);
+        if a != b {
+            active += 1;
+        }
     }
-    Ok(())
+    Ok(active)
 }
 
 /// `serial::serializeAeroForcesFl5`.
@@ -1458,35 +1785,74 @@ fn fl5_polar3d_v726(r: &mut Rd) -> Res<i32> {
 }
 
 /// `serial::serializePolar3dFl5v750`.
-fn fl5_polar3d_v750(r: &mut Rd) -> Res<()> {
+fn fl5_polar3d_v750(r: &mut Rd) -> Res<RawWPolar> {
     let w = "fl5 3D polar";
     r.fmt(w, 500750, 501000)?;
-    r.qstr(w)?;
+    let mut p = RawWPolar { source: "flow5", name: r.qstr(w)?, ..Default::default() };
     style_fl5(r)?;
-    r.i32(w)?;
-    r.skip_bools(3, w)?;
-    r.i32(w)?;
+    let method = r.i32(w)?;
+    r.bool(w)?; // Trefftz-plane drag
+    p.neumann = !r.bool(w)?;
+    p.ignore_body = r.bool(w)?;
+    let ty = r.i32(w)?;
     let n = r.loose_count("fl5 extra drag count", 20)?;
     for _ in 0..n {
-        r.qstr(w)?;
-        r.skip_f64s(2, w)?;
+        let tag = r.qstr(w)?;
+        let (a, c) = (r.f64(w)?, r.f64(w)?);
+        p.extra.push((tag, a, c));
     }
-    r.skip_bools(2, w)?;
-    r.skip_f64s(6, w)?;
-    r.bool(w)?;
-    r.skip_f64s(10, w)?;
-    r.skip_bools(2, w)?;
-    r.skip_f64s(3, w)?;
-    r.bool(w)?;
-    r.i32(w)?;
-    r.skip_f64s(2, w)?;
-    r.bool(w)?;
+    p.ground = r.bool(w)?;
+    p.free_surface = r.bool(w)?;
+    p.height = r.f64(w)?;
+    r.f64(w)?;
+    p.density = r.f64(w)?;
+    p.kin_visc = r.f64(w)?;
+    p.beta = r.f64(w)?;
+    p.phi = r.f64(w)?;
+    p.auto_inertia = r.bool(w)?;
+    p.mass = r.f64(w)?;
+    p.cog = r.v3(w)?;
+    p.ixx = r.f64(w)?;
+    p.iyy = r.f64(w)?;
+    p.izz = r.f64(w)?;
+    r.f64(w)?;
+    p.ixz = r.f64(w)?;
+    r.f64(w)?;
+    p.viscous = r.bool(w)?;
+    p.on_the_fly = r.bool(w)?;
+    r.skip_f64s(3, w)?; // NCrit, XTrTop, XTrBot (on-the-fly analyses only)
+    p.vorton = r.bool(w)?;
+    p.nx_wake = r.i32(w)?;
+    p.wake_len = r.f64(w)?;
+    p.wake_factor = r.f64(w)?;
+    p.visc_from_cl = Some(r.bool(w)?);
     r.skip_f64s(4, w)?;
     r.i32(w)?;
     r.skip_bools(10, w)?;
     r.skip_i32s(20, w)?;
     r.skip_f64s(20, w)?;
-    Ok(())
+    p.method = match method {
+        1 => Some(Method::Llt),
+        2 => Some(Method::Vlm1),
+        3 => Some(Method::Vlm2),
+        4 => Some(Method::Panel),
+        5 => Some(Method::TriLinear),
+        6 => Some(Method::TriPanel),
+        _ => None,
+    };
+    p.kind_code = ty;
+    p.kind = match ty {
+        1 => Some(PolarKind::FixedSpeed),
+        2 => Some(PolarKind::FixedLift),
+        3 => Some(PolarKind::Glide),
+        4 => Some(PolarKind::FixedAlpha),
+        5 => Some(PolarKind::Sideslip),
+        6 => Some(PolarKind::Control),
+        7 => Some(PolarKind::Stability),
+        8 => Some(PolarKind::List),
+        _ => None,
+    };
+    Ok(p)
 }
 
 /// `serial::serializePlanePolarFl5v726` (parsed and discarded).
@@ -1567,37 +1933,47 @@ fn fl5_planepolar_v726(r: &mut Rd) -> Res<()> {
     Ok(())
 }
 
-/// `serial::serializePlanePolarFl5v750` (parsed and discarded).
-fn fl5_planepolar_v750(r: &mut Rd) -> Res<()> {
+/// `serial::serializePlanePolarFl5v750`.
+fn fl5_planepolar_v750(r: &mut Rd) -> Res<RawWPolar> {
     let w = "fl5 plane polar";
-    fl5_polar3d_v750(r)?;
-    r.qstr(w)?;
-    r.skip_f64s(2, w)?;
-    r.skip_bools(2, w)?;
-    r.i32(w)?;
-    r.skip_f64s(3, w)?;
-    for _ in 0..2 {
-        let n = r.loose_count("fl5 control count", 12)?;
-        for _ in 0..n {
-            fl5_angle_control(r)?;
+    let mut p = fl5_polar3d_v750(r)?;
+    p.plane = r.qstr(w)?;
+    p.qinf = r.f64(w)?;
+    p.alpha = r.f64(w)?;
+    p.thin = r.bool(w)?;
+    r.bool(w)?; // viscous loop
+    p.refdim = r.i32(w)?;
+    p.ref_area = r.f64(w)?;
+    p.ref_chord = r.f64(w)?;
+    p.ref_span = r.f64(w)?;
+    let n = r.loose_count("fl5 control count", 12)?;
+    for _ in 0..n {
+        p.flaps.push(fl5_angle_control(r)?);
+    }
+    let n = r.loose_count("fl5 control count", 12)?;
+    for _ in 0..n {
+        if fl5_angle_control(r)?.iter().any(|v| *v != 0.0) {
+            p.avl_controls += 1;
         }
     }
-    r.bool(w)?;
+    r.bool(w)?; // adjusted velocity
     let n = r.loose_count("fl5 angle range count", 4)?;
     for _ in 0..n {
-        fl5_ranges(r, w)?;
+        p.ranges += fl5_ranges(r, w)?;
     }
-    fl5_ranges(r, w)?;
-    fl5_ranges(r, w)?;
-    r.skip_bools(2, w)?;
-    r.i32(w)?;
+    p.ranges += fl5_ranges(r, w)?;
+    p.ranges += fl5_ranges(r, w)?;
+    r.bool(w)?; // fuselage inertia
+    p.fuse_drag = r.bool(w)?;
+    r.i32(w)?; // fuselage drag method
     let n_spares = r.i32(w)?.max(0) as usize;
     let at = r.p;
     let n = r.i32(w)?;
     if n.abs() > 10000 {
         return r.fail(at, w, format_args!("{n} data points"));
     }
-    for _ in 0..n.max(0) {
+    p.npts = n.max(0) as usize;
+    for _ in 0..p.npts {
         fl5_aeroforces(r)?;
         r.skip_f64s(7 + 16, w)?;
         r.skip_f64s(n_spares, w)?;
@@ -1609,7 +1985,7 @@ fn fl5_planepolar_v750(r: &mut Rd) -> Res<()> {
     r.skip_bools(10, w)?;
     r.skip_i32s(20, w)?;
     r.skip_f64s(20, w)?;
-    Ok(())
+    Ok(p)
 }
 
 struct RawInertia {
@@ -2049,6 +2425,7 @@ pub fn read_any(path: &Path) -> Result<LegacyImport, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
+        "avl" => read_avl(&String::from_utf8_lossy(&bytes), path.parent()),
         "xfl" => read_xfl(&bytes),
         "fl5" => read_fl5(&bytes),
         "plr" => read_plr(&bytes),
@@ -2070,6 +2447,86 @@ pub fn read_any(path: &Path) -> Result<LegacyImport, String> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// AVL geometry and importing into a project
+// ---------------------------------------------------------------------------
+
+/// Read an AVL geometry file.  Foil files named by `AFILE` are loaded from
+/// `dir` when they exist.
+pub fn read_avl(text: &str, dir: Option<&Path>) -> Result<LegacyImport, String> {
+    let mut known = Vec::new();
+    if let Some(dir) = dir {
+        let lines: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with(['#', '!'])).collect();
+        for k in 0..lines.len().saturating_sub(1) {
+            if lines[k].to_uppercase().starts_with("AFIL") {
+                let file = lines[k + 1].trim_matches('"');
+                let stem = Path::new(file).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                if let Ok(mut f) = Foil::load(&dir.join(file)) {
+                    f.name = stem;
+                    if !known.iter().any(|g: &Foil| g.name == f.name) {
+                        known.push(f);
+                    }
+                }
+            }
+        }
+    }
+    let a = foiley_plane::export::import_avl(text, &known)?;
+    let mut imp = LegacyImport { foils: known, planes: vec![a.plane], report: a.report, ..Default::default() };
+    // hinged copies replace the loaded files' foils
+    for f in a.foils {
+        imp.foils.retain(|g| g.name != f.name);
+        imp.foils.push(f);
+    }
+    let mapped = std::mem::take(&mut imp.report.mapped);
+    imp.report.mapped = imp.foils.iter().map(|f| format!("foil '{}'", f.name)).collect();
+    imp.report.mapped.extend(mapped);
+    imp.report.source = "AVL geometry".into();
+    Ok(imp)
+}
+
+/// Files [`import_into`] handles: xflr5 / flow5 projects and polars, AVL geometry.
+pub fn is_interchange(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    matches!(ext.as_str(), "xfl" | "fl5" | "plr" | "avl")
+}
+
+/// Import an `.xfl`, `.fl5`, `.plr` or `.avl` file into a project: foils (an
+/// existing foil of the same name is kept), 2D polars, planes (renamed on a
+/// name clash, their polars follow) and plane polar definitions.  Returns the
+/// conversion report.
+pub fn import_into(proj: &mut crate::Project, path: &Path) -> Result<ConversionReport, String> {
+    let imp = read_any(path)?;
+    let mut rep = imp.report;
+    rep.source = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    for f in imp.foils {
+        if proj.foil(&f.name).is_none() {
+            proj.foils.push(f);
+        } else {
+            rep.approx(format!("foil '{}'", f.name), "the project already has a foil of that name; the project's one is kept");
+        }
+    }
+    for q in imp.polars {
+        proj.add_foil_polar(q);
+    }
+    let mut renamed: Vec<(String, String)> = Vec::new();
+    for mut pl in imp.planes {
+        if proj.planes.iter().any(|p| p.name == pl.name) {
+            let new = format!("{} (imported)", pl.name);
+            rep.approx(format!("plane '{}'", pl.name), format!("the project already has a plane of that name; imported as '{new}'"));
+            renamed.push((pl.name.clone(), new.clone()));
+            pl.name = new;
+        }
+        proj.planes.push(pl);
+    }
+    for mut q in imp.plane_polars {
+        if let Some((_, new)) = renamed.iter().find(|(old, _)| *old == q.plane) {
+            q.plane = new.clone();
+        }
+        proj.add_plane_polar(q);
+    }
+    Ok(rep)
 }
 
 // ---------------------------------------------------------------------------

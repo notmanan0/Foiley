@@ -10,3 +10,6 @@ foiley.workspace = true
 foiley-core.workspace = true
 rayon.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
