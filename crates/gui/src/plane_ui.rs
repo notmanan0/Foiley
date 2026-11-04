@@ -640,6 +640,9 @@ impl App {
                     for wn in o.warnings.iter().take(2) {
                         ui.label(RichText::new("!").color(Color32::from_rgb(230, 160, 60))).on_hover_text(wn);
                     }
+                    if let Some(e) = &o.stability_error {
+                        ui.label(RichText::new("no stability").color(Color32::from_rgb(230, 160, 60))).on_hover_text(e);
+                    }
                 }
             }
         });
@@ -791,7 +794,7 @@ impl App {
     }
 
     pub fn stability(&mut self, ui: &mut egui::Ui) {
-        let stab_polars: Vec<PlanePolar> = self.project.plane_polars.iter().filter(|p| p.points.iter().any(|o| o.stability.is_some())).cloned().collect();
+        let stab_polars: Vec<PlanePolar> = self.project.plane_polars.iter().filter(|p| p.points.iter().any(|o| o.stability.is_some() || o.stability_error.is_some())).cloned().collect();
         if stab_polars.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
@@ -808,6 +811,16 @@ impl App {
         let key = self.pui.sel_polar.clone().filter(|k| stab_polars.iter().any(|p| (p.plane.clone(), p.name.clone()) == *k)).unwrap_or_else(|| (stab_polars[0].plane.clone(), stab_polars[0].name.clone()));
         let pol = stab_polars.iter().find(|p| (p.plane.clone(), p.name.clone()) == key).unwrap().clone();
         let pts: Vec<&PlaneOpp> = pol.points.iter().filter(|o| o.stability.is_some()).collect();
+        let missing: Vec<&PlaneOpp> = pol.points.iter().filter(|o| o.stability.is_none() && o.stability_error.is_some()).collect();
+        let missing_text = missing.iter().map(|o| format!("alpha {:.2}  V {:.2}  ctrl {:.3}: {}", o.alpha, o.velocity, o.ctrl, o.stability_error.as_deref().unwrap_or(""))).collect::<Vec<_>>().join("\n");
+        if pts.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(RichText::new(format!("Stability failed at every point of {} / {}", key.0, key.1)).size(18.0).color(Color32::from_rgb(230, 160, 60)));
+                ui.label(missing_text);
+            });
+            return;
+        }
         self.pui.sel_point = self.pui.sel_point.min(pts.len() - 1);
         egui::SidePanel::left("stab_left").resizable(true).default_width(430.0).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -825,6 +838,9 @@ impl App {
                 });
                 if pts.len() > 1 {
                     ui.add(egui::Slider::new(&mut self.pui.sel_point, 0..=pts.len() - 1).text("point"));
+                }
+                if !missing.is_empty() {
+                    ui.label(RichText::new(format!("{} point(s) without stability", missing.len())).color(Color32::from_rgb(230, 160, 60))).on_hover_text(&missing_text);
                 }
                 let o = pts[self.pui.sel_point];
                 let s = o.stability.as_ref().unwrap();

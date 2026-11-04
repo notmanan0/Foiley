@@ -280,6 +280,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             cp: vec![],
             warnings,
             stability: None,
+            stability_error: None,
             wake: vec![],
             balance_residual: None,
         };
