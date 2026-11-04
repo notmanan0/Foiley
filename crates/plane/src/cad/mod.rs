@@ -7,10 +7,13 @@
 //!   B-spline) with evaluation and point inversion;
 //! * [`trim`]: topology (shells, faces, loops, edges), edge sampling and
 //!   the trimmed parameter-space domain of each face, with seam handling;
-//! * [`tessellate`]: watertight triangulation of the trimmed faces.
+//! * [`tessellate`]: watertight triangulation of the trimmed faces;
+//! * [`check`]: mesh checks (open / non-manifold edges, orientation,
+//!   volume, area against a reference, self-intersection).
 
 use foiley_core::Vec3;
 
+pub mod check;
 pub mod step_parse;
 pub mod surfaces;
 pub mod tessellate;

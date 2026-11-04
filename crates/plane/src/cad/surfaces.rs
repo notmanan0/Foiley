@@ -374,6 +374,21 @@ impl Surface {
         }
     }
 
+    /// Parameter value of the natural seam of a periodic direction.
+    pub fn seam_origin(&self, dir: usize) -> f64 {
+        match self {
+            Surface::BSpline { s, .. } => {
+                let ((u0, _), (v0, _)) = s.domain();
+                if dir == 0 {
+                    u0
+                } else {
+                    v0
+                }
+            }
+            _ => 0.0,
+        }
+    }
+
     /// Finite parameter bounds of non-periodic directions (for clamping).
     pub fn bounds(&self) -> [Option<(f64, f64)>; 2] {
         match self {

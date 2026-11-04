@@ -4,7 +4,7 @@
 //! volumes.
 
 use foiley_core::Vec3;
-use foiley_plane::cad::{Domain, Model, StepOptions};
+use foiley_plane::cad::{tessellate, Domain, Model, StepOptions};
 use std::f64::consts::{PI, TAU};
 
 const CAD_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/cad");
@@ -388,31 +388,32 @@ fn f022_refinement_meets_chordal_tolerance() {
             let m = Model::from_step(&text(name), &opts).unwrap();
             let (tol, max_edge) = (m.tol.chord, m.tol.max_edge);
             for fi in 0..m.faces.len() {
-                let fm = foiley_plane::cad::tessellate::face_mesh(&m, fi).unwrap();
+                let fm = tessellate::face_mesh(&m, fi).unwrap();
                 let s = &m.faces[fi].surface;
                 let boundary: std::collections::HashSet<(u32, u32)> = fm.boundary.iter().map(|e| (e[0].min(e[1]), e[0].max(e[1]))).collect();
                 assert!(!fm.tris.is_empty());
                 for t in &fm.tris {
-                    let q: Vec<[f64; 2]> = t.iter().map(|&i| fm.uv[i as usize]).collect();
-                    let p: Vec<Vec3> = t.iter().map(|&i| fm.pos[i as usize]).collect();
-                    let c = [(q[0][0] + q[1][0] + q[2][0]) / 3.0, (q[0][1] + q[1][1] + q[2][1]) / 3.0];
-                    let dev = (s.eval(c[0], c[1]) - (p[0] + p[1] + p[2]) / 3.0).norm();
-                    assert!(dev <= tol * (1.0 + 1e-9), "{name} face {fi}: centroid deviation {dev:e} > {tol:e}");
+                    let ids = t.map(|i| fm.ids[i as usize]);
+                    if (0..3).any(|k| ids[k] != u32::MAX && ids[k] == ids[(k + 1) % 3]) {
+                        continue; // collapsed at a pole: not part of the mesh
+                    }
+                    let dv = tessellate::deviations(s, &fm, *t);
+                    assert!(dv.centroid <= tol * (1.0 + 1e-9), "{name} face {fi}: centroid deviation {:e} > {tol:e}", dv.centroid);
                     for k in 0..3 {
-                        let (a, b) = (k, (k + 1) % 3);
-                        let len = (p[b] - p[a]).norm();
-                        assert!(len <= max_edge * (1.0 + 1e-9) || p[a] == p[b], "{name}: side {len} > {max_edge}");
-                        let e = (t[a].min(t[b]), t[a].max(t[b]));
-                        if !boundary.contains(&e) {
-                            let mid = [0.5 * (q[a][0] + q[b][0]), 0.5 * (q[a][1] + q[b][1])];
-                            let dev = (s.eval(mid[0], mid[1]) - (p[a] + p[b]) * 0.5).norm();
-                            assert!(dev <= tol * (1.0 + 1e-9), "{name}: midpoint deviation {dev:e} > {tol:e}");
+                        let (a, b) = (t[k], t[(k + 1) % 3]);
+                        assert!(dv.lengths[k] <= max_edge * (1.0 + 1e-9), "{name}: side {} > {max_edge}", dv.lengths[k]);
+                        if !boundary.contains(&(a.min(b), a.max(b))) {
+                            assert!(dv.edges[k] <= tol * (1.0 + 1e-9), "{name}: midpoint deviation {:e} > {tol:e}", dv.edges[k]);
                         }
                     }
+                    // anywhere inside: distance from the surface to the triangle's plane
+                    let q = tessellate::effective_uv(&fm, *t);
+                    let p = t.map(|i| fm.pos[i as usize]);
+                    let n = (p[1] - p[0]).cross(p[2] - p[0]).normalized();
                     for (wa, wb) in [(0.6, 0.2), (0.2, 0.6), (0.2, 0.2), (0.45, 0.45), (0.1, 0.45), (0.45, 0.1)] {
                         let wc = 1.0 - wa - wb;
                         let uv = [wa * q[0][0] + wb * q[1][0] + wc * q[2][0], wa * q[0][1] + wb * q[1][1] + wc * q[2][1]];
-                        let dev = (s.eval(uv[0], uv[1]) - (p[0] * wa + p[1] * wb + p[2] * wc)).norm();
+                        let dev = (s.eval(uv[0], uv[1]) - p[0]).dot(n).abs();
                         assert!(dev <= 2.0 * tol, "{name}: interior deviation {dev:e} > 2 x {tol:e}");
                     }
                 }
@@ -423,4 +424,118 @@ fn f022_refinement_meets_chordal_tolerance() {
     }
     assert!(sphere_err[1] < 0.2 * sphere_err[0], "area converges: {sphere_err:?}");
     assert!(sphere_err[1] < 1e-3, "{sphere_err:?}");
+}
+
+/// Perimeter of an ellipse (numerical).
+fn ellipse_perimeter(a: f64, b: f64) -> f64 {
+    let n = 20_000;
+    (0..n).map(|i| {
+        let t = TAU * (i as f64 + 0.5) / n as f64;
+        (a * a * t.sin().powi(2) + b * b * t.cos().powi(2)).sqrt()
+    }).sum::<f64>() * TAU / n as f64
+}
+
+/// (file, closed-form area, closed-form volume, bodies)
+fn corpus() -> Vec<(&'static str, f64, f64, usize)> {
+    let (r, h) = (0.2, 0.5);
+    let box_a = 2.0 * (2.0 - PI * r * r) + 2.0 * 2.0 * h + 2.0 * 1.0 * h + TAU * r * h;
+    let box_v = 2.0 * 1.0 * h - PI * r * r * h;
+    // cylinder fuselage: R 0.1, L 1, hemispherical ends
+    let (rf, lf) = (0.1, 1.0);
+    let fus_a = TAU * rf * lf + 4.0 * PI * rf * rf;
+    let fus_v = PI * rf * rf * lf + 4.0 / 3.0 * PI * rf.powi(3);
+    // nacelle: ellipse a 0.25 (axial) x b 0.05 (radial) revolved at radius 0.3 (Pappus)
+    let (d, a, b) = (0.3, 0.25, 0.05);
+    let nac_a = TAU * d * ellipse_perimeter(a, b);
+    let nac_v = TAU * d * PI * a * b;
+    // lofted B-spline fuselage: cone 0.3, cylinder 0.7, cone 0.4 at radius 0.1
+    let rl: f64 = 0.1;
+    let loft_a = TAU * rl * 0.7 + PI * rl * ((0.3f64).hypot(rl) + (0.4f64).hypot(rl));
+    let loft_v = PI * rl * rl * 0.7 + PI * rl * rl * (0.3 + 0.4) / 3.0;
+    // multi-shell: the box and a sphere of radius 0.3
+    let sph_a = 4.0 * PI * 0.09;
+    let sph_v = 4.0 / 3.0 * PI * 0.027;
+    vec![
+        ("box_hole.stp", box_a, box_v, 1),
+        ("cyl_fuselage.stp", fus_a, fus_v, 1),
+        ("nacelle.stp", nac_a, nac_v, 1),
+        ("loft_fuselage.stp", loft_a, loft_v, 1),
+        ("multi_shell.stp", box_a + sph_a, box_v + sph_v, 2),
+    ]
+}
+
+/// Closed-form area and volume of the hand-written corpus within 0.1 %,
+/// and the flow5 example fuselage (bare B-spline patches, no closed form)
+/// against a high-density reference tessellation.
+#[test]
+fn f022_corpus_area_volume_within_0_1pct() {
+    let opts = StepOptions { rel_chord_tol: 1e-5, ..Default::default() };
+    for (name, area, vol, bodies) in corpus() {
+        let r = import(name, &opts);
+        let (a, v) = (r.mesh.area(), r.mesh.volume());
+        println!("{name}: {} triangles, area {a:.6} ({area:.6}), volume {v:.6} ({vol:.6})", r.mesh.triangles.len());
+        assert!(((a - area) / area).abs() < 1e-3, "{name}: area {a} vs {area}");
+        assert!(((v - vol) / vol).abs() < 1e-3, "{name}: volume {v} vs {vol}");
+        assert_eq!(r.model.n_shells, bodies, "{name}");
+        let shells: std::collections::BTreeSet<u32> = r.mesh.shell.iter().copied().collect();
+        assert_eq!(shells.len(), bodies, "{name}: bodies in the mesh");
+    }
+    // flow5 example fuselage: area converged against a 16x tighter tessellation
+    let pw5 = text("pw5_2024-06-27T20_19_49.010Z.stp");
+    let (a, aref) = foiley_plane::cad::check::area_vs_reference(&pw5, &StepOptions { rel_chord_tol: 1e-4, ..Default::default() }, 16.0).unwrap();
+    println!("pw5 fuselage: area {a:.6}, reference {aref:.6}");
+    assert!(((a - aref) / aref).abs() < 1e-3, "pw5 area {a} vs reference {aref}");
+    // and it is the same body as the flow5 STL export of it
+    let stl = foiley_plane::cad::read_stl(&std::fs::read(std::path::Path::new(CAD_DIR).join("pw5_fuse.stl")).unwrap()).unwrap();
+    // the STL is in the STEP's unit (feet); the STEP import scaled to metres
+    let k = foiley_plane::cad::import_step(&pw5, &StepOptions::default(), &foiley_core::Progress::none()).unwrap().model.length_scale;
+    let stl_area: f64 = stl.iter().map(|t| 0.5 * (t[1] - t[0]).cross(t[2] - t[0]).norm()).sum::<f64>() * k * k;
+    println!("pw5 STL area {stl_area:.6} (unit scale {k})");
+    assert!(((a - stl_area) / stl_area).abs() < 0.02, "STEP {a} vs STL {stl_area}");
+}
+
+/// Every closed B-rep fixture imports as a watertight, consistently and
+/// outward oriented, self-intersection-free mesh, one part per body; the
+/// checks catch a hole, a flipped triangle and a crossing.
+#[test]
+fn g26_watertight_and_oriented() {
+    use foiley_plane::cad::check::{check, check_mesh};
+    let mut names: Vec<&str> = CLOSED.to_vec();
+    names.extend(["cyl_fuselage.stp", "nacelle.stp", "multi_shell.stp"]);
+    for name in names {
+        let r = import(name, &StepOptions::default());
+        let rep = check_mesh(&r.mesh);
+        println!("{name}: {}", rep.summary());
+        assert!(rep.watertight(), "{name}: {}", rep.summary());
+        assert!(rep.oriented(), "{name}: {}", rep.summary());
+        assert_eq!(rep.self_intersections, 0, "{name}: {}", rep.summary());
+        assert_eq!(rep.degenerate, 0, "{name}: {}", rep.summary());
+        assert_eq!(rep.components, r.model.n_shells, "{name}: {}", rep.summary());
+    }
+    // the flow5 patches: consistently oriented, outward
+    let r = import("pw5_2024-06-27T20_19_49.010Z.stp", &StepOptions::default());
+    let rep = check_mesh(&r.mesh);
+    println!("pw5: {}", rep.summary());
+    assert!(rep.volume > 0.0 && rep.misoriented_edges == 0, "pw5: {}", rep.summary());
+    assert_eq!(rep.self_intersections, 0, "pw5: {}", rep.summary());
+    // the checks see defects
+    let r = import("box_hole.stp", &StepOptions::default());
+    let (v, t) = (&r.mesh.vertices, &r.mesh.triangles);
+    let mut holed = t.clone();
+    holed.pop();
+    let rep = check(v, &holed);
+    assert!(!rep.watertight() && rep.open_edges == 3, "{}", rep.summary());
+    let mut flipped = t.clone();
+    flipped[0].swap(1, 2);
+    let rep = check(v, &flipped);
+    assert!(!rep.oriented() && rep.misoriented_edges == 3, "{}", rep.summary());
+    let mut crossing = v.clone();
+    let tri = t[t.len() / 2];
+    let c = (v[tri[0] as usize] + v[tri[1] as usize] + v[tri[2] as usize]) / 3.0;
+    let base = crossing.len() as u32;
+    crossing.extend([c + Vec3::new(0.3, 0.3, 0.3), c - Vec3::new(0.3, 0.3, 0.3), c + Vec3::new(0.3, -0.3, 0.0)]);
+    let mut with_spike = t.clone();
+    with_spike.push([base, base + 1, base + 2]);
+    let rep = check(&crossing, &with_spike);
+    assert!(rep.self_intersections > 0, "{}", rep.summary());
 }

@@ -71,6 +71,8 @@ pub struct FaceMesh {
     pub tris: Vec<[u32; 3]>,
     /// local vertex pairs that are domain-boundary (constraint) edges
     pub boundary: Vec<[u32; 2]>,
+    /// parameters that are free at the vertex (pole / apex)
+    pub sing: Vec<[bool; 2]>,
     pub domain: Domain,
 }
 
@@ -108,6 +110,8 @@ pub fn tessellate(model: &Model, strict: bool, p: &Progress) -> Result<(CadMesh,
     let mut map: Vec<u32> = vec![u32::MAX; nv];
     let mut mesh = CadMesh::default();
     let mut failed = 0;
+    let mut seen: std::collections::HashSet<[u32; 3]> = std::collections::HashSet::new();
+    let mut duplicates = 0usize;
     for (fi, r) in results.into_iter().enumerate() {
         let fm = match r {
             Ok(fm) => fm,
@@ -148,6 +152,15 @@ pub fn tessellate(model: &Model, strict: bool, p: &Progress) -> Result<(CadMesh,
             if a == b || b == c || a == c {
                 continue; // collapsed at a pole or seam
             }
+            // two faces that collapse to the same corner (untrimmed patches
+            // meeting at a nose) can both emit the triangle on their shared
+            // boundary; the second copy would make its edges non-manifold
+            let mut key = [a, b, c];
+            key.sort_unstable();
+            if !seen.insert(key) {
+                duplicates += 1;
+                continue;
+            }
             mesh.triangles.push(if flip { [a, c, b] } else { [a, b, c] });
             mesh.face.push(fi as u32);
             mesh.shell.push(model.faces[fi].shell as u32);
@@ -155,6 +168,9 @@ pub fn tessellate(model: &Model, strict: bool, p: &Progress) -> Result<(CadMesh,
     }
     if failed > 20 {
         notes.push(format!("... {} more faces skipped", failed - 20));
+    }
+    if duplicates > 0 {
+        notes.push(format!("{duplicates} duplicate triangle(s) where faces meet at a collapsed corner dropped"));
     }
     if mesh.triangles.is_empty() {
         return Err("no face could be tessellated".into());
@@ -217,6 +233,7 @@ pub fn face_mesh(model: &Model, fi: usize) -> Result<FaceMesh, String> {
         }
         if of_handle[h.index()] == u32::MAX {
             of_handle[h.index()] = fm.uv.len() as u32;
+            fm.sing.push(if id == u32::MAX { [false; 2] } else { s.singular(uv[0], uv[1]) });
             fm.uv.push(uv);
             fm.ids.push(id);
             fm.pos.push(pos);
@@ -244,7 +261,7 @@ pub fn face_mesh(model: &Model, fi: usize) -> Result<FaceMesh, String> {
     }
     // refinement: insert centroids / edge midpoints of inside triangles that
     // miss the chordal or length tolerance
-    let max_pts = 200_000;
+    let max_pts = 2_000_000;
     for _pass in 0..40 {
         let inside = classify(&cdt);
         let mut cand: Vec<[f64; 2]> = Vec::new();
@@ -252,12 +269,32 @@ pub fn face_mesh(model: &Model, fi: usize) -> Result<FaceMesh, String> {
             if !inside[f.fix().index()] {
                 continue;
             }
+            // never refine a sliver (nearly collinear boundary points): its
+            // centroid or midpoints would land on the boundary
+            let ps = f.positions();
+            let a2 = ((ps[1].x - ps[0].x) * (ps[2].y - ps[0].y) - (ps[2].x - ps[0].x) * (ps[1].y - ps[0].y)).abs();
+            let l2 = (0..3).map(|k| (ps[(k + 1) % 3].x - ps[k].x).powi(2) + (ps[(k + 1) % 3].y - ps[k].y).powi(2)).fold(0.0, f64::max);
+            if a2 <= 1e-9 * l2 {
+                continue;
+            }
             let vs = f.vertices();
-            let l: [usize; 3] = [of_handle[vs[0].fix().index()] as usize, of_handle[vs[1].fix().index()] as usize, of_handle[vs[2].fix().index()] as usize];
-            let p = [fm.pos[l[0]], fm.pos[l[1]], fm.pos[l[2]]];
-            let q = [fm.uv[l[0]], fm.uv[l[1]], fm.uv[l[2]]];
+            let l: [u32; 3] = [of_handle[vs[0].fix().index()], of_handle[vs[1].fix().index()], of_handle[vs[2].fix().index()]];
+            // a triangle with two vertices at the same pole is dropped on
+            // assembly and never refined; one spanning the two copies of a
+            // seam (same ids, no pole) must still be refined until it no
+            // longer does
+            let ids = l.map(|i| fm.ids[i as usize]);
+            let sg = l.map(|i| fm.sing.get(i as usize).copied().unwrap_or([false; 2]));
+            if (0..3).any(|k| {
+                let j = (k + 1) % 3;
+                ids[k] != u32::MAX && ids[k] == ids[j] && (sg[k] != [false; 2] || sg[j] != [false; 2])
+            }) {
+                continue;
+            }
+            let dv = deviations(s, &fm, l);
+            let q = l.map(|i| fm.uv[i as usize]);
             let edges = f.adjacent_edges();
-            // edge k joins vertex k and k + 1 (spade: edge k starts at vertex k)
+            // spade: edge k runs from vertex k to vertex k + 1
             let mut worst: Option<(f64, [f64; 2])> = None;
             let mut consider = |score: f64, uv: [f64; 2]| {
                 if score > 1.0 && worst.map(|w| score > w.0).unwrap_or(true) {
@@ -265,19 +302,14 @@ pub fn face_mesh(model: &Model, fi: usize) -> Result<FaceMesh, String> {
                 }
             };
             for k in 0..3 {
-                let (a, b) = (k, (k + 1) % 3);
-                let constraint = edges[k].as_undirected().is_constraint_edge();
-                let len = (p[b] - p[a]).norm();
-                if constraint {
+                if edges[k].as_undirected().is_constraint_edge() {
                     continue;
                 }
+                let (a, b) = (k, (k + 1) % 3);
                 let mid = [0.5 * (q[a][0] + q[b][0]), 0.5 * (q[a][1] + q[b][1])];
-                let dev = (s.eval(mid[0], mid[1]) - (p[a] + p[b]) * 0.5).norm();
-                consider((dev / tol.chord).max(len / tol.max_edge), mid);
+                consider((dv.edges[k] / tol.chord).max(dv.lengths[k] / tol.max_edge), mid);
             }
-            let c = [(q[0][0] + q[1][0] + q[2][0]) / 3.0, (q[0][1] + q[1][1] + q[2][1]) / 3.0];
-            let dev = (s.eval(c[0], c[1]) - (p[0] + p[1] + p[2]) / 3.0).norm();
-            consider(dev / tol.chord, c);
+            consider(dv.centroid / tol.chord, [(q[0][0] + q[1][0] + q[2][0]) / 3.0, (q[0][1] + q[1][1] + q[2][1]) / 3.0]);
             if let Some((_, uv)) = worst {
                 cand.push(uv);
             }
@@ -303,6 +335,70 @@ pub fn face_mesh(model: &Model, fi: usize) -> Result<FaceMesh, String> {
     }
     fm.domain = dom;
     Ok(fm)
+}
+
+/// Chordal deviations of a face triangle (local vertices `t`).
+#[derive(Clone, Copy, Debug)]
+pub struct Deviations {
+    /// distance from the surface at the parametric centroid to the
+    /// triangle's plane
+    pub centroid: f64,
+    /// distance from the surface at each edge's parametric midpoint to the
+    /// edge's line (edge k joins vertex k and k + 1)
+    pub edges: [f64; 3],
+    /// 3D side lengths
+    pub lengths: [f64; 3],
+}
+
+/// Parameter coordinates of a triangle's vertices for evaluating its
+/// interior: a vertex at a pole takes its free parameter from the others.
+pub fn effective_uv(fm: &FaceMesh, t: [u32; 3]) -> [[f64; 2]; 3] {
+    let mut q = t.map(|i| fm.uv[i as usize]);
+    let sing = t.map(|i| fm.sing.get(i as usize).copied().unwrap_or([false; 2]));
+    for d in 0..2 {
+        for k in 0..3 {
+            if !sing[k][d] {
+                continue;
+            }
+            let others: Vec<f64> = (0..3).filter(|&j| j != k && !sing[j][d]).map(|j| q[j][d]).collect();
+            if !others.is_empty() {
+                q[k][d] = others.iter().sum::<f64>() / others.len() as f64;
+            }
+        }
+    }
+    q
+}
+
+/// See [`Deviations`].
+pub fn deviations(s: &Surface, fm: &FaceMesh, t: [u32; 3]) -> Deviations {
+    let p = t.map(|i| fm.pos[i as usize]);
+    let q = effective_uv(fm, t);
+    let n = (p[1] - p[0]).cross(p[2] - p[0]);
+    let nn = n.norm();
+    let c = [(q[0][0] + q[1][0] + q[2][0]) / 3.0, (q[0][1] + q[1][1] + q[2][1]) / 3.0];
+    let sc = s.eval(c[0], c[1]);
+    let centroid = if nn > 0.0 { ((sc - p[0]).dot(n) / nn).abs() } else { (sc - (p[0] + p[1] + p[2]) / 3.0).norm() };
+    let sing = t.map(|i| fm.sing.get(i as usize).copied().unwrap_or([false; 2]));
+    let mut edges = [0.0; 3];
+    let mut lengths = [0.0; 3];
+    for k in 0..3 {
+        let (a, b) = (k, (k + 1) % 3);
+        lengths[k] = (p[b] - p[a]).norm();
+        let (mut qa, mut qb) = (fm.uv[t[a] as usize], fm.uv[t[b] as usize]);
+        for d in 0..2 {
+            if sing[a][d] && !sing[b][d] {
+                qa[d] = qb[d];
+            } else if sing[b][d] && !sing[a][d] {
+                qb[d] = qa[d];
+            }
+        }
+        let m = s.eval(0.5 * (qa[0] + qb[0]), 0.5 * (qa[1] + qb[1]));
+        let ab = p[b] - p[a];
+        let w = m - p[a];
+        let l2 = ab.norm2();
+        edges[k] = if l2 > 0.0 { (w - ab * (w.dot(ab) / l2)).norm() } else { w.norm() };
+    }
+    Deviations { centroid, edges, lengths }
 }
 
 /// Inside flags of the faces (by fixed face index): parity of the number

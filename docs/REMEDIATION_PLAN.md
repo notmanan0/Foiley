@@ -73,7 +73,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [x] **F022a** · STEP parse, topology, analytic surfaces, seams
 - [x] **F022b** · B-spline surfaces and curves — after F022a
 - [x] **F022c** · Watertight tessellation — after F022a
-- [ ] **F022d** · Mesh checks and CAD corpus — after F022b, F022c
+- [x] **F022d** · Mesh checks and CAD corpus — after F022b, F022c
 - [ ] **F010c** · Real XFLR5/flow5 files — after F010b; **waits on the user's files**
 
 F004, F005, F010, F015 and F022 are split into lettered parts; the finding is
