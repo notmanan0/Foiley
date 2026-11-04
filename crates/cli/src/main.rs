@@ -122,6 +122,9 @@ struct XfoilOpts {
     /// number of panel nodes (XFoil PANGEN, max 354)
     #[arg(long, default_value_t = 160)]
     panels: usize,
+    /// solve on the foil's own coordinates (XFoil LOAD + PCOP) instead of PANGEN
+    #[arg(long)]
+    keep_nodes: bool,
     /// do not try to recover unconverged points
     #[arg(long)]
     no_recover: bool,
@@ -147,7 +150,7 @@ impl XfoilOpts {
             xtr_bot: x[1],
             viscous: !self.inviscid,
             max_iter: self.iter,
-            paneling: Paneling { panels: self.panels, ..Default::default() },
+            paneling: if self.keep_nodes { foiley_foil::foil::NodeInput::Preserve } else { foiley_foil::foil::NodeInput::Pangen(Paneling { panels: self.panels, ..Default::default() }) },
             recover: !self.no_recover,
             from_zero: !self.no_from_zero,
             parallel: !self.sequential,

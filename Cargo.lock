@@ -1222,6 +1222,7 @@ dependencies = [
  "foiley-core",
  "rayon",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
