@@ -701,19 +701,12 @@ fn ensure_polars(mgr: &mut JobManager, ui: &mut Ui, proj: &mut Project, plane: &
         return Ok(());
     }
     let db = proj.foil_db();
-    let need: Vec<Foil> = auto::foils_needing_polars(plane, &proj.foils, &db).into_iter().cloned().collect();
-    if need.is_empty() {
+    let plan = auto::plan(plane, &proj.foils, &db, def, count)?;
+    if plan.is_empty() {
         return Ok(());
     }
-    let (cases, settings, sweep) = auto::polar_mesh_cases(plane, &db, def, count);
-    eprintln!(
-        "  computing 2D polar mesh for {} ({} Re values {:.0}..{:.0})",
-        need.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", "),
-        cases.len(),
-        cases.first().map(|c| c.re).unwrap_or(0.0),
-        cases.last().map(|c| c.re).unwrap_or(0.0)
-    );
-    if let JobOutput::Batch(pols) = run_job(mgr, ui, "2D polar mesh", JobKind::Batch { foils: need, cases, settings, sweep })? {
+    eprintln!("  computing {}", plan.describe());
+    if let JobOutput::Batch(pols) = run_job(mgr, ui, "2D polar mesh", JobKind::AutoPolars { batches: plan.batches })? {
         for p in pols {
             proj.add_foil_polar(p);
         }

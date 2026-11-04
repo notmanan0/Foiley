@@ -6,7 +6,7 @@
 //! captured.  Planform only: sweep and dihedral are ignored, as in xflr5.
 
 use crate::analysis::{Ctx, PlaneOpp, PolarKind, StripResult, G};
-use crate::foildb::Envelope;
+use crate::foildb::{Envelope, FamilyId};
 use crate::geom::Wing;
 use crate::PlaneError;
 use foiley_core::{Progress, Vec3};
@@ -20,6 +20,9 @@ struct Station {
     twist: f64,
     foil_a: String,
     foil_b: String,
+    /// polar families of the two end foils (resolved by `Ctx::new`)
+    fam_a: Option<FamilyId>,
+    fam_b: Option<FamilyId>,
     tau: f64,
     width: f64,
 }
@@ -59,6 +62,8 @@ fn stations(w: &Wing, n: usize) -> Vec<Station> {
             twist,
             foil_a: w.foil(i, left).to_string(),
             foil_b: w.foil(i + 1, left).to_string(),
+            fam_a: None,
+            fam_b: None,
             tau: t,
             width: w_th,
         });
@@ -71,18 +76,20 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
     let def = ctx.def;
     let wing = ctx.plane.main_wing().ok_or_else(|| PlaneError::Geometry("no main wing".into()))?;
     let n = def.llt.stations.clamp(8, 400);
-    let st = stations(wing, n);
+    let mut st = stations(wing, n);
     let b = wing.planform_span();
     let s_w = wing.planform_area();
     if b <= 0.0 || s_w <= 0.0 {
         return Err(PlaneError::Geometry("main wing has zero span or area".into()));
     }
-    for s in &st {
+    for s in &mut st {
         for f in [&s.foil_a, &s.foil_b] {
-            if ctx.db.re_range(f).is_none() {
+            if ctx.family_of(f).is_none() {
                 return Err(PlaneError::Input(format!("LLT needs type-1 viscous 2D polars for foil '{f}' (run a batch polar mesh first)")));
             }
         }
+        s.fam_a = ctx.family_of(&s.foil_a);
+        s.fam_b = ctx.family_of(&s.foil_b);
     }
     let m = st.len();
     let theta: Vec<f64> = (1..n).map(|k| k as f64 * PI / n as f64).collect();
@@ -111,8 +118,8 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
         _ => def.range.values().into_iter().map(|a| (a, def.velocity)).collect(),
     };
     let interp = |s: &Station, re: f64, a: f64| -> Option<(f64, f64, f64, f64, f64, Envelope)> {
-        let (pa, oa) = ctx.db.at_re_alpha(&s.foil_a, re, a)?;
-        let (pb, ob) = ctx.db.at_re_alpha(&s.foil_b, re, a)?;
+        let (pa, oa) = ctx.db.at_re_alpha(s.fam_a?, re, a)?;
+        let (pb, ob) = ctx.db.at_re_alpha(s.fam_b?, re, a)?;
         let l = |x: f64, y: f64| x + s.tau * (y - x);
         Some((l(pa.cl, pb.cl), l(pa.cd, pb.cd), l(pa.cm, pb.cm), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), oa.combine(ob)))
     };
@@ -124,7 +131,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
     let omega: Vec<f64> = (0..m)
         .map(|k| {
             let re = def.velocity.max(1.0) * st[k].chord / nu;
-            let slope = ctx.db.linear_lift(&st[k].foil_a, re).map(|v| v.1).unwrap_or(0.1).clamp(0.02, 0.2);
+            let slope = st[k].fam_a.and_then(|f| ctx.db.linear_lift(f, re)).map(|v| v.1).unwrap_or(0.1).clamp(0.02, 0.2);
             let lam = beta[k][k] * st[k].chord / b * slope;
             1.0 / (def.llt.relax.max(1.0) * (1.0 + lam))
         })
@@ -141,6 +148,8 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             v = (2.0 * mass * G / (rho * s_w * 0.5)).sqrt();
         }
         let mut converged = false;
+        // T3: |resultant - W| / W at the speed the section data were read at
+        let mut balance = f64::INFINITY;
         let mut cl = vec![0.0; m];
         let mut extra = vec![(0.0, 0.0, 1.0, 1.0, Envelope::Inside); m];
         let mut ok = true;
@@ -177,9 +186,18 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
                     ok = false;
                     break;
                 }
-                v = (2.0 * mass * G / (rho * s_w * clw)).sqrt();
+                if def.kind == PolarKind::Glide {
+                    // the total aerodynamic force balances the weight: CD
+                    // (induced, viscous at the current Re, extra) as reported
+                    let cdw = (0..m).map(|k| (-cl[k] * ai[k].to_radians() + if def.viscous { extra[k].0 } else { 0.0 }) * st[k].chord * st[k].width).sum::<f64>() / s_w + def.extra_drag.iter().map(|e| e.area * e.cd).sum::<f64>() / s_w;
+                    let cr = clw.hypot(cdw);
+                    balance = (0.5 * rho * v * v * s_w * cr - mass * G).abs() / (mass * G);
+                    v = (2.0 * mass * G / (rho * s_w * cr)).sqrt();
+                } else {
+                    v = (2.0 * mass * G / (rho * s_w * clw)).sqrt();
+                }
             }
-            if maxd < def.llt.tolerance && _it > 2 {
+            if maxd < def.llt.tolerance && _it > 2 && (def.kind != PolarKind::Glide || balance < crate::analysis::GLIDE_TOL) {
                 converged = true;
                 break;
             }
@@ -187,7 +205,14 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
         prog.set((ip + 1) as f64 / total as f64);
         if !ok || !converged {
             prog.count_failed();
-            failed.push(format!("alpha={alpha:.2} V={v:.2}: LLT {}", if ok { "did not converge (stall?)" } else { "left the 2D polar range" }));
+            let why = if !ok {
+                "left the 2D polar range".to_string()
+            } else if def.kind == PolarKind::Glide && balance >= crate::analysis::GLIDE_TOL {
+                format!("glide speed balance did not converge (|resultant - W|/W = {balance:.2e})")
+            } else {
+                "did not converge (stall?)".to_string()
+            };
+            failed.push(format!("alpha={alpha:.2} V={v:.2}: LLT {why}"));
             ai.iter_mut().for_each(|a| *a = 0.0);
             continue;
         }
@@ -228,6 +253,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
                 bending: 0.0,
                 out_of_polar: env.is_clamped(),
                 envelope: env as u8,
+                flap_clamped: false,
             });
         }
         strips.reverse();
@@ -282,7 +308,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             stability: None,
             stability_error: None,
             wake: vec![],
-            balance_residual: None,
+            balance_residual: (def.kind == PolarKind::Glide).then_some(balance),
             diagnostics: None,
         };
         if let Some(why) = crate::analysis::nonfinite_reason(&opp).or_else(|| crate::analysis::envelope_failure(def, &opp)) {

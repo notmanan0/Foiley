@@ -54,18 +54,18 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [x] **F023** · LLT settings honesty — after F009
 - [x] **F012** · Viscous envelope status
 - [x] **F014** · Cancellable blocked LU
-- [ ] **F008** · LLT glide balance — after F020
+- [x] **F008** · LLT glide balance — after F020
 - [ ] **F018** · Node-preserving 2D input
 - [ ] **F024** · GUI CAD import as a job
-- [ ] **F002** · Explicit polar families
+- [x] **F002** · Explicit polar families
 - [x] **F007** · One wake-aware evaluator for every driver (+F019) — after F020
 - [ ] **F004a** · Multi-body meshing
 - [ ] **F010a** · AVL export fidelity and importer
-- [ ] **F003** · Flap-deflected polars — after F002, F004a
+- [x] **F003** · Flap-deflected polars — after F002, F004a
 - [x] **F005a** · `FullLoad` stability model — after F007
-- [ ] **F016** · Provenance and project format v2 — after F002
+- [x] **F016** · Provenance and project format v2 — after F002
 - [x] **F015a** · Raw-bit hooks and harness
-- [ ] **F021** · Coverage-aware auto-polars — after F003
+- [x] **F021** · Coverage-aware auto-polars — after F003
 - [ ] **F004b** · GUI editing of every body — after F004a, F024
 - [ ] **F010b** · `.xfl`/`.fl5` import and conversion report
 - [ ] **F015b** · Raw-bit corpus and configuration matrix — after F015a

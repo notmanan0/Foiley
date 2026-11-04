@@ -20,14 +20,14 @@ fn viscous() -> PlanePolarDef {
 #[test]
 fn f012_envelope_kinds_reported() {
     let (_, db) = db_res(&[1e5, 1e6]);
-    let name = &naca0012().name;
+    let name = db.resolve(&naca0012().name, &Default::default()).unwrap().unwrap();
     assert_eq!(db.at_re_cl(name, 5e5, 0.5).unwrap().1, Envelope::Inside);
     assert_eq!(db.at_re_cl(name, 1e4, 0.5).unwrap().1, Envelope::ClampedRe);
     assert_eq!(db.at_re_cl(name, 5e7, 0.5).unwrap().1, Envelope::ClampedRe);
     assert_eq!(db.at_re_cl(name, 5e5, 5.0).unwrap().1, Envelope::ClampedCl);
     assert_eq!(db.at_re_cl(name, 1e4, 5.0).unwrap().1, Envelope::ClampedBoth);
     assert_eq!(db.at_re_alpha(name, 5e5, 40.0).unwrap().1, Envelope::ClampedCl);
-    assert!(db.at_re_cl("no such foil", 5e5, 0.5).is_none());
+    assert_eq!(db.resolve("no such foil", &Default::default()), Ok(None));
 
     // in a 3D point: flight Re ~ 7e5 against polars far above it
     let (p, hi) = db_res(&[1e8, 2e8]);
