@@ -149,7 +149,7 @@ impl<'a> Rd<'a> {
         }
         let s = self.take(n, what)?;
         let le = self.le;
-        let units: Vec<u16> = s.chunks_exact(2).map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }).collect();
+        let units: Vec<u16> = s.as_chunks::<2>().0.iter().map(|&c| if le { u16::from_le_bytes(c) } else { u16::from_be_bytes(c) }).collect();
         Ok(String::from_utf16_lossy(&units))
     }
     /// Legacy MFC string (`xfl::readString`): signed byte count + Latin-1.
