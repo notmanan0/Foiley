@@ -458,6 +458,10 @@ impl App {
                 check(ui, "keep panel Cp for 3D colour maps", &mut d.keep_cp, "uses memory for large meshes");
                 if matches!(d.method, Method::Vlm1 | Method::Vlm2) && on_fwake {
                     int(ui, "free-wake iterations", &mut d.free_wake, 0..=usize::MAX,"0 = rigid wake along x (fast, linear). >0 relaxes the trailing vortices along the local flow at every point (slower; shown in the 3D view)");
+                    if d.free_wake > 0 {
+                        int(ui, "  wake segments", &mut d.wake_nseg, 2..=400, "segments per trailing line (geometric spacing, fine at the trailing edge)");
+                        num_u(ui, "  wake relaxation", &mut d.wake_relax, 0.01, 0.05..=1.0, "", "under-relaxation of the node update: 1 moves the wake fully onto the new streamlines");
+                    }
                 }
             });
         });

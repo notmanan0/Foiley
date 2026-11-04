@@ -2,27 +2,30 @@
 //! time responses (Etkin & Reid small-perturbation equations in stability
 //! axes; level flight, theta0 = 0).
 
-use crate::analysis::{wind_dir, wind_normal, wind_side, Ctx, System, G};
+use crate::analysis::{wind_dir, wind_normal, wind_side, Ctx, G};
+use crate::evaluator::Evaluator;
 use crate::PlaneError;
 use foiley_core::linalg::{eigen, Complex};
-use foiley_core::{Vec3, DEG};
+use foiley_core::{Progress, Vec3, DEG};
 use serde::{Deserialize, Serialize};
 
 /// Pitching moment coefficient (inviscid, about the CoG) at unit speed.
-fn cm_at(ctx: &Ctx, sys: &System, alpha: f64, beta: f64) -> f64 {
-    let raw = sys.loads(wind_dir(alpha, beta), Vec3::ZERO);
-    raw.moment.dot(wind_side(alpha, beta)) / (0.5 * ctx.s_ref * ctx.c_ref)
+fn cm_at(ctx: &Ctx, ev: &Evaluator, alpha: f64, beta: f64, prog: &Progress) -> Result<f64, PlaneError> {
+    let (raw, _) = ev.loads(wind_dir(alpha, beta), 1.0, Vec3::ZERO, prog)?;
+    Ok(raw.moment.dot(wind_side(alpha, beta)) / (0.5 * ctx.s_ref * ctx.c_ref))
 }
 
 /// Find the trimmed angle of attack (Cm = 0) and the speed at which lift
-/// equals weight.  Returns (alpha deg, speed m/s).
-pub fn trim(ctx: &Ctx, sys: &System, _cog: Vec3, beta: f64) -> Option<(f64, f64)> {
+/// equals weight.  Returns (alpha deg, speed m/s), or None when there is no
+/// trim; `Err` only for a solver failure or cancellation.
+pub fn trim(ctx: &Ctx, ev: &Evaluator, beta: f64, prog: &Progress) -> Result<Option<(f64, f64)>, PlaneError> {
+    let cm_at = |a: f64| cm_at(ctx, ev, a, beta, prog);
     // coarse scan for a stable crossing (Cm decreasing through zero)
     let mut prev: Option<(f64, f64)> = None;
     let mut bracket = None;
     let mut a = -10.0;
     while a <= 30.0 + 1e-9 {
-        let c = cm_at(ctx, sys, a, beta);
+        let c = cm_at(a)?;
         if let Some((pa, pc)) = prev {
             if pc * c <= 0.0 {
                 bracket = Some((pa, pc, a, c));
@@ -35,19 +38,21 @@ pub fn trim(ctx: &Ctx, sys: &System, _cog: Vec3, beta: f64) -> Option<(f64, f64)
         a += 2.0;
     }
     if bracket.is_none() {
-        let c0 = cm_at(ctx, sys, -30.0, beta);
-        let c1 = cm_at(ctx, sys, -10.0, beta);
+        let c0 = cm_at(-30.0)?;
+        let c1 = cm_at(-10.0)?;
         if c0 * c1 <= 0.0 {
             bracket = Some((-30.0, c0, -10.0, c1));
         }
     }
-    let (mut a0, mut c0, mut a1, mut c1) = bracket?;
+    let Some((mut a0, mut c0, mut a1, mut c1)) = bracket else {
+        return Ok(None);
+    };
     // Illinois regula falsi
     let mut side = 0;
     let mut am = a0;
     for _ in 0..60 {
         am = (a0 * c1 - a1 * c0) / (c1 - c0);
-        let cm = cm_at(ctx, sys, am, beta);
+        let cm = cm_at(am)?;
         if cm.abs() < 1e-8 || (a1 - a0).abs() < 1e-7 {
             break;
         }
@@ -67,12 +72,12 @@ pub fn trim(ctx: &Ctx, sys: &System, _cog: Vec3, beta: f64) -> Option<(f64, f64)
             side = 1;
         }
     }
-    let raw = sys.loads(wind_dir(am, beta), Vec3::ZERO);
+    let (raw, _) = ev.loads(wind_dir(am, beta), 1.0, Vec3::ZERO, prog)?;
     let l1 = (raw.force + raw.induced_force).dot(wind_normal(am)) * ctx.def.fluid.rho;
     if l1 <= 1e-12 || ctx.inertia.mass <= 0.0 {
-        return None;
+        return Ok(None);
     }
-    Some((am, (ctx.inertia.mass * G / l1).sqrt()))
+    Ok(Some((am, (ctx.inertia.mass * G / l1).sqrt())))
 }
 
 /// Dimensional derivatives in stability axes (forces N per m/s or per rad/s).
@@ -163,14 +168,17 @@ pub struct StabilityResult {
     pub b_lat: [f64; 4],
 }
 
-fn forces(ctx: &Ctx, sys: &System, vinf: Vec3, omega: Vec3) -> (Vec3, Vec3) {
-    let raw = sys.loads(vinf, omega);
+fn forces(ctx: &Ctx, ev: &Evaluator, vinf: Vec3, omega: Vec3, prog: &Progress) -> Result<(Vec3, Vec3), PlaneError> {
+    let (raw, _) = ev.loads_at(vinf, omega, prog)?;
     let rho = ctx.def.fluid.rho;
-    ((raw.force + raw.induced_force) * rho, raw.moment * rho)
+    Ok(((raw.force + raw.induced_force) * rho, raw.moment * rho))
 }
 
 /// Stability derivatives, state matrices and modes at a trimmed point.
-pub fn analyse(ctx: &Ctx, sys: &System, _cog: Vec3, alpha: f64, u0: f64) -> Result<StabilityResult, PlaneError> {
+/// A relaxed wake is frozen at the reference state (see
+/// `Evaluator::derivative_evaluator`) unless the definition asks for
+/// `relaxed_derivatives`.
+pub fn analyse(ctx: &Ctx, ev: &Evaluator, _cog: Vec3, alpha: f64, u0: f64, prog: &Progress) -> Result<StabilityResult, PlaneError> {
     let (sa, ca) = (alpha * DEG).sin_cos();
     let is = Vec3::new(-ca, 0.0, -sa);
     let js = Vec3::Y;
@@ -183,23 +191,25 @@ pub fn analyse(ctx: &Ctx, sys: &System, _cog: Vec3, alpha: f64, u0: f64) -> Resu
         return Err(PlaneError::Input("mass is zero".into()));
     }
     let mut d = Derivatives::default();
+    let frozen = ev.derivative_evaluator(-is, u0, prog)?;
+    let ev = frozen.as_ref().unwrap_or(ev);
     // translations: the air velocity is V0 - e*delta when the aircraft speeds up along e
-    let tr = |e: Vec3| {
-        let (fm, mm) = forces(ctx, sys, v0 - e * du, Vec3::ZERO);
-        let (fp, mp) = forces(ctx, sys, v0 + e * du, Vec3::ZERO);
-        ((fm - fp) / (2.0 * du), (mm - mp) / (2.0 * du))
+    let tr = |e: Vec3| -> Result<(Vec3, Vec3), PlaneError> {
+        let (fm, mm) = forces(ctx, ev, v0 - e * du, Vec3::ZERO, prog)?;
+        let (fp, mp) = forces(ctx, ev, v0 + e * du, Vec3::ZERO, prog)?;
+        Ok(((fm - fp) / (2.0 * du), (mm - mp) / (2.0 * du)))
     };
-    let (f_u, m_u) = tr(is);
-    let (f_v, m_v) = tr(js);
-    let (f_w, m_w) = tr(ks);
-    let rot = |e: Vec3| {
-        let (fp, mp) = forces(ctx, sys, v0, e * dw);
-        let (fm, mm) = forces(ctx, sys, v0, -e * dw);
-        ((fp - fm) / (2.0 * dw), (mp - mm) / (2.0 * dw))
+    let (f_u, m_u) = tr(is)?;
+    let (f_v, m_v) = tr(js)?;
+    let (f_w, m_w) = tr(ks)?;
+    let rot = |e: Vec3| -> Result<(Vec3, Vec3), PlaneError> {
+        let (fp, mp) = forces(ctx, ev, v0, e * dw, prog)?;
+        let (fm, mm) = forces(ctx, ev, v0, -e * dw, prog)?;
+        Ok(((fp - fm) / (2.0 * dw), (mp - mm) / (2.0 * dw)))
     };
-    let (f_p, m_p) = rot(is);
-    let (f_q, m_q) = rot(js);
-    let (f_r, m_r) = rot(ks);
+    let (f_p, m_p) = rot(is)?;
+    let (f_q, m_q) = rot(js)?;
+    let (f_r, m_r) = rot(ks)?;
     d.xu = f_u.dot(is);
     d.zu = f_u.dot(ks);
     d.mu = m_u.dot(js);
@@ -291,15 +301,16 @@ pub fn analyse(ctx: &Ctx, sys: &System, _cog: Vec3, alpha: f64, u0: f64) -> Resu
 }
 
 /// Control derivatives from a second system built with the control
-/// parameter increased by `dt`: forces at the same trimmed state.
-pub fn add_control_derivatives(ctx: &Ctx, base: &System, plus: &System, res: &mut StabilityResult, dt: f64) {
+/// parameter increased by `dt`: forces at the same trimmed state, both
+/// through their evaluators (so with the same wake model).
+pub fn add_control_derivatives(ctx: &Ctx, base: &Evaluator, plus: &Evaluator, res: &mut StabilityResult, dt: f64, prog: &Progress) -> Result<(), PlaneError> {
     let (sa, ca) = (res.alpha * DEG).sin_cos();
     let is = Vec3::new(-ca, 0.0, -sa);
     let js = Vec3::Y;
     let ks = Vec3::new(sa, 0.0, -ca);
     let v0 = -is * res.u0;
-    let (f0, m0) = forces(ctx, base, v0, Vec3::ZERO);
-    let (f1, m1) = forces(ctx, plus, v0, Vec3::ZERO);
+    let (f0, m0) = forces(ctx, base, v0, Vec3::ZERO, prog)?;
+    let (f1, m1) = forces(ctx, plus, v0, Vec3::ZERO, prog)?;
     let (df, dm) = ((f1 - f0) / dt, (m1 - m0) / dt);
     let c = [df.dot(is), df.dot(js), df.dot(ks), dm.dot(is), dm.dot(js), dm.dot(ks)];
     let m = ctx.inertia.mass;
@@ -309,6 +320,7 @@ pub fn add_control_derivatives(ctx: &Ctx, base: &System, plus: &System, res: &mu
     res.b_long = [c[0] / m, c[2] / m, c[4] / iyy, 0.0];
     res.b_lat = [c[1] / m, c[3] / ixp + c[5] * izxp, c[3] * izxp + c[5] / izp, 0.0];
     res.control = Some(c);
+    Ok(())
 }
 
 /// Shape of a control input for forced responses.
