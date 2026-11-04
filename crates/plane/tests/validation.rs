@@ -296,6 +296,7 @@ fn long_free_wake_cancels() {
     let p = rect("thin", 8.0, 4, 16);
     let mut d = inviscid(Method::Vlm2, 6.0);
     d.free_wake = 1_000_000;
+    d.wake_tol = 0.0; // never converged: run until cancelled
     let db = db(); // built lazily (2D polars): keep it out of the timing
     let prog = Progress::new();
     let t = std::time::Instant::now();

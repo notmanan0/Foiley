@@ -407,6 +407,15 @@ enum PlaneCmd {
         /// VLM free-wake relaxation iterations (0 = rigid wake)
         #[arg(long, default_value_t = 0)]
         free_wake: usize,
+        /// free wake: segments per trailing line
+        #[arg(long, default_value_t = 24)]
+        wake_nseg: usize,
+        /// free wake: under-relaxation of the node update, in (0, 1]
+        #[arg(long, default_value_t = 0.5)]
+        wake_relax: f64,
+        /// free wake: convergence tolerance (node displacement / c_ref and relative circulation change)
+        #[arg(long, default_value_t = 1e-3)]
+        wake_tol: f64,
         /// T7: forced response "step", "pulse:SECONDS", "doublet:SECONDS" or "sine:HZ" (CSV to --response-out)
         #[arg(long)]
         response: Option<String>,
@@ -1143,7 +1152,7 @@ fn real_main() -> Result<(), String> {
                 proj.save(&save)?;
                 eprintln!("  saved {}", save.display());
             }
-            PlaneCmd::Analyze { src, ptype, method, free_wake, response, response_amp, response_time, response_out, range, speed, alpha, beta, list, inviscid, altitude, water, mass, cog, ground, derivatives, strict_envelope, flaps, gains, reference, auto_polars, llt_stations, strips, save, out } => {
+            PlaneCmd::Analyze { src, ptype, method, free_wake, wake_nseg, wake_relax, wake_tol, response, response_amp, response_time, response_out, range, speed, alpha, beta, list, inviscid, altitude, water, mass, cog, ground, derivatives, strict_envelope, flaps, gains, reference, auto_polars, llt_stations, strips, save, out } => {
                 let (mut proj, plane) = load_plane(&src)?;
                 let kind = match ptype.to_lowercase().trim_start_matches('t') {
                     "1" => PolarKind::FixedSpeed,
@@ -1170,6 +1179,9 @@ fn real_main() -> Result<(), String> {
                 let mut def = PlanePolarDef { kind, method, velocity: speed, alpha, beta, range: Range { from: a, to: b, step: s }, viscous: !inviscid, fluid, ground_height: ground, derivatives, ..Default::default() };
                 def.llt.stations = llt_stations;
                 def.free_wake = free_wake;
+                def.wake_nseg = wake_nseg;
+                def.wake_relax = wake_relax;
+                def.wake_tol = wake_tol;
                 def.strict_envelope = strict_envelope;
                 if kind == PolarKind::Stability && a == -4.0 && b == 10.0 {
                     def.range = Range { from: 0.0, to: 0.0, step: 1.0 };

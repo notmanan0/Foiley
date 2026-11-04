@@ -10,6 +10,7 @@
 //! freestream along x, y, z and unit rotations p, q, r about the CoG) are
 //! superposed for any operating point.
 
+use crate::evaluator::WakeReport;
 use crate::mesh::{Mesh, PanelKind};
 use crate::PlaneError;
 use foiley_core::linalg::{diagnose, DenseMatrix, Diagnostics, FnRows, Lu, SolveReport};
@@ -64,6 +65,7 @@ pub enum Ground {
 }
 
 /// The vortex elements of a thin mesh.
+#[derive(Clone)]
 pub struct Lattice<'a> {
     pub mesh: &'a Mesh,
     pub rings: bool,
@@ -166,6 +168,22 @@ impl<'a> Lattice<'a> {
     }
 }
 
+/// Right-hand sides of the six unit solutions (u, v, w, p, q, r about `cog`).
+fn unit_rhs(mesh: &Mesh, cog: Vec3) -> DenseMatrix {
+    let n = mesh.panels.len();
+    let mut rhs = DenseMatrix::zeros(n, 6);
+    for i in 0..n {
+        let p = &mesh.panels[i];
+        let r = p.ctrl - cog;
+        let e = [Vec3::X, Vec3::Y, Vec3::Z];
+        for k in 0..3 {
+            rhs.set(i, k, -e[k].dot(p.normal));
+            rhs.set(i, 3 + k, -r.cross(e[k]).dot(p.normal));
+        }
+    }
+    rhs
+}
+
 /// Factored VLM system with unit solutions.
 pub struct VlmSystem<'a> {
     pub lat: Lattice<'a>,
@@ -217,16 +235,7 @@ impl<'a> VlmSystem<'a> {
         let lu = Lu::factor_with(a, prog)?;
         prog.set(0.9);
         prog.check()?;
-        let mut rhs = DenseMatrix::zeros(n, 6);
-        for i in 0..n {
-            let p = &mesh.panels[i];
-            let r = p.ctrl - cog;
-            let e = [Vec3::X, Vec3::Y, Vec3::Z];
-            for k in 0..3 {
-                rhs.set(i, k, -e[k].dot(p.normal));
-                rhs.set(i, 3 + k, -r.cross(e[k]).dot(p.normal));
-            }
-        }
+        let mut rhs = unit_rhs(mesh, cog);
         let b0 = if diag != Diagnostics::Off { rhs.clone() } else { DenseMatrix::default() };
         lu.solve_many(&mut rhs);
         let report = if diag != Diagnostics::Off {
@@ -303,6 +312,27 @@ pub struct FreeWake {
     pub lines: Vec<Vec<Vec3>>,
     /// per element: (line of corner A, line of corner B) for trailing elements
     pub legs: Vec<Option<(usize, usize)>>,
+    /// direction of the semi-infinite tail of every line (the freestream
+    /// direction the wake was relaxed in)
+    pub dir: Vec3,
+}
+
+/// Settings of a relaxed-wake solve (`evaluator::WakeModel::Relaxed`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WakeSettings {
+    /// relaxation steps at most (each re-builds and re-factors the matrix)
+    pub max_iter: usize,
+    /// stop when the max node displacement / `c_ref` and the relative
+    /// circulation change are both below this
+    pub tol: f64,
+    /// segments per wake line
+    pub nseg: usize,
+    /// under-relaxation of the node update (1 = move fully onto the new streamline)
+    pub relax: f64,
+    /// wake length, m
+    pub length: f64,
+    /// reference chord for the displacement residual, m
+    pub c_ref: f64,
 }
 
 impl<'a> VlmSystem<'a> {
@@ -360,13 +390,18 @@ impl<'a> VlmSystem<'a> {
         }
     }
 
-    /// Solve with a relaxed wake for one freestream (no superposition).
-    /// `length` = wake length (m), `nseg` = segments per wake line.
-    pub fn solve_free_wake(&self, vinf: Vec3, iterations: usize, length: f64, nseg: usize, prog: &Progress) -> Result<(Vec<f64>, FreeWake), PlaneError> {
+    /// Segment lengths along a wake line (geometric, fine near the trailing edge).
+    fn wake_segments(length: f64, nseg: usize) -> Vec<f64> {
+        let nseg = nseg.max(2);
+        let r: f64 = 1.15;
+        let tot: f64 = (0..nseg).map(|k| r.powi(k as i32)).sum();
+        (0..nseg).map(|k| length * r.powi(k as i32) / tot).collect()
+    }
+
+    /// Straight wake lines along `dir` from the trailing-element corners.
+    pub fn rigid_wake(&self, dir: Vec3, length: f64, nseg: usize) -> FreeWake {
         let mesh = self.lat.mesh;
         let n = mesh.panels.len();
-        let dir = vinf.normalized();
-        let nseg = nseg.max(2);
         let tol = 1e-9 * length.max(1e-9);
         let mut starts: Vec<Vec3> = Vec::new();
         let mut legs = vec![None; n];
@@ -386,11 +421,8 @@ impl<'a> VlmSystem<'a> {
                 legs[j] = Some((ia, ib));
             }
         }
-        // geometric spacing along the wake (fine near the trailing edge)
-        let r: f64 = 1.15;
-        let tot: f64 = (0..nseg).map(|k| r.powi(k as i32)).sum();
-        let seg_len: Vec<f64> = (0..nseg).map(|k| length * r.powi(k as i32) / tot).collect();
-        let mut lines: Vec<Vec<Vec3>> = starts
+        let seg_len = Self::wake_segments(length, nseg);
+        let lines = starts
             .iter()
             .map(|s| {
                 let mut l = vec![*s];
@@ -401,35 +433,70 @@ impl<'a> VlmSystem<'a> {
                 l
             })
             .collect();
+        FreeWake { lines, legs, dir }
+    }
+
+    /// Influence matrix with the trailing legs replaced by the wake lines of `fw`.
+    fn wake_matrix(&self, fw: &FreeWake) -> DenseMatrix {
+        let mesh = self.lat.mesh;
+        let n = mesh.panels.len();
+        let mut a = DenseMatrix::zeros(n, n);
+        a.fill_columns_par(|j, col| {
+            for (i, v) in col.iter_mut().enumerate() {
+                let p = &mesh.panels[i];
+                let vel = self.with_ground(p.ctrl, |x| {
+                    let mut w = self.element_core(j, x);
+                    if let Some((la, lb)) = fw.legs[j] {
+                        w += self.polyline(&fw.lines[lb], fw.dir, x) - self.polyline(&fw.lines[la], fw.dir, x);
+                    }
+                    w
+                });
+                *v = vel.dot(p.normal);
+            }
+        });
+        a
+    }
+
+    /// Solve with a relaxed wake for one freestream `vinf` and body rates
+    /// `omega` (no superposition).  Each step re-builds and re-factors the
+    /// matrix.  Stops when the max node displacement / `c_ref` and
+    /// ||dGamma||inf / ||Gamma||inf both drop below `ws.tol`, or after
+    /// `ws.max_iter` steps.
+    pub fn solve_free_wake(&self, vinf: Vec3, omega: Vec3, ws: &WakeSettings, prog: &Progress) -> Result<(Vec<f64>, FreeWake, WakeReport), PlaneError> {
+        let mesh = self.lat.mesh;
+        let n = mesh.panels.len();
+        let dir = vinf.normalized();
+        let seg_len = Self::wake_segments(ws.length, ws.nseg);
+        let mut fw = self.rigid_wake(dir, ws.length, ws.nseg);
+        let rhs0: Vec<f64> = mesh.panels.iter().map(|p| -(vinf - omega.cross(p.ctrl - self.cog)).dot(p.normal)).collect();
+        let c_ref = ws.c_ref.max(1e-12);
+        let relax = ws.relax;
         let mut gamma = vec![0.0; n];
-        for it in 0..=iterations {
+        let mut rep = WakeReport { relaxed: true, ..Default::default() };
+        for it in 0..=ws.max_iter {
             prog.check()?;
-            prog.stage(format!("Free wake iteration {}/{}", it, iterations));
-            let mut a = DenseMatrix::zeros(n, n);
-            a.fill_columns_par(|j, col| {
-                for (i, v) in col.iter_mut().enumerate() {
-                    let p = &mesh.panels[i];
-                    let vel = self.with_ground(p.ctrl, |x| {
-                        let mut w = self.element_core(j, x);
-                        if let Some((la, lb)) = legs[j] {
-                            w += self.polyline(&lines[lb], dir, x) - self.polyline(&lines[la], dir, x);
-                        }
-                        w
-                    });
-                    *v = vel.dot(p.normal);
-                }
-            });
-            let lu = Lu::factor_with(a, prog)?;
-            let mut rhs: Vec<f64> = mesh.panels.iter().map(|p| -vinf.dot(p.normal)).collect();
-            lu.solve(&mut rhs);
-            gamma = rhs;
-            if it == iterations {
+            prog.stage(format!("Free wake iteration {}/{}", it, ws.max_iter));
+            let lu = Lu::factor_with(self.wake_matrix(&fw), prog)?;
+            let mut g = rhs0.clone();
+            lu.solve(&mut g);
+            if it > 0 {
+                let gmax = g.iter().fold(0.0f64, |a, x| a.max(x.abs())).max(1e-300);
+                rep.circulation = g.iter().zip(&gamma).fold(0.0f64, |a, (x, y)| a.max((x - y).abs())) / gmax;
+            }
+            gamma = g;
+            rep.iterations = it;
+            if it > 0 && rep.displacement < ws.tol && rep.circulation < ws.tol {
+                rep.converged = true;
+                break;
+            }
+            if it == ws.max_iter {
                 break;
             }
             // net circulation of each wake line
+            let lines = &fw.lines;
             let mut lg = vec![0.0; lines.len()];
             for j in 0..n {
-                if let Some((la, lb)) = legs[j] {
+                if let Some((la, lb)) = fw.legs[j] {
                     lg[lb] += gamma[j];
                     lg[la] -= gamma[j];
                 }
@@ -455,17 +522,33 @@ impl<'a> VlmSystem<'a> {
                 .map(|l| {
                     let mut out = vec![l[0]];
                     for (k, d) in seg_len.iter().enumerate() {
-                        let v = vinf + induced(l[k]);
+                        let v = vinf - omega.cross(l[k] - self.cog) + induced(l[k]);
                         let step = *out.last().unwrap() + v.normalized() * *d;
-                        out.push(l[k + 1] * 0.5 + step * 0.5);
+                        out.push(l[k + 1] * (1.0 - relax) + step * relax);
                     }
                     out
                 })
                 .collect();
-            lines = new_lines;
-            prog.set((it + 1) as f64 / (iterations + 1) as f64);
+            let disp = new_lines.iter().zip(lines).flat_map(|(a, b)| a.iter().zip(b).map(|(p, q)| (*p - *q).norm())).fold(0.0f64, f64::max) / c_ref;
+            rep.displacement = if disp.is_finite() { disp } else { f64::MAX };
+            fw.lines = new_lines;
+            prog.set((it + 1) as f64 / (ws.max_iter + 1) as f64);
         }
-        Ok((gamma, FreeWake { lines, legs }))
+        if !rep.circulation.is_finite() {
+            rep.circulation = f64::MAX;
+        }
+        Ok((gamma, fw, rep))
+    }
+
+    /// A system whose wake is frozen in the shape `fw`: the matrix with
+    /// those wake lines, factored once, and its six unit solutions, so that
+    /// perturbations about a relaxed reference state superpose.
+    pub fn frozen(&self, fw: &FreeWake, prog: &Progress) -> Result<VlmSystem<'a>, PlaneError> {
+        let lu = Lu::factor_with(self.wake_matrix(fw), prog)?;
+        let mut rhs = unit_rhs(self.lat.mesh, self.cog);
+        lu.solve_many(&mut rhs);
+        let unit = std::array::from_fn(|k| rhs.col(k).to_vec());
+        Ok(VlmSystem { lat: self.lat.clone(), cog: self.cog, unit, report: SolveReport::default() })
     }
 }
 

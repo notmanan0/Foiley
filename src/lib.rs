@@ -16,6 +16,7 @@ pub mod opextra_blplot;
 pub mod panel;
 pub mod polar;
 pub mod qdes;
+pub mod rawdump;
 pub mod simd;
 pub mod spline;
 pub mod sweep;

@@ -1,0 +1,59 @@
+--- a/xpol.f
++++ b/xpol.f
+@@ -536,6 +536,9 @@
+       INCLUDE 'XFOIL.INC'
+       LOGICAL ERROR
+ C
++C---- Foiley raw-bit hook (inactive unless RAWDUMP is set)
++      CALL RAWDMP
++C
+ cc      WRITE(*,1000) CL, CD, CM
+ cc 1000 FORMAT(/' CL =', F7.3, '    Cd =', F9.5, '    Cm =', F8.4)
+ C
+@@ -943,3 +946,46 @@
+       END
+ 
+ 
++
++      SUBROUTINE RAWDMP
++C---------------------------------------------------------------
++C     Foiley raw-bit hook (bench/xfoil-rawdump.patch, finding F015).
++C     When the environment variable RAWDUMP names a file, every
++C     point PLRADD stores is appended to it: the coefficients and
++C     the BL arrays, each value as the hex digits of its bits (Z16).
++C     Foiley's `rawdump` feature writes the same records.
++C---------------------------------------------------------------
++      INCLUDE 'XFOIL.INC'
++      CHARACTER*256 RDFILE
++      LOGICAL LRAWOP
++      SAVE LRAWOP
++      DATA LRAWOP / .FALSE. /
++C
++      IF(.NOT.LRAWOP) THEN
++       CALL GETENV('RAWDUMP',RDFILE)
++       IF(RDFILE.EQ.' ') RETURN
++       OPEN(UNIT=79,FILE=RDFILE,STATUS='UNKNOWN')
++       LRAWOP = .TRUE.
++      ENDIF
++C
++      WRITE(79,1000) NBL(1), NBL(2)
++      WRITE(79,1010) 'ALFA', ALFA
++      WRITE(79,1010) 'CL', CL
++      WRITE(79,1010) 'CD', CD
++      WRITE(79,1010) 'CDP', CDP
++      WRITE(79,1010) 'CM', CM
++      WRITE(79,1010) 'XTR1', XOCTR(1)
++      WRITE(79,1010) 'XTR2', XOCTR(2)
++      DO IS = 1, 2
++        DO IBL = 2, NBL(IS)
++          WRITE(79,1020) IS, IBL,
++     &      UEDG(IBL,IS), THET(IBL,IS), DSTR(IBL,IS), CTAU(IBL,IS)
++        ENDDO
++      ENDDO
++      CALL FLUSH(79)
++      RETURN
++C
++ 1000 FORMAT('POINT',2I6)
++ 1010 FORMAT(A,1X,Z16.16)
++ 1020 FORMAT('BL',2I6,4(1X,Z16.16))
++      END ! RAWDMP
