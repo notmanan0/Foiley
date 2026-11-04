@@ -138,7 +138,9 @@ impl Project {
 
     /// Add or merge a 2D polar (same foil + name: points are merged).  A
     /// polar without a geometry hash gets its foil's.
-    pub fn add_foil_polar(&mut self, mut p: FoilPolar) {
+    pub fn add_foil_polar(&mut self, p: FoilPolar) {
+        // a deflected copy from an automatic batch goes under its base foil
+        let mut p = crate::auto::adopt(p, |base| self.foil(base).map(|f| f.geom_hash()));
         if p.foil_hash.is_none() {
             p.foil_hash = self.foil(&p.foil).map(|f| f.geom_hash());
         }

@@ -27,6 +27,8 @@ pub enum JobKind {
     FoilPolar { foil: Foil, settings: AnalysisSettings, sweep: Sweep },
     FoilPoint { foil: Foil, settings: AnalysisSettings, value: f64, is_alpha: bool },
     Batch { foils: Vec<Foil>, cases: Vec<BatchCase>, settings: AnalysisSettings, sweep: Sweep },
+    /// the batches of an `auto::plan`, one after the other (output: `Batch`)
+    AutoPolars { batches: Vec<crate::auto::AutoBatch> },
     PlanePolar { plane: Plane, db: FoilDb, def: PlanePolarDef },
     Mesh { plane: Plane, db: FoilDb, options: MeshOptions },
     Optimise { foil: Foil, settings: foiley_foil::optim::OptimSettings },
@@ -38,7 +40,7 @@ impl JobKind {
         match self {
             JobKind::FoilPolar { .. } => "2D polar",
             JobKind::FoilPoint { .. } => "2D point",
-            JobKind::Batch { .. } => "2D batch",
+            JobKind::Batch { .. } | JobKind::AutoPolars { .. } => "2D batch",
             JobKind::PlanePolar { .. } => "3D polar",
             JobKind::Mesh { .. } => "mesh",
             JobKind::Optimise { .. } => "optimiser",
@@ -258,6 +260,30 @@ fn execute(job: &Job, kind: JobKind, notify: &Notify) -> Result<JobOutput, Strin
                 match r.polar {
                     Ok(pol) => out.push(pol),
                     Err(_) => errs += 1,
+                }
+            }
+            if errs > 0 {
+                p.warn(format!("{errs} polar(s) failed"));
+            }
+            Ok(JobOutput::Batch(out))
+        }
+        JobKind::AutoPolars { batches } => {
+            let n = batches.len();
+            let mut out = Vec::new();
+            let mut errs = 0;
+            for (k, b) in batches.iter().enumerate() {
+                let res = run_batch(&b.foils, &b.cases, &b.settings, &b.sweep, &p.part(k, n), &|r| {
+                    if let Ok(pol) = &r.polar {
+                        job.partial.lock().unwrap().foil_polars.push(pol.clone());
+                        notify();
+                    }
+                });
+                p.check().map_err(|e| e.to_string())?;
+                for r in res {
+                    match r.polar {
+                        Ok(pol) => out.push(pol),
+                        Err(_) => errs += 1,
+                    }
                 }
             }
             if errs > 0 {
