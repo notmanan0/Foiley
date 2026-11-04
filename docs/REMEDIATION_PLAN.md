@@ -59,7 +59,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [ ] **F024** · GUI CAD import as a job
 - [ ] **F002** · Explicit polar families
 - [ ] **F007** · One wake-aware evaluator for every driver (+F019) — after F020
-- [ ] **F004a** · Multi-body meshing
+- [x] **F004a** · Multi-body meshing
 - [ ] **F010a** · AVL export fidelity and importer
 - [ ] **F003** · Flap-deflected polars — after F002, F004a
 - [ ] **F005a** · `FullLoad` stability model — after F007
