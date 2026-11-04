@@ -13,5 +13,5 @@ pub mod jobs;
 pub mod legacy_io;
 pub mod project;
 
-pub use jobs::{Job, JobId, JobKind, JobManager, JobOutput, JobStatus};
+pub use jobs::{CadFormat, CadImport, CadImportResult, Job, JobId, JobKind, JobManager, JobOutput, JobStatus};
 pub use project::Project;

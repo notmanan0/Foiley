@@ -54,6 +54,8 @@ pub enum Pending {
     Mesh(u64),
     Inverse,
     Optimise,
+    /// apply an imported CAD body to the plane of this name
+    CadImport { plane: String },
 }
 
 enum IoMsg {
@@ -391,6 +393,20 @@ impl App {
                 self.fui.opt_result = Some(r);
                 self.notify(msg, false);
             }
+            (Pending::CadImport { plane }, JobOutput::CadImport(r)) => match self.project.planes.iter().position(|p| p.name == plane) {
+                Some(i) => {
+                    let mut edited = self.project.planes[i].clone();
+                    match r.apply(&mut edited) {
+                        Ok(msg) => {
+                            self.snapshot();
+                            self.project.planes[i] = edited;
+                            self.notify(format!("{title}: {msg}"), false);
+                        }
+                        Err(e) => self.notify(format!("{title}: {e}"), true),
+                    }
+                }
+                None => self.notify(format!("{title}: plane '{plane}' no longer exists"), true),
+            },
             (Pending::Mesh(key), JobOutput::Mesh(m)) => {
                 self.pui.mesh = Some((key, m));
                 self.pui.mesh_job = None;

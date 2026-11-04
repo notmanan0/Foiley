@@ -15,7 +15,8 @@ use foiley_foil::analysis::{analyze_point, PointDetail};
 use foiley_foil::batch::{run_batch, BatchCase};
 use foiley_foil::{analyze, AnalysisSettings, Foil, FoilPolar, Sweep};
 use foiley_plane::mesh::{build, Mesh, MeshOptions};
-use foiley_plane::{run_polar, FoilDb, Plane, PlaneOpp, PlanePolar, PlanePolarDef};
+use foiley_plane::cad::Tri;
+use foiley_plane::{run_polar, FoilDb, Fuse, Plane, PlaneOpp, PlanePolar, PlanePolarDef};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,6 +32,103 @@ pub enum JobKind {
     Mesh { plane: Plane, db: FoilDb, options: MeshOptions },
     Optimise { foil: Foil, settings: foiley_foil::optim::OptimSettings },
     Inverse { foil: Foil, alpha: f64, mode: foiley_foil::inverse::InverseMode, paneling: foiley_foil::foil::Paneling, target: Option<(Vec<f64>, Option<(usize, usize)>)>, iterations: usize },
+    /// Read and tessellate an STL / STEP body (F024).
+    CadImport(CadImport),
+}
+
+/// CAD file formats a body can be imported from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CadFormat {
+    Stl,
+    Step,
+}
+
+impl CadFormat {
+    /// From the file extension (`.stl`, `.step`, `.stp`, any case).
+    pub fn from_path(path: &std::path::Path) -> Option<CadFormat> {
+        match path.extension()?.to_string_lossy().to_lowercase().as_str() {
+            "stl" => Some(CadFormat::Stl),
+            "step" | "stp" => Some(CadFormat::Step),
+            _ => None,
+        }
+    }
+}
+
+/// A CAD import request: the file's bytes (owned, read by the caller) and
+/// where the result goes.  The job only produces triangles; the caller
+/// applies them with [`CadImportResult::apply`] when the job is done.
+#[derive(Clone, Debug)]
+pub struct CadImport {
+    /// body name (usually the file stem)
+    pub name: String,
+    pub format: CadFormat,
+    pub bytes: Vec<u8>,
+    /// extra factor to metres applied after reading (1 = automatic: STEP
+    /// files carry their units, STL files are taken as metres)
+    pub scale: f64,
+    /// approximate triangle count for STEP tessellation
+    pub target_triangles: usize,
+    /// index of the plane body (`Plane::fuses`) to replace; the length of
+    /// the list appends a new body
+    pub body: usize,
+}
+
+/// Output of a [`JobKind::CadImport`] job.
+#[derive(Clone, Debug)]
+pub struct CadImportResult {
+    pub body: usize,
+    pub name: String,
+    pub triangles: Vec<Tri>,
+    /// reader notes (also logged on the job)
+    pub notes: Vec<String>,
+}
+
+impl CadImportResult {
+    /// Put the imported surface into body `self.body` of `plane`: replaces
+    /// that body (keeping its structural mass) or appends one when
+    /// `body == plane.fuses.len()`.  Returns a one-line summary.
+    pub fn apply(self, plane: &mut Plane) -> Result<String, String> {
+        let n = plane.fuses.len();
+        if self.body > n {
+            return Err(format!("body {} does not exist ({} bodies in '{}')", self.body + 1, n, plane.name));
+        }
+        let mass = plane.fuses.get(self.body).map(|f| f.mass).unwrap_or(0.0);
+        let nt = self.triangles.len();
+        let f = Fuse::from_triangles(&self.name, self.triangles, mass);
+        let msg = format!("body {} '{}': {} triangles, length {:.3} m", self.body + 1, self.name, nt, f.length());
+        if self.body == n {
+            plane.fuses.push(f);
+        } else {
+            plane.fuses[self.body] = f;
+        }
+        Ok(msg)
+    }
+}
+
+/// Read and tessellate a CAD body (the work of a [`JobKind::CadImport`] job).
+pub fn read_cad(req: &CadImport, p: &Progress) -> Result<(Vec<Tri>, Vec<String>), String> {
+    p.check().map_err(|e| e.to_string())?;
+    let (mut tris, mut notes) = match req.format {
+        CadFormat::Stl => (foiley_plane::cad::read_stl(&req.bytes)?, vec![]),
+        CadFormat::Step => {
+            let text = String::from_utf8_lossy(&req.bytes);
+            foiley_plane::cad::read_step_target(&text, req.target_triangles.max(1))?
+        }
+    };
+    p.check().map_err(|e| e.to_string())?;
+    if !(req.scale.is_finite() && req.scale > 0.0) {
+        return Err(format!("bad unit scale {}", req.scale));
+    }
+    if req.scale != 1.0 {
+        for t in &mut tris {
+            for v in t.iter_mut() {
+                *v = *v * req.scale;
+            }
+        }
+        notes.push(format!("scaled by {}", req.scale));
+    }
+    notes.push(format!("{} triangles", tris.len()));
+    Ok((tris, notes))
 }
 
 impl JobKind {
@@ -43,6 +141,7 @@ impl JobKind {
             JobKind::Mesh { .. } => "mesh",
             JobKind::Optimise { .. } => "optimiser",
             JobKind::Inverse { .. } => "inverse design",
+            JobKind::CadImport(_) => "CAD import",
         }
     }
 }
@@ -56,6 +155,7 @@ pub enum JobOutput {
     Optimise(foiley_foil::optim::OptimResult),
     /// (new foil if a target was given, speed distribution)
     Inverse(Option<Foil>, foiley_foil::inverse::SpeedDist),
+    CadImport(CadImportResult),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -294,6 +394,15 @@ fn execute(job: &Job, kind: JobKind, notify: &Notify) -> Result<JobOutput, Strin
             };
             p.set(1.0);
             Ok(JobOutput::Inverse(out.0, out.1))
+        }
+        JobKind::CadImport(req) => {
+            p.stage(format!("Reading {}", req.name));
+            let (triangles, notes) = read_cad(&req, p)?;
+            for n in &notes {
+                p.info(format!("{}: {n}", req.name));
+            }
+            p.set(1.0);
+            Ok(JobOutput::CadImport(CadImportResult { body: req.body, name: req.name, triangles, notes }))
         }
         JobKind::Mesh { plane, db, options } => {
             p.stage("Meshing");
