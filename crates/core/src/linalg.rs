@@ -78,8 +78,7 @@ impl DenseMatrix {
     /// Matrix-vector product.
     pub fn mul_vec(&self, x: &[f64]) -> Vec<f64> {
         let mut y = vec![0.0; self.rows];
-        for j in 0..self.cols {
-            let xj = x[j];
+        for (j, &xj) in x[..self.cols].iter().enumerate() {
             if xj != 0.0 {
                 for (yi, a) in y.iter_mut().zip(self.col(j)) {
                     *yi += a * xj;
@@ -236,6 +235,8 @@ impl Lu {
         Self::factor_impl(a, prog, true, nb.max(1), tile_flops)
     }
 
+    // `!(d > 0.0)` deliberately also catches a NaN pivot
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     fn factor_impl(mut a: DenseMatrix, prog: &Progress, blocked: bool, nb: usize, tile_flops: f64) -> Result<Lu, LinalgError> {
         assert_eq!(a.rows, a.cols, "LU needs a square matrix");
         let n = a.rows;

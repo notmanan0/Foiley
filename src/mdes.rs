@@ -430,7 +430,7 @@ impl MdesState {
         }
 
         let qimoff = -(chordz / zte).ln().im;
-        self.cn[0] = self.cn[0] - c(0.0, qimoff);
+        self.cn[0] -= c(0.0, qimoff);
 
         for ic in 1..=nc {
             self.zc[ic] += self.zleold;
@@ -762,7 +762,7 @@ impl MdesState {
         let dy = self.ycold[2] - self.ycold[1];
         self.qim0 = dx.atan2(-dy) + 0.5 * PI * (1.0 + self.agte);
         let qimoff = self.qim0 - self.cn[0].im;
-        self.cn[0] = self.cn[0] + c(0.0, qimoff);
+        self.cn[0] += c(0.0, qimoff);
 
         self.piqsum();
         let mct = self.mct;
@@ -977,7 +977,7 @@ fn pert(s: &mut Session) {
         let dy = m.ycold[2] - m.ycold[1];
         m.qim0 = dx.atan2(-dy) + 0.5 * PI * (1.0 + m.agte);
         let qimoff = m.qim0 - m.cn[0].im;
-        m.cn[0] = m.cn[0] + c(0.0, qimoff);
+        m.cn[0] += c(0.0, qimoff);
 
         crate::outln!();
         crate::outln!(" Current mapping coefficients...");

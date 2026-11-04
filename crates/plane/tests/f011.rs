@@ -55,8 +55,8 @@ fn fn_body<'a>(src: &'a str, name: &str) -> &'a str {
 /// Calls whose `Result`/`Option` carries a solver outcome.
 const SOLVER_CALLS: [&str; 7] = ["loads(", "solve", "analyse(", "trim(", "build(", "make_system(", "add_control_derivatives("];
 
-/// Silent result-swallowing in the 3D drivers.  Later items may only lower it.
-const MAX_SILENT: usize = 0;
+/// Silent result-swallowing in the 3D drivers: none is allowed (the count was
+/// a ratchet that has reached zero).
 
 #[test]
 fn no_silent_ok() {
@@ -75,5 +75,5 @@ fn no_silent_ok() {
             }
         }
     }
-    assert!(hits.len() <= MAX_SILENT, "{} silent result(s) in the 3D drivers:\n{}", hits.len(), hits.join("\n"));
+    assert!(hits.is_empty(), "{} silent result(s) in the 3D drivers:\n{}", hits.len(), hits.join("\n"));
 }

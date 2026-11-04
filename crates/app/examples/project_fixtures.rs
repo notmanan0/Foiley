@@ -114,7 +114,8 @@ fn main() {
     let suffix = args.get(2).cloned().unwrap_or_default();
     std::fs::create_dir_all(&dir).unwrap();
     let mut written = vec![];
-    let mut cases: Vec<(&str, fn() -> Project)> = vec![("starter", starter), ("glider_xml", glider_xml)];
+    type Case = (&'static str, fn() -> Project);
+    let mut cases: Vec<Case> = vec![("starter", starter), ("glider_xml", glider_xml)];
     if suffix.is_empty() {
         cases.push(("review_rect", review_rect));
         cases.push(("flapped", flapped));

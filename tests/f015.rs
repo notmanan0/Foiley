@@ -103,6 +103,8 @@ pub fn run_foiley(exe: Option<&Path>, dir: &Path, script: &str, env: &[(&str, &s
 }
 
 #[test]
+// ENABLED is a cfg-dependent constant; checking it at run time is the point
+#[allow(clippy::assertions_on_constants)]
 fn f015_hooks_agree_on_naca0012() {
     assert!(foiley::rawdump::ENABLED, "the root crate's tests are built with the rawdump feature");
     let exe = match ref_exe() {
@@ -340,6 +342,8 @@ impl Tally {
 }
 
 #[test]
+// ENABLED is a cfg-dependent constant; checking it at run time is the point
+#[allow(clippy::assertions_on_constants)]
 fn f015_matrix() {
     assert!(foiley::rawdump::ENABLED);
     let cases = corpus();
@@ -360,7 +364,9 @@ fn f015_matrix() {
     // run everything, a few cases at a time
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 6);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: std::sync::Mutex<Vec<(usize, Option<Result<Vec<Point>, String>>, Vec<Result<Vec<Point>, String>>)>> = std::sync::Mutex::new(Vec::new());
+    // (case, reference run, one run per configuration)
+    type CaseRuns = (usize, Option<Result<Vec<Point>, String>>, Vec<Result<Vec<Point>, String>>);
+    let results: std::sync::Mutex<Vec<CaseRuns>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| loop {

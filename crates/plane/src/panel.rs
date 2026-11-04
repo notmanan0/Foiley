@@ -275,7 +275,7 @@ impl<'a> PanelSystem<'a> {
                 };
             }
             let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if d % 128 == 0 {
+            if d.is_multiple_of(128) {
                 sub.set(d as f64 / n as f64);
                 if sub.is_cancelled() {
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -337,8 +337,8 @@ impl<'a> PanelSystem<'a> {
         prog.set(0.95);
         let mut rhs = DenseMatrix::zeros(n, 6);
         for (i, r) in rhs_rows.iter().enumerate() {
-            for k in 0..6 {
-                rhs.set(i, k, r[k]);
+            for (k, &v) in r.iter().enumerate() {
+                rhs.set(i, k, v);
             }
         }
         let b0 = if diag != Diagnostics::Off { rhs.clone() } else { DenseMatrix::default() };

@@ -176,9 +176,9 @@ fn unit_rhs(mesh: &Mesh, cog: Vec3) -> DenseMatrix {
         let p = &mesh.panels[i];
         let r = p.ctrl - cog;
         let e = [Vec3::X, Vec3::Y, Vec3::Z];
-        for k in 0..3 {
-            rhs.set(i, k, -e[k].dot(p.normal));
-            rhs.set(i, 3 + k, -r.cross(e[k]).dot(p.normal));
+        for (k, &ek) in e.iter().enumerate() {
+            rhs.set(i, k, -ek.dot(p.normal));
+            rhs.set(i, 3 + k, -r.cross(ek).dot(p.normal));
         }
     }
     rhs
@@ -223,7 +223,7 @@ impl<'a> VlmSystem<'a> {
                 *v = lat.element_velocity(j, pi.ctrl, false).dot(pi.normal);
             }
             let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if d % 64 == 0 {
+            if d.is_multiple_of(64) {
                 sub.set(d as f64 / n as f64);
                 if sub.is_cancelled() {
                     cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -266,10 +266,10 @@ impl<'a> VlmSystem<'a> {
         let c = [vinf.x, vinf.y, vinf.z, omega.x, omega.y, omega.z];
         let n = self.unit[0].len();
         let mut g = vec![0.0; n];
-        for k in 0..6 {
-            if c[k] != 0.0 {
+        for (k, &ck) in c.iter().enumerate() {
+            if ck != 0.0 {
                 for (gi, u) in g.iter_mut().zip(&self.unit[k]) {
-                    *gi += c[k] * u;
+                    *gi += ck * u;
                 }
             }
         }
@@ -405,7 +405,7 @@ impl<'a> VlmSystem<'a> {
         let tol = 1e-9 * length.max(1e-9);
         let mut starts: Vec<Vec3> = Vec::new();
         let mut legs = vec![None; n];
-        for j in 0..n {
+        for (j, leg) in legs.iter_mut().enumerate() {
             if self.lat.next[j].is_none() {
                 let (a, b) = self.corners(j);
                 let mut idx = |p: Vec3| -> usize {
@@ -418,7 +418,7 @@ impl<'a> VlmSystem<'a> {
                 };
                 let ia = idx(a);
                 let ib = idx(b);
-                legs[j] = Some((ia, ib));
+                *leg = Some((ia, ib));
             }
         }
         let seg_len = Self::wake_segments(length, nseg);
@@ -495,18 +495,18 @@ impl<'a> VlmSystem<'a> {
             // net circulation of each wake line
             let lines = &fw.lines;
             let mut lg = vec![0.0; lines.len()];
-            for j in 0..n {
+            for (j, &gj) in gamma[..n].iter().enumerate() {
                 if let Some((la, lb)) = fw.legs[j] {
-                    lg[lb] += gamma[j];
-                    lg[la] -= gamma[j];
+                    lg[lb] += gj;
+                    lg[la] -= gj;
                 }
             }
             let induced = |x: Vec3| -> Vec3 {
                 self.with_ground(x, |y| {
                     let mut v = Vec3::ZERO;
-                    for j in 0..n {
-                        if gamma[j] != 0.0 {
-                            v += self.element_core(j, y) * gamma[j];
+                    for (j, &gj) in gamma[..n].iter().enumerate() {
+                        if gj != 0.0 {
+                            v += self.element_core(j, y) * gj;
                         }
                     }
                     for (l, g) in lines.iter().zip(&lg) {

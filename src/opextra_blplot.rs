@@ -120,7 +120,7 @@ pub fn read_n(s: &mut Session, n: usize) -> Option<Option<Vec<f64>>> {
             return None;
         }
         let mut slash = false;
-        for tok in l.split(|c: char| c == ' ' || c == ',' || c == '\t') {
+        for tok in l.split([' ', ',', '\t']) {
             if tok.is_empty() {
                 continue;
             }
@@ -232,20 +232,18 @@ pub fn blplot(s: &mut Session) {
                     let v = if r.len() >= 3 {
                         Some([r[0], r[1], r[2]])
                     } else {
-                        loop {
-                            crate::out!(
-                                "\n Currently, Ymin,Ymax,Ydel ={}{}{}\n Enter new  Ymin,Ymax,Ydel :    ",
-                                f_fmt(ymin, 11, 4),
-                                f_fmt(ymax, 11, 4),
-                                f_fmt(ydel, 11, 4)
-                            );
-                            crate::flush_if_tty();
-                            match read_n(s, 3) {
-                                None => return,
-                                Some(Some(v)) => break Some([v.first().copied().unwrap_or(ymin), v.get(1).copied().unwrap_or(ymax), v.get(2).copied().unwrap_or(ydel)]),
-                                // READ error: the Fortran jumps to the DUMP/OVER code (ERR=140)
-                                Some(None) => break None,
-                            }
+                        crate::out!(
+                            "\n Currently, Ymin,Ymax,Ydel ={}{}{}\n Enter new  Ymin,Ymax,Ydel :    ",
+                            f_fmt(ymin, 11, 4),
+                            f_fmt(ymax, 11, 4),
+                            f_fmt(ydel, 11, 4)
+                        );
+                        crate::flush_if_tty();
+                        match read_n(s, 3) {
+                            None => return,
+                            Some(Some(v)) => Some([v.first().copied().unwrap_or(ymin), v.get(1).copied().unwrap_or(ymax), v.get(2).copied().unwrap_or(ydel)]),
+                            // READ error: the Fortran jumps to the DUMP/OVER code (ERR=140)
+                            Some(None) => None,
                         }
                     };
                     match v {

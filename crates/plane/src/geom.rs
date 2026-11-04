@@ -118,6 +118,8 @@ impl Wing {
     }
 
     /// Basic validity checks with plain-language messages.
+    // `!(x > 0.0)` deliberately also rejects NaN
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn validate(&self) -> Result<(), String> {
         let n = self.sections.len();
         if n < 2 {
@@ -182,8 +184,7 @@ impl Wing {
         let ups = self.junction_ups();
         let mut le = Vec3::new(self.sections[0].offset, self.sections[0].y, 0.0);
         let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let s = &self.sections[i];
+        for (i, s) in self.sections.iter().enumerate() {
             if i > 0 {
                 let p = &self.sections[i - 1];
                 let d = p.dihedral * DEG;

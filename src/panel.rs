@@ -386,7 +386,7 @@ impl XFoil {
         }
         let mut psi = 0.0;
         let mut psi_ni = 0.0;
-        let in_wake = io >= n + 1 && io <= n + nw;
+        let in_wake = (n + 1..=n + nw).contains(&io);
         for jo in n + 1..n + nw {
             let jp = jo + 1;
             let mut jm = jo - 1;

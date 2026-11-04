@@ -26,6 +26,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+/// One swept value and its converged point (with detail), if any.
+type SweepValue = (f64, Option<(FoilPoint, Option<PointDetail>)>);
+
 /// How Re and Mach vary along a polar (XFoil polar types plus xflr5's
 /// type 4 fixed-alpha and type 6 flap-sweep polars).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -580,7 +583,7 @@ pub fn analyze(foil: &Foil, st: &AnalysisSettings, sweep: &Sweep, prog: &Progres
         }
         (PolarType::FlapSweep, Sweep::Flap { .. }) => {
             // each flap angle is a different geometry: independent, parallel
-            let results: Vec<Result<(f64, Option<(FoilPoint, Option<PointDetail>)>), FoilError>> = values
+            let results: Vec<Result<SweepValue, FoilError>> = values
                 .par_iter()
                 .map(|&d| {
                     foiley::set_quiet(true);
@@ -630,7 +633,7 @@ pub fn analyze(foil: &Foil, st: &AnalysisSettings, sweep: &Sweep, prog: &Progres
             let threads = rayon::current_num_threads();
             let pieces = if st.parallel && total >= 16 { (threads / 2).clamp(1, 8) } else { 1 };
             let jobs = if pieces > 1 { split_chunks(chunks, pieces) } else { chunks.into_iter().map(|c| (c, true)).collect() };
-            let results: Vec<Result<Vec<(f64, Option<(FoilPoint, Option<PointDetail>)>)>, FoilError>> = jobs
+            let results: Vec<Result<Vec<SweepValue>, FoilError>> = jobs
                 .par_iter()
                 .map(|(chunk, _anchored)| {
                     foiley::set_quiet(true);
