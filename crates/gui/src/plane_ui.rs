@@ -8,7 +8,7 @@ use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points};
 use foiley_app::{auto, JobId, JobKind};
 use foiley_core::atmosphere::{isa, Fluid};
 use foiley_core::{Spacing, Vec3};
-use foiley_plane::analysis::{ControlRange, ControlTarget, ExtraDrag, Method, PlaneOpp, PolarKind, RefDims};
+use foiley_plane::analysis::{ControlRange, ControlTarget, ExtraDrag, Method, PlaneOpp, PolarKind, RefDims, Setting};
 use foiley_plane::geom::{Fuse, FuseFrame, PointMass, Wing, WingKind, WingSection};
 use foiley_plane::mesh::{Mesh, MeshOptions};
 use foiley_plane::stability::{modal_initial_state, time_response};
@@ -342,9 +342,11 @@ impl App {
         let d = &mut self.pui.def;
         let mut k = PolarKind::ALL.iter().position(|x| *x == d.kind).unwrap_or(0);
         let kl: Vec<&str> = PolarKind::ALL.iter().map(|k| k.label()).collect();
+        let k_on: Vec<bool> = PolarKind::ALL.iter().map(|k| d.method.supports(*k, Setting::PolarType)).collect();
         ui.label("Polar type");
-        if widgets::pick(ui, "kind3", &mut k, &kl) {
+        if widgets::pick_enabled(ui, "kind3", &mut k, &kl, &k_on) {
             d.kind = PolarKind::ALL[k];
+            d.clear_unsupported();
             d.range = match d.kind {
                 PolarKind::FixedAlpha => foiley_plane::analysis::Range { from: 8.0, to: 30.0, step: 2.0 },
                 PolarKind::Sideslip => foiley_plane::analysis::Range { from: -10.0, to: 10.0, step: 2.0 },
@@ -354,10 +356,14 @@ impl App {
         }
         let mut m = Method::ALL.iter().position(|x| *x == d.method).unwrap_or(2);
         let ml: Vec<&str> = Method::ALL.iter().map(|m| m.label()).collect();
+        let m_on: Vec<bool> = Method::ALL.iter().map(|m| m.supports(d.kind, Setting::PolarType)).collect();
         ui.label("Method");
-        if widgets::pick(ui, "meth3", &mut m, &ml) {
+        if widgets::pick_enabled(ui, "meth3", &mut m, &ml, &m_on) {
             d.method = Method::ALL[m];
+            d.clear_unsupported();
         }
+        let on = |s: Setting| d.method.supports(d.kind, s);
+        let (on_beta, on_ground, on_fdrag, on_deriv, on_fwake, on_flaps) = (on(Setting::Sideslip), on(Setting::GroundEffect), on(Setting::FuseDrag), on(Setting::Derivatives), on(Setting::FreeWake), on(Setting::Flaps));
         hint(
             ui,
             match d.method {
@@ -379,7 +385,7 @@ impl App {
                 num_u(ui, "alpha", &mut d.alpha, 0.1, -30.0..=30.0, " deg", "angle of attack");
             }
             if matches!(d.kind, PolarKind::FixedSpeed | PolarKind::FixedLift | PolarKind::Glide | PolarKind::FixedAlpha | PolarKind::Stability) {
-                num_u(ui, "sideslip", &mut d.beta, 0.1, -30.0..=30.0, " deg", "sideslip angle (+ = wind from the right)");
+                widgets::num_u_on(ui, on_beta, "sideslip", &mut d.beta, 0.1, -30.0..=30.0, " deg", "sideslip angle (+ = wind from the right)");
             }
             if d.kind != PolarKind::List {
                 ui.label(RichText::new(format!("sweep: {}", d.kind.swept())).strong());
@@ -428,7 +434,7 @@ impl App {
                     int(ui, "auto polar mesh (Re count)", &mut self.pui.auto_polars, 0..=20, "missing 2D polars are computed automatically over the Re range of this analysis (0 = never)");
                     check(ui, "interpolate by CL (xflr5)", &mut d.viscous_from_cl, "unchecked: interpolate by the section's effective angle of attack");
                 }
-                check(ui, "fuselage friction drag", &mut d.fuse_drag, "turbulent skin friction x form factor on the fuselage wetted area");
+                widgets::check_on(ui, on_fdrag, "fuselage friction drag", &mut d.fuse_drag, "turbulent skin friction x form factor on the fuselage wetted area");
                 if d.method.is_panel() {
                     check(ui, "include fuselage panels", &mut d.include_fuse, "model the fuselage surface in the panel method");
                     num(ui, "wake length (x MAC)", &mut d.wake_length, 1.0, 1.0..=200.0, "length of the flat wake behind the trailing edges");
@@ -439,15 +445,15 @@ impl App {
                     int(ui, "LLT max iterations", &mut d.llt.max_iter, 10..=5000, "");
                 }
                 let mut ge = d.ground_height.is_some();
-                if check(ui, "ground effect", &mut ge, "mirror image below the plane") {
+                if widgets::check_on(ui, on_ground, "ground effect", &mut ge, "mirror image below the plane") {
                     d.ground_height = if ge { Some(0.5) } else { None };
                 }
                 if let Some(h) = &mut d.ground_height {
                     num_u(ui, "  ground below origin", h, 0.01, 0.0..=100.0, " m", "height of the plane origin above the ground");
                 }
-                check(ui, "stability derivatives at every point", &mut d.derivatives, "computes derivatives and modes for each point (needs mass); always on for T7");
+                widgets::check_on(ui, on_deriv, "stability derivatives at every point", &mut d.derivatives, "computes derivatives and modes for each point (needs mass); always on for T7");
                 check(ui, "keep panel Cp for 3D colour maps", &mut d.keep_cp, "uses memory for large meshes");
-                if matches!(d.method, Method::Vlm1 | Method::Vlm2) {
+                if matches!(d.method, Method::Vlm1 | Method::Vlm2) && on_fwake {
                     int(ui, "free-wake iterations", &mut d.free_wake, 0..=usize::MAX,"0 = rigid wake along x (fast, linear). >0 relaxes the trailing vortices along the local flow at every point (slower; shown in the 3D view)");
                 }
             });
@@ -509,6 +515,9 @@ impl App {
             }
         });
         section(ui, "Flap presets and extra drag", false, |ui| {
+            if !on_flaps {
+                hint(ui, "This method ignores flap deflections.");
+            }
             hint(ui, "Preset deflections (all polar types). Flaps exist where both section foils are marked as control surfaces (Foil design > Mark as control surface).");
             let flaps = flap_targets(plane);
             let mut del = None;
@@ -524,7 +533,7 @@ impl App {
             if let Some(i) = del {
                 d.flaps.remove(i);
             }
-            ui.menu_button("+ flap preset", |ui| {
+            ui.add_enabled_ui(on_flaps, |ui| ui.menu_button("+ flap preset", |ui| {
                 for (w, f, name) in &flaps {
                     if ui.button(name).clicked() {
                         d.flaps.push(((*w, *f), 5.0));
@@ -534,7 +543,7 @@ impl App {
                 if flaps.is_empty() {
                     ui.label("no control surfaces on this plane");
                 }
-            });
+            }));
             ui.separator();
             let mut del = None;
             for (i, e) in d.extra_drag.iter_mut().enumerate() {

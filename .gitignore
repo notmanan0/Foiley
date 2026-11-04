@@ -13,3 +13,4 @@
 /spitfire/run_log.txt
 /spitfire/run_err.txt
 /spitfire/spitfire_6dof_job.json
+__pycache__/

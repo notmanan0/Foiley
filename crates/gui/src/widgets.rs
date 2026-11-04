@@ -38,6 +38,41 @@ pub fn int(ui: &mut Ui, label: &str, v: &mut usize, range: std::ops::RangeInclus
     r.changed()
 }
 
+/// `check`, greyed out when `on` is false.
+pub fn check_on(ui: &mut Ui, on: bool, label: &str, v: &mut bool, help: &str) -> bool {
+    ui.label("");
+    let r = ui.add_enabled(on, egui::Checkbox::new(v, label)).on_hover_text(help).on_disabled_hover_text("not supported by this method / polar type");
+    ui.end_row();
+    r.changed()
+}
+
+/// `num_u`, greyed out when `on` is false.
+#[allow(clippy::too_many_arguments)]
+pub fn num_u_on(ui: &mut Ui, on: bool, label: &str, v: &mut f64, speed: f64, range: std::ops::RangeInclusive<f64>, unit: &str, help: &str) -> bool {
+    let l = ui.add_enabled(on, egui::Label::new(label));
+    if !help.is_empty() {
+        l.on_hover_text(help);
+    }
+    let r = ui.add_enabled(on, egui::DragValue::new(v).speed(speed).range(range).suffix(unit).max_decimals(6)).on_disabled_hover_text("not supported by this method / polar type");
+    ui.end_row();
+    r.changed()
+}
+
+/// `pick` with some entries greyed out (`enabled[i] == false`).
+pub fn pick_enabled(ui: &mut Ui, id: &str, current: &mut usize, labels: &[&str], enabled: &[bool]) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id).selected_text(labels.get(*current).copied().unwrap_or("?")).show_ui(ui, |ui| {
+        for (i, l) in labels.iter().enumerate() {
+            let on = enabled.get(i).copied().unwrap_or(true);
+            if ui.add_enabled(on, egui::Button::selectable(*current == i, *l)).clicked() && *current != i {
+                *current = i;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
 pub fn check(ui: &mut Ui, label: &str, v: &mut bool, help: &str) -> bool {
     ui.label("");
     let r = ui.checkbox(v, label).on_hover_text(help);

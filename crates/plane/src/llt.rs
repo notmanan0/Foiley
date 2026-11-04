@@ -283,6 +283,12 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             wake: vec![],
             balance_residual: None,
         };
+        if let Some(why) = crate::analysis::nonfinite_reason(&opp) {
+            prog.count_failed();
+            failed.push(format!("alpha={alpha:.2} V={v:.2}: LLT {why}"));
+            ai.iter_mut().for_each(|a| *a = 0.0);
+            continue;
+        }
         prog.count_ok();
         on_point(&opp);
         out.push(opp);
