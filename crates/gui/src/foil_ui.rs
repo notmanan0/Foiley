@@ -44,7 +44,7 @@ pub struct FoilUi {
     pub inv_mode: InverseMode,
     pub inv_alpha: f64,
     pub qdist: Option<SpeedDist>,
-    pub inv_target: Option<(Vec<f64>, Option<(usize, usize)>)>,
+    pub inv_target: Option<foiley_app::InverseTarget>,
     pub inv_upper: bool,
     pub inv_x: [f64; 2],
     pub inv_kind: usize,
