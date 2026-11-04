@@ -1,0 +1,12 @@
+# Project fixtures (docs/REMEDIATION_PLAN.md, F016).  One file per line:
+# path relative to this directory, then the format and how it was written.
+# crates/app/tests/f016.rs (project_roundtrip) loads, saves, reloads and
+# compares every file listed here.  Regenerate the v2 files with
+#   cargo run --release -p foiley-app --example project_fixtures -- tests/data/projects
+starter.foiley              v2  project_fixtures: Project::starter() + 2D and 3D polars
+glider_xml.foiley           v2  project_fixtures: docs/examples/glider.xml + 2D and 3D polars
+review_rect.foiley          v2  project_fixtures: benchmark_review rectangle, geometry only
+flapped.foiley              v2  project_fixtures: starter with a hinged elevator, deflected 2D families
+starter_v1.foiley           v1  project_fixtures at 98515c9 (pre-format-2 code), suffix _v1
+glider_xml_v1.foiley        v1  project_fixtures at 98515c9 (pre-format-2 code), suffix _v1
+../../../spitfire/Spitfire_MkI_geometry.foiley  v1  spitfire/make_spitfire.py (tracked geometry)

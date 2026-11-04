@@ -741,6 +741,9 @@ pub struct PlanePolar {
     pub ref_dims: (f64, f64, f64),
     /// number of panels / unknowns
     pub unknowns: usize,
+    /// provenance of the run (F016); None for polars from older versions
+    #[serde(default)]
+    pub manifest: Option<foiley_core::provenance::RunManifest>,
 }
 
 impl PlanePolar {
@@ -1256,7 +1259,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
     }
     let cog = if mass > 0.0 { ctx.inertia.cog } else { Vec3::ZERO };
     let name = if def.name.is_empty() { def.auto_name() } else { def.name.clone() };
-    let mut polar = PlanePolar { name: name.clone(), plane: plane.name.clone(), def: Some(def.clone()), ref_dims: (ctx.s_ref, ctx.b_ref, ctx.c_ref), ..Default::default() };
+    let mut polar = PlanePolar { name: name.clone(), plane: plane.name.clone(), def: Some(def.clone()), ref_dims: (ctx.s_ref, ctx.b_ref, ctx.c_ref), manifest: Some(crate::provenance::run_manifest(&ctx)), ..Default::default() };
     prog.stage(format!("{}: {}", plane.name, name));
     prog.info(format!("{} - {} - {}", plane.name, def.kind.label(), def.method.label()));
     if mass > 0.0 {
