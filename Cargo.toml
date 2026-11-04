@@ -34,6 +34,10 @@ autobins = false
 [dependencies]
 rayon = "1.10"
 
+[features]
+# raw-bit dump of every stored point to $RAWDUMP (finding F015; src/rawdump.rs)
+rawdump = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -53,3 +57,5 @@ inherits = "release"
 
 [dev-dependencies]
 mimalloc = { version = "0.1.52", default-features = false }
+# the root crate's own tests (tests/f015.rs) run with the raw-bit hook
+foiley = { path = ".", features = ["rawdump"] }

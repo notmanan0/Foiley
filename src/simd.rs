@@ -1,6 +1,11 @@
 //! Explicit SIMD kernels (AVX2 with runtime detection, scalar fallback).
 //! Multiplication and subtraction are kept as separate instructions (no FMA
 //! contraction) so results are bit-identical to the scalar Fortran.
+//!
+//! `FOILEY_SIMD=0` forces the scalar path.  It is honoured only in builds
+//! without compile-time AVX2: `.cargo/config.toml`'s `target-cpu=native`
+//! hard-enables AVX2 on an AVX2 machine, and such a build always takes the
+//! AVX2 path (see [`mode`]).
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -14,11 +19,30 @@ fn has_avx2() -> bool {
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     {
         static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *F.get_or_init(|| is_x86_feature_detected!("avx2"))
+        *F.get_or_init(|| !simd_off() && is_x86_feature_detected!("avx2"))
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
         false
+    }
+}
+
+/// `FOILEY_SIMD=0` in the environment.
+fn simd_off() -> bool {
+    std::env::var("FOILEY_SIMD").is_ok_and(|v| v.trim() == "0")
+}
+
+/// Which kernels this process uses: "avx2 (compile-time)" (FOILEY_SIMD is
+/// ignored), "avx2 (runtime)", "scalar (FOILEY_SIMD=0)" or "scalar".
+pub fn mode() -> &'static str {
+    if cfg!(all(target_arch = "x86_64", target_feature = "avx2")) {
+        "avx2 (compile-time)"
+    } else if has_avx2() {
+        "avx2 (runtime)"
+    } else if simd_off() {
+        "scalar (FOILEY_SIMD=0)"
+    } else {
+        "scalar"
     }
 }
 

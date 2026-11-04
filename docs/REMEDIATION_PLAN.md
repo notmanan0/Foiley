@@ -64,7 +64,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [ ] **F003** · Flap-deflected polars — after F002, F004a
 - [x] **F005a** · `FullLoad` stability model — after F007
 - [ ] **F016** · Provenance and project format v2 — after F002
-- [ ] **F015a** · Raw-bit hooks and harness
+- [x] **F015a** · Raw-bit hooks and harness
 - [ ] **F021** · Coverage-aware auto-polars — after F003
 - [ ] **F004b** · GUI editing of every body — after F004a, F024
 - [ ] **F010b** · `.xfl`/`.fl5` import and conversion report
