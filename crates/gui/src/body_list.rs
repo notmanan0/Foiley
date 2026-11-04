@@ -3,7 +3,6 @@
 //! a selected index, with no egui, so `crates/gui/tests/f004b.rs` drives it
 //! without rendering.
 
-use foiley_core::Vec3;
 use foiley_plane::geom::{Fuse, Plane};
 
 /// Lateral spacing of a new body from the previous one, m (a new default pod
@@ -86,23 +85,4 @@ pub fn apply(p: &mut Plane, sel: &mut usize, a: BodyAction) {
             }
         }
     }
-}
-
-/// Replace body `body` by a triangulated CAD surface given in file units
-/// (`scale` converts them to metres), keeping the body's mass.
-pub fn set_cad_surface(p: &mut Plane, body: usize, name: &str, mut tris: Vec<[Vec3; 3]>, scale: f64) -> Result<(), String> {
-    let n = p.fuses.len();
-    let f = p.fuses.get_mut(body).ok_or_else(|| format!("no body {} (the plane has {n})", body + 1))?;
-    if tris.is_empty() {
-        return Err(format!("'{name}': the file has no triangles"));
-    }
-    if scale != 1.0 {
-        for t in &mut tris {
-            for v in t.iter_mut() {
-                *v = *v * scale;
-            }
-        }
-    }
-    *f = Fuse::from_triangles(name, tris, f.mass);
-    Ok(())
 }
