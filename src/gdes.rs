@@ -427,14 +427,15 @@ pub fn gdes(s: &mut Session) {
                 }
             }
             "ADEG" | "ARAD" => {
-                let arad;
-                if comand == "ADEG" {
+                let arad = if comand == "ADEG" {
                     let adeg = if ninput >= 1 { rinput[1] } else { s.input.askr("Enter angle change (deg)^", 0.0) };
                     s.xf.adeg = adeg;
-                    arad = adeg * PI / 180.0;
+                    adeg * PI / 180.0
+                } else if ninput >= 1 {
+                    rinput[1]
                 } else {
-                    arad = if ninput >= 1 { rinput[1] } else { s.input.askr("Enter angle change (rad)^", 0.0) };
-                }
+                    s.input.askr("Enter angle change (rad)^", 0.0)
+                };
                 let xf = &mut s.xf;
                 let nb = xf.nb;
                 rotate(&mut xf.xb, &mut xf.yb, nb, arad);
@@ -1458,17 +1459,16 @@ fn tcscal(s: &mut Session, rinput: &[f64], ninput: usize) {
     crate::outln!();
     let lgsym = s.gdes_state.lgsym;
     let tfac = if ninput >= 1 { rinput[1] } else { s.input.askr("Enter new/old thickness scale factor^", 1.0) };
-    let cfac;
-    if ninput >= 2 {
-        cfac = rinput[2];
+    let cfac = if ninput >= 2 {
+        rinput[2]
     } else if lgsym {
         // CFAC is left undefined by the Fortran here; the reference build
         // behaves as CFAC = 0 (which also matches the intent)
         crate::outln!(" Symmetry enforced:  Maintaining zero camber.");
-        cfac = 0.0;
+        0.0
     } else {
-        cfac = s.input.askr("Enter new/old camber    scale factor^", 1.0);
-    }
+        s.input.askr("Enter new/old camber    scale factor^", 1.0)
+    };
     thkcam(&mut s.xf, tfac, cfac);
     getcam_b(&mut s.gdes_state, &s.xf);
 }
@@ -1482,17 +1482,16 @@ fn tcset(s: &mut Session, rinput: &[f64], ninput: usize) {
     crate::outln!();
     let lgsym = s.gdes_state.lgsym;
     let tnew = if ninput >= 1 { rinput[1] } else { s.input.askr("Enter new max thickness <ret> to skip^", 999.0) };
-    let cnew;
-    if ninput >= 2 {
-        cnew = rinput[2];
+    let cnew = if ninput >= 2 {
+        rinput[2]
     } else if lgsym {
         // CNEW is left undefined by the Fortran here; the reference build
         // behaves as CNEW = 0 (zero camber)
         crate::outln!(" Symmetry enforced:  Maintaining zero camber.");
-        cnew = 0.0;
+        0.0
     } else {
-        cnew = s.input.askr("Enter new max  camber   <ret> to skip^", 999.0);
-    }
+        s.input.askr("Enter new max  camber   <ret> to skip^", 999.0)
+    };
     let mut cfac = 1.0;
     let mut tfac = 1.0;
     if cy != 0.0 && cnew != 999.0 {
