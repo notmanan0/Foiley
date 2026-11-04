@@ -435,6 +435,7 @@ impl App {
                 if d.viscous || d.method == Method::Llt {
                     int(ui, "auto polar mesh (Re count)", &mut self.pui.auto_polars, 0..=20, "missing 2D polars are computed automatically over the Re range of this analysis (0 = never)");
                     check(ui, "interpolate by CL (xflr5)", &mut d.viscous_from_cl, "unchecked: interpolate by the section's effective angle of attack");
+                    check(ui, "strict 2D polar envelope", &mut d.strict_envelope, "fail a point when any strip's Re or CL falls outside its 2D polars (instead of clamping with a warning)");
                 }
                 widgets::check_on(ui, on_fdrag, "fuselage friction drag", &mut d.fuse_drag, "turbulent skin friction x form factor on the fuselage wetted area");
                 if d.method.is_panel() {
