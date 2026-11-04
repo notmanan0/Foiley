@@ -112,7 +112,7 @@ pub fn read_cad(req: &CadImport, p: &Progress) -> Result<(Vec<Tri>, Vec<String>)
         CadFormat::Stl => (foiley_plane::cad::read_stl(&req.bytes)?, vec![]),
         CadFormat::Step => {
             let text = String::from_utf8_lossy(&req.bytes);
-            foiley_plane::cad::read_step_target(&text, req.target_triangles.max(1))?
+            foiley_plane::cad::read_step_target_with(&text, req.target_triangles.max(1), p).map_err(|e| if p.is_cancelled() { "cancelled by user".to_string() } else { e })?
         }
     };
     p.check().map_err(|e| e.to_string())?;

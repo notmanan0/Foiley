@@ -305,11 +305,11 @@ def cone_apex(st):
     ])
 
 
-def sphere(st, R=0.5):
+def sphere(st, R=0.5, c=(0.0, 0.0, 0.0)):
     """full sphere: one face bounded by a meridian seam between the poles"""
-    s, n = (0.0, 0.0, -R), (0.0, 0.0, R)
-    es = st.edge(s, n, st.circle((0, 0, 0), (0, -1, 0), X, R))
-    st.solid([st.face([[(es, True), (es, False)]], st.sphere((0, 0, 0), Z, X, R))])
+    s, n = (c[0], c[1], c[2] - R), (c[0], c[1], c[2] + R)
+    es = st.edge(s, n, st.circle(c, (0, -1, 0), X, R))
+    st.solid([st.face([[(es, True), (es, False)]], st.sphere(c, Z, X, R))])
 
 
 def torus(st, R=0.5, r=0.15):
@@ -395,7 +395,8 @@ def loft_fuselage(st):
     surf = st.bspline_surface(1, 2, net, [2, 1, 1, 2], CIRCLE_MULTS, [0.0, 1 / 3.0, 2 / 3.0, 1.0], CIRCLE_KNOTS, w)
     nose, tail = (0.0, 0.0, 0.0), (1.4, 0.0, 0.0)
     seam = st.edge(nose, tail, st.bspline_curve(1, [(x, r, 0.0) for x, r in LOFT], [2, 1, 1, 2], [0.0, 1 / 3.0, 2 / 3.0, 1.0]))
-    st.solid([st.face([[(seam, True), (seam, False)]], surf)])
+    # dS/du x dS/dv points inward (u along +x, v counter-clockwise about +x)
+    st.solid([st.face([[(seam, True), (seam, False)]], surf, same=False)])
 
 
 def one(name, build, scale=1.0, prefix="$", **kw):

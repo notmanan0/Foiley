@@ -301,7 +301,126 @@ fn f022_bspline_edge_inversion_residual_1e9() {
     // closed loft: the seam's two uses lie one period (1) apart in v, the poles are duplicated
     let m = model("loft_fuselage.stp");
     let d = checked_domain(&m, 0);
-    assert!(close(d.area(), 1.0, 1e-12), "loft domain area {}", d.area());
+    assert!(!m.faces[0].same_sense, "the loft's surface normal points inward");
+    assert!(close(-d.area(), 1.0, 1e-12), "loft domain area {} (clockwise: face normal opposes dS/du x dS/dv)", d.area());
     let sp = span(&d);
     assert!(close(sp[0], 1.0, 1e-12) && close(sp[1], 1.0, 1e-12), "loft span {sp:?}");
+}
+
+const CLOSED: [&str; 9] = ["box_hole.stp", "cyl_seam.stp", "cyl_pcurve.stp", "frustum_rev.stp", "cone_apex.stp", "sphere.stp", "torus.stp", "ellipse_prism.stp", "loft_fuselage.stp"];
+
+fn import(name: &str, opts: &StepOptions) -> foiley_plane::cad::StepImport {
+    foiley_plane::cad::import_step(&text(name), opts, &foiley_core::Progress::none()).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// (open edges, non-manifold edges, edges used twice in the same direction)
+fn edge_stats(t: &[[u32; 3]]) -> (usize, usize, usize) {
+    let mut m: std::collections::HashMap<(u32, u32), (usize, usize)> = std::collections::HashMap::new();
+    for tri in t {
+        for k in 0..3 {
+            let (a, b) = (tri[k], tri[(k + 1) % 3]);
+            let e = m.entry((a.min(b), a.max(b))).or_default();
+            if a < b {
+                e.0 += 1
+            } else {
+                e.1 += 1
+            }
+        }
+    }
+    let open = m.values().filter(|c| c.0 + c.1 == 1).count();
+    let nonman = m.values().filter(|c| c.0 + c.1 > 2).count();
+    let flipped = m.values().filter(|c| c.0 + c.1 == 2 && (c.0 == 2 || c.1 == 2)).count();
+    (open, nonman, flipped)
+}
+
+/// Faces that share an edge share its sampled vertices exactly, so a box
+/// with a hole (and every closed fixture) has zero open edges.
+#[test]
+fn f022_shared_edge_vertices_identical() {
+    for name in CLOSED {
+        let r = import(name, &StepOptions::default());
+        let mesh = &r.mesh;
+        let (open, nonman, flipped) = edge_stats(&mesh.triangles);
+        assert_eq!((open, nonman, flipped), (0, 0, 0), "{name}: open / non-manifold / inconsistently oriented edges; {:?}", r.notes);
+        assert!(mesh.volume() > 0.0, "{name}: outward");
+        // every edge sample is one mesh vertex, and consecutive samples form a
+        // mesh edge between the two faces using the edge
+        let key = |p: Vec3| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits());
+        let mut at: std::collections::HashMap<(u64, u64, u64), Vec<u32>> = std::collections::HashMap::new();
+        for (i, p) in mesh.vertices.iter().enumerate() {
+            at.entry(key(*p)).or_default().push(i as u32);
+        }
+        let mut edge_faces: std::collections::HashMap<(u32, u32), Vec<u32>> = std::collections::HashMap::new();
+        for (t, f) in mesh.triangles.iter().zip(&mesh.face) {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                edge_faces.entry((a.min(b), a.max(b))).or_default().push(*f);
+            }
+        }
+        for e in &r.model.edges {
+            for w in e.samples.windows(2) {
+                let (pa, pb) = (r.model.vertices[w[0].1 as usize], r.model.vertices[w[1].1 as usize]);
+                let (va, vb) = (&at[&key(pa)], &at[&key(pb)]);
+                assert!(va.len() == 1 && vb.len() == 1, "{name}: edge sample duplicated in the mesh");
+                let (a, b) = (va[0], vb[0]);
+                let faces = edge_faces.get(&(a.min(b), a.max(b))).unwrap_or_else(|| panic!("{name}: edge segment missing from the mesh"));
+                assert_eq!(faces.len(), 2, "{name}: edge segment used by {} triangles", faces.len());
+            }
+        }
+    }
+    // the box with a hole in detail: area and volume close to the closed form already at default tolerances
+    let r = import("box_hole.stp", &StepOptions::default());
+    let (area, vol) = (7.0 + 0.12 * PI, 1.0 - 0.02 * PI);
+    assert!(close(r.mesh.area(), area, 2e-3), "area {} vs {area}", r.mesh.area());
+    assert!(close(r.mesh.volume(), vol, 2e-3), "volume {} vs {vol}", r.mesh.volume());
+}
+
+/// Refinement by curvature: every triangle meets the chordal tolerance at
+/// its centroid and interior edge midpoints (and within twice the tolerance
+/// anywhere inside), no side exceeds the length limit, and tightening the
+/// tolerance converges the area.
+#[test]
+fn f022_refinement_meets_chordal_tolerance() {
+    let mut sphere_err = Vec::new();
+    for rel in [1e-3, 1e-4] {
+        for name in ["cyl_seam.stp", "sphere.stp", "torus.stp", "cone_apex.stp", "bspline_patch.stp", "loft_fuselage.stp", "box_hole.stp"] {
+            let opts = StepOptions { rel_chord_tol: rel, ..Default::default() };
+            let m = Model::from_step(&text(name), &opts).unwrap();
+            let (tol, max_edge) = (m.tol.chord, m.tol.max_edge);
+            for fi in 0..m.faces.len() {
+                let fm = foiley_plane::cad::tessellate::face_mesh(&m, fi).unwrap();
+                let s = &m.faces[fi].surface;
+                let boundary: std::collections::HashSet<(u32, u32)> = fm.boundary.iter().map(|e| (e[0].min(e[1]), e[0].max(e[1]))).collect();
+                assert!(!fm.tris.is_empty());
+                for t in &fm.tris {
+                    let q: Vec<[f64; 2]> = t.iter().map(|&i| fm.uv[i as usize]).collect();
+                    let p: Vec<Vec3> = t.iter().map(|&i| fm.pos[i as usize]).collect();
+                    let c = [(q[0][0] + q[1][0] + q[2][0]) / 3.0, (q[0][1] + q[1][1] + q[2][1]) / 3.0];
+                    let dev = (s.eval(c[0], c[1]) - (p[0] + p[1] + p[2]) / 3.0).norm();
+                    assert!(dev <= tol * (1.0 + 1e-9), "{name} face {fi}: centroid deviation {dev:e} > {tol:e}");
+                    for k in 0..3 {
+                        let (a, b) = (k, (k + 1) % 3);
+                        let len = (p[b] - p[a]).norm();
+                        assert!(len <= max_edge * (1.0 + 1e-9) || p[a] == p[b], "{name}: side {len} > {max_edge}");
+                        let e = (t[a].min(t[b]), t[a].max(t[b]));
+                        if !boundary.contains(&e) {
+                            let mid = [0.5 * (q[a][0] + q[b][0]), 0.5 * (q[a][1] + q[b][1])];
+                            let dev = (s.eval(mid[0], mid[1]) - (p[a] + p[b]) * 0.5).norm();
+                            assert!(dev <= tol * (1.0 + 1e-9), "{name}: midpoint deviation {dev:e} > {tol:e}");
+                        }
+                    }
+                    for (wa, wb) in [(0.6, 0.2), (0.2, 0.6), (0.2, 0.2), (0.45, 0.45), (0.1, 0.45), (0.45, 0.1)] {
+                        let wc = 1.0 - wa - wb;
+                        let uv = [wa * q[0][0] + wb * q[1][0] + wc * q[2][0], wa * q[0][1] + wb * q[1][1] + wc * q[2][1]];
+                        let dev = (s.eval(uv[0], uv[1]) - (p[0] * wa + p[1] * wb + p[2] * wc)).norm();
+                        assert!(dev <= 2.0 * tol, "{name}: interior deviation {dev:e} > 2 x {tol:e}");
+                    }
+                }
+            }
+        }
+        let r = import("sphere.stp", &StepOptions { rel_chord_tol: rel, ..Default::default() });
+        sphere_err.push(((r.mesh.area() - PI) / PI).abs());
+    }
+    assert!(sphere_err[1] < 0.2 * sphere_err[0], "area converges: {sphere_err:?}");
+    assert!(sphere_err[1] < 1e-3, "{sphere_err:?}");
 }
