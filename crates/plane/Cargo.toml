@@ -11,3 +11,4 @@ foiley-foil.workspace = true
 rayon.workspace = true
 serde.workspace = true
 quick-xml.workspace = true
+spade = { version = "2.15", default-features = false }

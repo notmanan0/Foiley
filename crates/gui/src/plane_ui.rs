@@ -6,7 +6,7 @@ use crate::widgets::{self, check, heading, hint, int, num, num_u, section, serie
 use crate::{App, Pending};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points};
-use foiley_app::{auto, JobId, JobKind};
+use foiley_app::{auto, CadFormat, CadImport, JobId, JobKind};
 use foiley_core::atmosphere::{isa, Fluid};
 use foiley_core::{Spacing, Vec3};
 use foiley_plane::analysis::{ControlRange, ControlTarget, ExtraDrag, Method, PlaneOpp, PolarKind, RefDims, Setting};
@@ -153,6 +153,28 @@ impl App {
         self.pending.push((j.id, Pending::Mesh(key)));
     }
 
+    /// Import an STL / STEP file into body `body` of plane `plane` as a
+    /// background job (F024); the result is applied when the job finishes.
+    pub fn import_cad_body(&mut self, plane: usize, body: usize, path: &std::path::Path, scale: f64) {
+        let Some(format) = CadFormat::from_path(path) else {
+            self.notify(format!("{}: CAD files must be .stl, .step or .stp", path.display()), true);
+            return;
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.notify(format!("{}: {e}", path.display()), true);
+                return;
+            }
+        };
+        let Some(pl) = self.project.planes.get(plane) else { return };
+        let plane_name = pl.name.clone();
+        let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Fuselage".into());
+        let file = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let req = CadImport { name, format, bytes, scale, target_triangles: 3000, body };
+        self.submit(format!("import {file}"), JobKind::CadImport(req), Pending::CadImport { plane: plane_name });
+    }
+
     pub fn plane_design(&mut self, ui: &mut egui::Ui) {
         if self.project.planes.is_empty() {
             ui.label("No plane in the project. Use '+ New plane' in the explorer or import an xflr5/flow5 .xml file.");
@@ -163,6 +185,7 @@ impl App {
         let before = self.project.planes[self.sel_plane].clone();
         let mut edited = before.clone();
         let db = self.project.foil_db();
+        let mut cad_request = None;
         egui::SidePanel::left("plane_left").resizable(true).default_width(560.0).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let p = &mut edited;
@@ -179,12 +202,15 @@ impl App {
                 ui.separator();
                 match self.pui.design_tab {
                     0 => wings_editor(ui, p, &mut self.pui.sel_wing, &foil_names),
-                    1 => fuse_editor(ui, p, &mut self.pui.sel_body),
+                    1 => cad_request = fuse_editor(ui, p, &mut self.pui.sel_body),
                     2 => masses_editor(ui, p),
                     _ => summary(ui, p, &db),
                 }
             });
         });
+        if let Some((path, scale, body)) = cad_request {
+            self.import_cad_body(self.sel_plane, body, &path, scale);
+        }
         if edited != before {
             if let Err(e) = edited.validate() {
                 self.toast = Some((e, std::time::Instant::now(), true));
@@ -1229,27 +1255,10 @@ fn wings_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize, foils: &[Stri
     }
 }
 
-// ---- F024 merge point ----------------------------------------------------
-/// Import an STL / STEP file into body `body` (`p.fuses[body]`), keeping its
-/// mass.  This is today's path: it reads and tessellates on the UI thread.
-/// F024 moves CAD import into the job manager; that job takes the same target
-/// body index, and its result should be applied with
-/// `body_list::set_cad_surface(p, body, ...)`, replacing this function.
-fn import_cad_into_body(p: &mut Plane, body: usize, path: &std::path::Path, unit: usize) -> Result<(), String> {
-    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let tris = if ext == "stl" {
-        std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| foiley_plane::cad::read_stl(&b))?
-    } else {
-        std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| foiley_plane::cad::read_step_target(&t, 3000).map(|r| r.0))?
-    };
-    let scale = [1.0, 1e-3, 1e-2, 0.0254, 0.3048][unit.min(4)];
-    let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    body_list::set_cad_surface(p, body, &name, tris, scale)
-}
-// ---------------------------------------------------------------------------
-
 /// Body list (every entry of `p.fuses`) and the editor of the selected body.
-fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) {
+/// Returns a CAD import request (file, unit factor, body index) when the
+/// user picked a file; the import itself runs as a job (F024).
+fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) -> Option<(std::path::PathBuf, f64, usize)> {
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
         for i in 0..p.fuses.len() {
@@ -1274,11 +1283,10 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) {
     }
     let Some(ib) = body_list::selected(p, sel) else {
         hint(ui, "No fuselage. VLM ignores fuselages; the 3D panel method models every body (bodies must not overlap).");
-        return;
+        return None;
     };
     ui.separator();
     ui.label(RichText::new(format!("type: {}", p.fuses[ib].kind_label())).strong());
-    let err_id = egui::Id::new(("body_import_error", ib));
     let mut import = None;
     ui.horizontal(|ui| {
         static UNITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1299,17 +1307,9 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) {
             f.nurbs = None;
         }
     });
-    if let Some((path, u)) = import {
-        let res = import_cad_into_body(p, ib, &path, u).map_err(|e| format!("{}: {e}", path.display()));
-        ui.data_mut(|d| match res {
-            Ok(()) => d.remove::<String>(err_id),
-            Err(e) => d.insert_temp(err_id, e),
-        });
-    }
-    if let Some(e) = ui.data(|d| d.get_temp::<String>(err_id)) {
-        ui.label(RichText::new(format!("import failed: {e}")).color(Color32::from_rgb(230, 80, 70)));
-    }
-    let Some(f) = body_list::selected_mut(p, sel) else { return };
+    // the import runs as a job; its notes and errors go to the result panel
+    let cad_request = import.map(|(path, u)| (path, [1.0, 1e-3, 1e-2, 0.0254, 0.3048][u.min(4)], ib));
+    let Some(f) = body_list::selected_mut(p, sel) else { return cad_request };
     if !f.triangles.is_empty() {
         ui.label(format!("{} triangles, length {:.3} m, wetted area {:.4} m2", f.triangles.len(), f.length(), f.wetted_area()));
         egui::Grid::new("fusetri").num_columns(2).show(ui, |ui| {
@@ -1325,7 +1325,7 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) {
             ui.end_row();
             num_u(ui, "structural mass", &mut f.mass, 0.01, 0.0..=1e6, " kg", "distributed over the skin");
         });
-        return;
+        return cad_request;
     }
     if let Some(n) = &mut f.nurbs {
         egui::Grid::new("nurbsdeg").num_columns(2).show(ui, |ui| {
@@ -1374,7 +1374,7 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) {
             }
         }
         let _ = np;
-        return;
+        return cad_request;
     }
     egui::Grid::new("fuse").num_columns(2).show(ui, |ui| {
         ui.label("name");
@@ -1425,6 +1425,7 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) {
     if f.validate().is_err() {
         ui.label(RichText::new("frame x positions must increase").color(Color32::from_rgb(230, 80, 70)));
     }
+    cad_request
 }
 
 fn masses_editor(ui: &mut egui::Ui, p: &mut Plane) {

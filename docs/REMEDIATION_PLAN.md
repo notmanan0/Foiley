@@ -56,7 +56,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [x] **F014** · Cancellable blocked LU
 - [x] **F008** · LLT glide balance — after F020
 - [x] **F018** · Node-preserving 2D input
-- [ ] **F024** · GUI CAD import as a job
+- [x] **F024** · GUI CAD import as a job
 - [x] **F002** · Explicit polar families
 - [x] **F007** · One wake-aware evaluator for every driver (+F019) — after F020
 - [x] **F004a** · Multi-body meshing
@@ -70,10 +70,10 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [x] **F010b** · `.xfl`/`.fl5` import and conversion report
 - [ ] **F015b** · Raw-bit corpus and configuration matrix — after F015a
 - [x] **F005b** · Coupled 8×8 stability and nonzero beta (+F006) — after F005a
-- [ ] **F022a** · STEP parse, topology, analytic surfaces, seams
-- [ ] **F022b** · B-spline surfaces and curves — after F022a
-- [ ] **F022c** · Watertight tessellation — after F022a
-- [ ] **F022d** · Mesh checks and CAD corpus — after F022b, F022c
+- [x] **F022a** · STEP parse, topology, analytic surfaces, seams
+- [x] **F022b** · B-spline surfaces and curves — after F022a
+- [x] **F022c** · Watertight tessellation — after F022a
+- [x] **F022d** · Mesh checks and CAD corpus — after F022b, F022c
 - [ ] **F010c** · Real XFLR5/flow5 files — after F010b; **waits on the user's files**
 
 F004, F005, F010, F015 and F022 are split into lettered parts; the finding is
