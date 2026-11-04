@@ -720,7 +720,7 @@ pub fn inviscid_cl(foil: &Foil, alpha_deg: f64) -> Option<f64> {
     let st = AnalysisSettings { viscous: false, ..Default::default() };
     let mut xf = setup_engine(foil, &st, 0.0).ok()?;
     let r = catch_unwind(AssertUnwindSafe(|| solve_point(&mut xf, true, alpha_deg * DTOR, 1))).ok()?;
-    Some(polar_point(&xf).cl).filter(|_| r.converged)
+    r.converged.then(|| polar_point(&xf).cl)
 }
 
 #[cfg(test)]
