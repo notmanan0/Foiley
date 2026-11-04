@@ -18,7 +18,7 @@ pub(crate) fn legacy(text: &str, density: f64) -> Result<(Vec<Tri>, Vec<String>)
     let mut done_surfaces = std::collections::HashSet::new();
     for (fi, f) in model.faces.iter().enumerate() {
         match &f.surface {
-            Surface::BSpline(s) => {
+            Surface::BSpline { s, .. } => {
                 if !done_surfaces.insert(f.surface_id) {
                     continue;
                 }

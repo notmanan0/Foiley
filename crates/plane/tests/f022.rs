@@ -189,3 +189,119 @@ fn f022_analytic_faces_with_holes_parse() {
     assert!(!tris.is_empty(), "{notes:?}");
     let _ = Vec3::ZERO;
 }
+
+fn bspline_of(m: &Model, fi: usize) -> (&foiley_plane::cad::NurbsSurface, [bool; 2]) {
+    match &m.faces[fi].surface {
+        foiley_plane::cad::Surface::BSpline { s, closed } => (s, *closed),
+        s => panic!("not a B-spline: {}", s.kind()),
+    }
+}
+
+/// B-spline surface evaluation against closed forms: the bicubic patch
+/// S = (u, v, u^2 v) (simple STEP entity) and the rational loft of exact
+/// circles (complex rational entity), with first derivatives.
+#[test]
+fn f022_bspline_surface_eval_matches_reference() {
+    let m = model("bspline_patch.stp");
+    let (s, closed) = bspline_of(&m, 0);
+    assert_eq!((s.pu, s.pv), (3, 3));
+    assert_eq!(closed, [false, false]);
+    for i in 0..=8 {
+        for j in 0..=8 {
+            let (u, v) = (i as f64 / 8.0, j as f64 / 8.0);
+            let (p, su, sv) = s.eval_derivs(u, v);
+            let want = Vec3::new(u, v, u * u * v);
+            assert!((p - want).norm() < 1e-14, "S({u},{v}) = {p:?}");
+            assert!((s.eval(u, v) - want).norm() < 1e-14);
+            assert!((su - Vec3::new(1.0, 0.0, 2.0 * u * v)).norm() < 1e-12, "Su({u},{v}) = {su:?}");
+            assert!((sv - Vec3::new(0.0, 1.0, u * u)).norm() < 1e-12, "Sv({u},{v}) = {sv:?}");
+        }
+    }
+    // rational loft: degree 1 along x through (x, r) stations, exact circles around
+    let m = model("loft_fuselage.stp");
+    let (s, closed) = bspline_of(&m, 0);
+    assert_eq!(closed, [false, true], "closed around, open along");
+    assert_eq!(m.faces[0].surface.poles(0), vec![0.0, 1.0], "nose and tail are poles");
+    let st = [(0.0, 0.0), (0.3, 0.1), (1.0, 0.1), (1.4, 0.0)];
+    let radius = |x: f64| {
+        let k = st.windows(2).position(|w| x <= w[1].0 + 1e-15).unwrap_or(2);
+        let (a, b) = (st[k], st[k + 1]);
+        a.1 + (b.1 - a.1) * (x - a.0) / (b.0 - a.0)
+    };
+    for i in 0..=12 {
+        for j in 0..=16 {
+            let (u, v) = (i as f64 / 12.0, j as f64 / 16.0);
+            let (p, su, sv) = s.eval_derivs(u, v);
+            // x is linear in u on each third
+            let k = ((u * 3.0).floor() as usize).min(2);
+            let x = st[k].0 + (st[k + 1].0 - st[k].0) * (u * 3.0 - k as f64);
+            assert!((p.x - x).abs() < 1e-13, "x({u}) = {} vs {x}", p.x);
+            assert!((p.y.hypot(p.z) - radius(x)).abs() < 1e-13, "radius at u {u} v {v}");
+            // derivatives against central differences (inside a span)
+            let h = 1e-6;
+            if (u * 3.0 - (u * 3.0).round()).abs() > 1e-3 {
+                let fd = (s.eval(u + h, v) - s.eval(u - h, v)) / (2.0 * h);
+                assert!((su - fd).norm() < 1e-6 * (1.0 + fd.norm()), "Su {su:?} vs {fd:?}");
+            }
+            if (v * 4.0 - (v * 4.0).round()).abs() > 1e-3 {
+                let fd = (s.eval(u, v + h) - s.eval(u, v - h)) / (2.0 * h);
+                assert!((sv - fd).norm() < 1e-6 * (1.0 + fd.norm()), "Sv {sv:?} vs {fd:?}");
+            }
+        }
+    }
+    // rational B-spline curve: the hole of the plate is an exact circle
+    let m = model("bspline_plate_hole.stp");
+    let e = m.edges.iter().find(|e| e.curve.kind() == "B_SPLINE_CURVE").expect("NURBS circle edge");
+    for k in 0..=64 {
+        let (t0, t1) = (e.samples[0].0, e.samples.last().unwrap().0);
+        let t = t0 + (t1 - t0) * k as f64 / 64.0;
+        let p = e.curve.eval(t);
+        let r = (p - Vec3::new(0.5, 0.5, 0.0)).norm();
+        assert!((r - 0.2).abs() < 1e-14, "circle radius {r}");
+        assert!(e.curve.deriv(t).dot(p - Vec3::new(0.5, 0.5, 0.0)).abs() < 1e-12, "tangent");
+    }
+}
+
+/// Edge inversion onto B-spline surfaces without PCURVEs: a curve across
+/// the patch (diagonal S(t, t)), a NURBS-circle hole in a B-spline plate,
+/// and the closed loft whose only edge is its seam between two poles.
+#[test]
+fn f022_bspline_edge_inversion_residual_1e9() {
+    // direct inversion of surface points from the coarse-grid seed
+    let m = model("bspline_patch.stp");
+    let s = &m.faces[0].surface;
+    for i in 0..=10 {
+        for j in 0..=10 {
+            let (u, v) = (0.03 + 0.094 * i as f64, 0.01 + 0.098 * j as f64);
+            let p = s.eval(u, v);
+            let uv = s.invert(p, None);
+            assert!((s.eval(uv[0], uv[1]) - p).norm() < 1e-12, "residual at {u},{v}");
+            assert!((uv[0] - u).abs() < 1e-9 && (uv[1] - v).abs() < 1e-9, "{uv:?} vs {u},{v}");
+        }
+    }
+    // the two triangles of the patch, split along the diagonal curve
+    let diag = m.edges.iter().find(|e| e.curve.kind() == "B_SPLINE_CURVE" && e.samples.len() > 2 && (m.vertices[e.v[1] as usize] - Vec3::new(1.0, 1.0, 1.0)).norm() < 1e-12 && (m.vertices[e.v[0] as usize]).norm() < 1e-12).expect("diagonal edge");
+    let on_diag: std::collections::HashSet<u32> = diag.samples.iter().map(|s| s.1).collect();
+    for fi in 0..2 {
+        let d = checked_domain(&m, fi);
+        assert!(close(d.area().abs(), 0.5, 1e-12), "triangle {fi}: area {}", d.area());
+        assert!(d.area() > 0.0);
+        for (uv, id) in d.loops[0].uv.iter().zip(&d.loops[0].ids) {
+            if on_diag.contains(id) {
+                assert!((uv[0] - uv[1]).abs() < 1e-9, "diagonal point at {uv:?}");
+            }
+        }
+    }
+    // plate with a NURBS-circle hole: area 1 - pi r^2
+    let fine = StepOptions { chord_tol: 1e-7, ..Default::default() };
+    let m = Model::from_step(&text("bspline_plate_hole.stp"), &fine).unwrap();
+    let d = checked_domain(&m, 0);
+    assert_eq!(d.loops.len(), 2);
+    assert!(close(d.area(), 1.0 - PI * 0.04, 1e-6), "plate area {}", d.area());
+    // closed loft: the seam's two uses lie one period (1) apart in v, the poles are duplicated
+    let m = model("loft_fuselage.stp");
+    let d = checked_domain(&m, 0);
+    assert!(close(d.area(), 1.0, 1e-12), "loft domain area {}", d.area());
+    let sp = span(&d);
+    assert!(close(sp[0], 1.0, 1e-12) && close(sp[1], 1.0, 1e-12), "loft span {sp:?}");
+}

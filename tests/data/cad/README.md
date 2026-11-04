@@ -19,3 +19,6 @@ closed-form area and volume:
 | `sphere.stp` | sphere bounded by one meridian seam |
 | `torus.stp` | torus with u and v seams |
 | `ellipse_prism.stp` | linear extrusion of an ellipse, planar caps |
+| `bspline_patch.stp` | bicubic B-spline patch S = (u, v, u^2 v) split along a B-spline diagonal curve, no PCURVEs |
+| `bspline_plate_hole.stp` | bilinear B-spline plate with a rational B-spline circle hole |
+| `loft_fuselage.stp` | closed rational B-spline loft: cone, cylinder, cone, poles at nose and tail |
