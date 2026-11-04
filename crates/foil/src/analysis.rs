@@ -521,6 +521,10 @@ pub fn analyze(foil: &Foil, st: &AnalysisSettings, sweep: &Sweep, prog: &Progres
         points: vec![],
         failed: vec![],
         flap_deg: 0.0,
+        settings: Some(st.clone()),
+        foil_hash: Some(foil.geom_hash()),
+        manifest: Some(foiley_core::provenance::RunManifest::new(foiley_core::provenance::hash_json("foiley.settings2d.v1", st), foil.geom_hash())),
+        legacy: false,
     };
     let values = sweep.values();
     if values.is_empty() {

@@ -107,10 +107,7 @@ impl Envelope {
 /// Hash of a foil's normalized coordinates (unit chord, LE at the origin,
 /// de-rotated), quantized to 1e-9 chord.  The name is not part of it.
 pub fn foil_geom_hash(f: &Foil) -> Hash32 {
-    let g = if f.n() >= 3 { f.normalized() } else { f.clone() };
-    let mut h = Hasher::new();
-    h.tag("foiley.foil.v1").f64s(&g.x).f64s(&g.y);
-    h.finish()
+    f.geom_hash()
 }
 
 /// Quantize a family parameter for comparison and hashing (1e-6).
@@ -144,7 +141,8 @@ impl FamilyKey {
     /// Moment reference used when a polar does not record one.
     pub const DEFAULT_MOM_REF_X: f64 = 0.25;
     pub fn of(p: &FoilPolar, foil_geom_hash: Hash32) -> FamilyKey {
-        FamilyKey { foil_geom_hash, polar_type: p.polar_type, mach: p.mach, ncrit: p.ncrit, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, flap_deg: p.flap_deg, mom_ref_x: FamilyKey::DEFAULT_MOM_REF_X }
+        let mom_ref_x = p.settings.as_ref().map(|s| s.cm_ref.0).unwrap_or(FamilyKey::DEFAULT_MOM_REF_X);
+        FamilyKey { foil_geom_hash, polar_type: p.polar_type, mach: p.mach, ncrit: p.ncrit, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, flap_deg: p.flap_deg, mom_ref_x }
     }
     fn q(&self) -> (Hash32, u8, [i64; 6]) {
         (self.foil_geom_hash, self.polar_type, [qv(self.mach), qv(self.ncrit), qv(self.xtr_top), qv(self.xtr_bot), qv(self.flap_deg), qv(self.mom_ref_x)])
@@ -248,6 +246,9 @@ pub struct FoilDb {
     foils: HashMap<String, (Arc<FoilShape>, Hash32)>,
     families: Vec<Family>,
     index: HashMap<(String, FamilyKey), FamilyId>,
+    /// polars computed on another geometry than the loaded foil's (their
+    /// `foil_hash` does not match): kept out of every family
+    stale: Vec<FoilPolar>,
 }
 
 impl FoilDb {
@@ -263,7 +264,8 @@ impl FoilDb {
         }
     }
     fn rebuild(&mut self) {
-        let polars: Vec<FoilPolar> = std::mem::take(&mut self.families).into_iter().flat_map(|f| f.polars).collect();
+        let mut polars: Vec<FoilPolar> = std::mem::take(&mut self.families).into_iter().flat_map(|f| f.polars).collect();
+        polars.append(&mut self.stale);
         self.index.clear();
         for p in &polars {
             self.insert(p);
@@ -283,10 +285,23 @@ impl FoilDb {
         for fam in self.families.iter_mut().filter(|f| f.foil == p.foil) {
             fam.polars.retain(|q| q.name != p.name);
         }
+        self.stale.retain(|q| q.foil != p.foil || q.name != p.name);
         self.insert(p);
     }
+    /// Polars left out because their geometry hash does not match the
+    /// loaded foil (the foil was edited after they were computed).
+    pub fn stale_polars(&self) -> &[FoilPolar] {
+        &self.stale
+    }
     fn insert(&mut self, p: &FoilPolar) {
-        let key = FamilyKey::of(p, self.foil_hash(&p.foil).unwrap_or(Hash32::ZERO));
+        let current = self.foil_hash(&p.foil);
+        if let (Some(c), Some(h)) = (current, p.foil_hash) {
+            if c != h {
+                self.stale.push(p.clone());
+                return;
+            }
+        }
+        let key = FamilyKey::of(p, current.or(p.foil_hash).unwrap_or(Hash32::ZERO));
         let families = &mut self.families;
         let id = *self.index.entry((p.foil.clone(), key)).or_insert_with(|| {
             families.push(Family { foil: p.foil.clone(), key, polars: vec![] });
