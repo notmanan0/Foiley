@@ -714,11 +714,11 @@ impl App {
                                 l = l.style(egui_plot::LineStyle::dashed_dense());
                             }
                             pu.line(l);
-                            pu.points(Points::new(name.clone(), PlotPoints::from(xy)).radius(2.5).color(col));
+                            pu.points(Points::new(name.clone(), PlotPoints::from(xy)).radius(2.5_f32).color(col));
                         }
                         if let Some(p) = &sel {
                             if let Some(o) = p.points.get(self.pui.sel_point) {
-                                pu.points(Points::new("selected", PlotPoints::from(vec![[var3(o, xv), var3(o, yv)]])).radius(6.0).shape(MarkerShape::Circle).filled(false).color(Color32::YELLOW));
+                                pu.points(Points::new("selected", PlotPoints::from(vec![[var3(o, xv), var3(o, yv)]])).radius(6.0_f32).shape(MarkerShape::Circle).filled(false).color(Color32::YELLOW));
                             }
                             if pu.response().clicked() {
                                 if let Some(c) = pu.pointer_coordinate() {
@@ -780,7 +780,7 @@ impl App {
                                     .collect();
                                 let name = plane.wings.get(wi).map(|w| w.name.clone()).unwrap_or_else(|| format!("wing {wi}"));
                                 pu.line(Line::new(name.clone(), PlotPoints::from(pts.clone())).color(series_color(wi)));
-                                pu.points(Points::new(name, PlotPoints::from(pts)).radius(1.5).color(series_color(wi)));
+                                pu.points(Points::new(name, PlotPoints::from(pts)).radius(1.5_f32).color(series_color(wi)));
                             }
                         }
                     }
@@ -959,10 +959,10 @@ impl App {
                     }
                 }
                 for (i, (name, v)) in by_mode.into_iter().enumerate() {
-                    pu.points(Points::new(name, PlotPoints::from(v)).radius(4.0).shape(MarkerShape::Cross).color(series_color(i)));
+                    pu.points(Points::new(name, PlotPoints::from(v)).radius(4.0_f32).shape(MarkerShape::Cross).color(series_color(i)));
                 }
                 let cur: Vec<[f64; 2]> = s.modes.iter().flat_map(|m| [[m.eigenvalue.re, m.eigenvalue.im], [m.eigenvalue.re, -m.eigenvalue.im]]).collect();
-                pu.points(Points::new("selected point", PlotPoints::from(cur)).radius(7.0).filled(false).color(Color32::YELLOW));
+                pu.points(Points::new("selected point", PlotPoints::from(cur)).radius(7.0_f32).filled(false).color(Color32::YELLOW));
                 pu.vline(egui_plot::VLine::new("stability limit", 0.0).color(Color32::GRAY));
             });
             ui.horizontal(|ui| {
