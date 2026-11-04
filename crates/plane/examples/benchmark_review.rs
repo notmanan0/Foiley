@@ -152,11 +152,9 @@ fn main() {
     let mut ba = db.clone();
     ba.add_polar(&pb);
     ba.add_polar(&pa);
-    println!(
-        "Polar insertion order: CD={}/{}",
-        ab.at_re_cl(&f.name, 1e6, 0.5).unwrap().0.cd,
-        ba.at_re_cl(&f.name, 1e6, 0.5).unwrap().0.cd
-    );
+    let n9 = foiley_plane::FamilySelector { ncrit: Some(9.0), ..Default::default() };
+    let cd = |db: &FoilDb| db.at_re_cl(db.resolve(&f.name, &n9).unwrap().unwrap(), 1e6, 0.5).unwrap().0.cd;
+    println!("Polar insertion order (Ncrit 9 family): CD={}/{}", cd(&ab), cd(&ba));
 
     let mut ldb = db.clone();
     for re in [1e4, 1e8] {

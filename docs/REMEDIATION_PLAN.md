@@ -57,7 +57,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [ ] **F008** · LLT glide balance — after F020
 - [ ] **F018** · Node-preserving 2D input
 - [ ] **F024** · GUI CAD import as a job
-- [ ] **F002** · Explicit polar families
+- [x] **F002** · Explicit polar families
 - [ ] **F007** · One wake-aware evaluator for every driver (+F019) — after F020
 - [ ] **F004a** · Multi-body meshing
 - [ ] **F010a** · AVL export fidelity and importer

@@ -27,7 +27,7 @@ pub mod vlm;
 pub mod xml;
 
 pub use analysis::{run_polar, Method, PlaneOpp, PlanePolar, PlanePolarDef, PolarKind};
-pub use foildb::FoilDb;
+pub use foildb::{FamilyId, FamilySelector, FoilDb};
 pub use geom::{Fuse, NurbsBody, NurbsFrame, Plane, PointMass, Wing, WingKind, WingSection};
 
 /// Error type for the 3D layer.

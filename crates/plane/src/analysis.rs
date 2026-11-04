@@ -1,10 +1,10 @@
 //! 3D polars: definitions (types 1-8), the drivers, and the reduction of
 //! raw loads to coefficients and span distributions.
 
-use crate::foildb::{Envelope, FoilDb};
+use crate::foildb::{Envelope, FamilyId, FamilySelector, FoilDb};
 use crate::geom::{Inertia, Plane};
 use crate::linear_panel::LinearPanelSystem;
-use crate::mesh::{build, Mesh, MeshOptions};
+use crate::mesh::{build, Mesh, MeshOptions, Strip};
 use crate::panel::PanelSystem;
 use crate::stability::{self, StabilityResult};
 use crate::vlm::VlmSystem;
@@ -328,6 +328,9 @@ pub struct PlanePolarDef {
     /// fail a point if any strip's viscous interpolation is clamped to the
     /// 2D polar envelope (or has no polar), instead of warning
     pub strict_envelope: bool,
+    /// which 2D polar family of each foil the viscous interpolation (and
+    /// the lifting line) uses; must select exactly one per foil
+    pub family: FamilySelector,
 }
 
 impl Default for PlanePolarDef {
@@ -362,6 +365,7 @@ impl Default for PlanePolarDef {
             keep_strips: true,
             allow_missing_foils: false,
             strict_envelope: false,
+            family: FamilySelector::default(),
             free_wake: 0,
             diagnostics: Diagnostics::Off,
         }
@@ -860,6 +864,11 @@ pub struct Ctx<'a> {
     pub b_ref: f64,
     pub c_ref: f64,
     pub inertia: Inertia,
+    /// polar family of every wing section's foil: `[wing][section][left]`
+    /// (resolved once, so the per-strip lookup is two array indexes)
+    pub section_family: Vec<Vec<[Option<FamilyId>; 2]>>,
+    /// the same per foil name (setup code only)
+    pub foil_family: Vec<(String, Option<FamilyId>)>,
 }
 
 impl<'a> Ctx<'a> {
@@ -873,15 +882,50 @@ impl<'a> Ctx<'a> {
             return Err(PlaneError::Input(format!("reference dimensions must be positive (area {s}, span {b}, chord {c})")));
         }
         let inertia = def.inertia.unwrap_or_else(|| plane.inertia(db));
-        Ok(Ctx { plane, db, def, s_ref: s, b_ref: b, c_ref: c, inertia })
+        // the 2D polar family of every foil, once; ambiguity is an error
+        let uses_polars = def.viscous || def.method == Method::Llt;
+        let mut foil_family: Vec<(String, Option<FamilyId>)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for f in plane.foil_names() {
+            let id = if uses_polars {
+                db.resolve(&f, &def.family).unwrap_or_else(|e| {
+                    errors.push(e);
+                    None
+                })
+            } else {
+                None
+            };
+            foil_family.push((f, id));
+        }
+        if !errors.is_empty() {
+            return Err(PlaneError::Input(errors.join("
+")));
+        }
+        let fam = |name: &str| foil_family.iter().find(|(n, _)| n == name).and_then(|(_, id)| *id);
+        let section_family = plane.wings.iter().map(|w| (0..w.sections.len()).map(|i| [fam(w.foil(i, false)), fam(w.foil(i, true))]).collect()).collect();
+        Ok(Ctx { plane, db, def, s_ref: s, b_ref: b, c_ref: c, inertia, section_family, foil_family })
+    }
+
+    /// The resolved polar family of a foil (setup code; not for hot loops).
+    pub fn family_of(&self, foil: &str) -> Option<FamilyId> {
+        self.foil_family.iter().find(|(n, _)| n == foil).and_then(|(_, id)| *id)
+    }
+
+    /// Polar families of a strip's two end foils (no string lookups).
+    pub fn strip_families(&self, s: &Strip) -> (Option<FamilyId>, Option<FamilyId>) {
+        let at = |i: usize| self.section_family.get(s.wing).and_then(|w| w.get(i)).and_then(|f| f[s.left as usize]);
+        (at(s.surf), at(s.surf + 1))
     }
 
     /// Viscous drag, transition and section Cm for a strip: interpolated
     /// between the strip's two end foils.  Returns None if no polar exists.
-    pub fn strip_viscous(&self, foil_a: &str, foil_b: &str, tau: f64, re: f64, cl: f64, alpha_eff: f64) -> Option<(f64, f64, f64, f64, Envelope)> {
-        let get = |f: &str| if self.def.viscous_from_cl { self.db.at_re_cl(f, re, cl) } else { self.db.at_re_alpha(f, re, alpha_eff) };
-        let (pa, oa) = get(foil_a)?;
-        let (pb, ob) = if foil_b == foil_a { (pa, oa) } else { get(foil_b)? };
+    pub fn strip_viscous(&self, s: &Strip, re: f64, cl: f64, alpha_eff: f64) -> Option<(f64, f64, f64, f64, Envelope)> {
+        let (fa, fb) = self.strip_families(s);
+        let get = |f: FamilyId| if self.def.viscous_from_cl { self.db.at_re_cl(f, re, cl) } else { self.db.at_re_alpha(f, re, alpha_eff) };
+        let (fa, fb) = (fa?, fb?);
+        let (pa, oa) = get(fa)?;
+        let (pb, ob) = if fb == fa { (pa, oa) } else { get(fb)? };
+        let tau = s.tau;
         let l = |x: f64, y: f64| x + tau * (y - x);
         Some((l(pa.cd, pb.cd), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), l(pa.cm, pb.cm), oa.combine(ob)))
     }
@@ -927,7 +971,7 @@ impl<'a> Ctx<'a> {
                 ..Default::default()
             };
             if self.def.viscous {
-                match self.strip_viscous(&s.foil_a, &s.foil_b, s.tau, re, cl, alpha_eff) {
+                match self.strip_viscous(s, re, cl, alpha_eff) {
                     Some((cd, xt, xb, cm, env)) => {
                         sr.cdv = cd;
                         sr.xtr_top = xt;
