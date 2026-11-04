@@ -54,7 +54,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [x] **F023** · LLT settings honesty — after F009
 - [x] **F012** · Viscous envelope status
 - [x] **F014** · Cancellable blocked LU
-- [ ] **F008** · LLT glide balance — after F020
+- [x] **F008** · LLT glide balance — after F020
 - [ ] **F018** · Node-preserving 2D input
 - [ ] **F024** · GUI CAD import as a job
 - [x] **F002** · Explicit polar families
