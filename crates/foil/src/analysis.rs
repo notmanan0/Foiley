@@ -339,8 +339,9 @@ fn to_foil_point(xf: &XFoil, q: &foiley::polar::PolarPoint) -> FoilPoint {
         cpmin: q.cpmin,
         re: if xf.lvisc { xf.reinf } else { 0.0 },
         mach: xf.minf,
-        iterations: 0,
+        iterations: if xf.lvisc { xf.viscal_iters as u32 } else { 0 },
         recovered: false,
+        recovery: crate::polar::Recovery::None,
         flap: 0.0,
     }
 }
@@ -397,6 +398,7 @@ impl<'a> Marcher<'a> {
         self.reset_bl();
         if let Some(mut p) = try_solve(&mut self.xf, self.lalfa, eng(self.lalfa, v), it * 2) {
             p.recovered = true;
+            p.recovery = crate::polar::Recovery::ReinitBl;
             prog.debug(format!("recovered {} by re-initialising the boundary layer", self.fmt(v)));
             self.last_ok = Some(v);
             return Some(p);
@@ -438,6 +440,7 @@ impl<'a> Marcher<'a> {
             }
             if let Some(mut p) = try_solve(&mut self.xf, self.lalfa, eng(self.lalfa, v), it) {
                 p.recovered = true;
+                p.recovery = crate::polar::Recovery::March { substeps: nsub as u32, attempts: tries as u32 };
                 prog.debug(format!("recovered {} by marching in {nsub} sub-steps from {}", self.fmt(v), self.fmt(start)));
                 self.last_ok = Some(v);
                 return Some(p);

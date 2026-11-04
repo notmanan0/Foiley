@@ -45,7 +45,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 ## Checklist
 
 - [x] **S1** · Track test fixtures and gitignore the big files
-- [ ] **F017** · Real 2D iteration counts
+- [x] **F017** · Real 2D iteration counts
 - [ ] **F020** · T3 convergence flag
 - [ ] **F001** · 2D bench harness fixes
 - [ ] **F009** · Input validation and finite output

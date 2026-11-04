@@ -229,6 +229,8 @@ pub struct XFoil {
     pub ladij: bool,
     pub lwdij: bool,
     pub lvconv: bool,
+    /// Newton iterations taken by the last `viscal` call (its `iter` count)
+    pub viscal_iters: usize,
     pub lclock: bool,
     pub lnorm: bool,
     pub lbflap: bool,
@@ -455,6 +457,7 @@ impl XFoil {
             ladij: false,
             lwdij: false,
             lvconv: false,
+            viscal_iters: 0,
             lclock: false,
             lnorm: false,
             lbflap: false,
@@ -839,7 +842,9 @@ impl XFoil {
             crate::outln!("\n Solving BL system ...");
         }
         let mut conv = false;
+        self.viscal_iters = 0;
         for iter in 1..=niter {
+            self.viscal_iters = iter;
             self.setbl();
             self.blsolv();
             self.update();
