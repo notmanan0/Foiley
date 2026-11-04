@@ -26,21 +26,25 @@ use std::collections::{BTreeMap, HashMap};
 /// Import settings.
 #[derive(Clone, Debug)]
 pub struct StepOptions {
-    /// chordal deviation tolerance in metres (0 = 0.1 % of the model's
-    /// bounding-box diagonal)
+    /// chordal deviation tolerance in metres (0 = `rel_chord_tol` times
+    /// the model's bounding-box diagonal)
     pub chord_tol: f64,
+    /// chordal tolerance relative to the bounding-box diagonal
+    pub rel_chord_tol: f64,
     /// largest turning angle between adjacent edge segments, degrees
     pub angle_tol_deg: f64,
-    /// longest triangle / edge-segment side in metres (0 = 10 % of the
-    /// bounding-box diagonal)
+    /// longest triangle / edge-segment side in metres (0 = `rel_max_edge`
+    /// times the bounding-box diagonal)
     pub max_edge: f64,
+    /// longest side relative to the bounding-box diagonal
+    pub rel_max_edge: f64,
     /// fail on any unsupported entity instead of skipping it with a note
     pub strict: bool,
 }
 
 impl Default for StepOptions {
     fn default() -> Self {
-        StepOptions { chord_tol: 0.0, angle_tol_deg: 20.0, max_edge: 0.0, strict: false }
+        StepOptions { chord_tol: 0.0, rel_chord_tol: 1e-3, angle_tol_deg: 20.0, max_edge: 0.0, rel_max_edge: 0.1, strict: false }
     }
 }
 
@@ -734,9 +738,9 @@ impl Model {
     pub fn from_file(f: &StepFile, opts: &StepOptions) -> Result<Model, String> {
         let diag = file_diag(f);
         let tol = Tol {
-            chord: if opts.chord_tol > 0.0 { opts.chord_tol } else { 1e-3 * diag },
+            chord: if opts.chord_tol > 0.0 { opts.chord_tol } else { opts.rel_chord_tol.max(1e-9) * diag },
             angle: opts.angle_tol_deg.clamp(1.0, 90.0).to_radians(),
-            max_edge: if opts.max_edge > 0.0 { opts.max_edge } else { 0.1 * diag },
+            max_edge: if opts.max_edge > 0.0 { opts.max_edge } else { opts.rel_max_edge.max(1e-6) * diag },
         };
         let m = Model { vertices: vec![], edges: vec![], faces: vec![], notes: vec![], unsupported: BTreeMap::new(), length_scale: f.length_scale, diag, tol, n_shells: 0, bare_surfaces: false };
         let mut b = Builder { f, m, vmap: HashMap::new(), emap: HashMap::new(), smap: HashMap::new() };

@@ -7,7 +7,7 @@
 //!   B-spline) with evaluation and point inversion;
 //! * [`trim`]: topology (shells, faces, loops, edges), edge sampling and
 //!   the trimmed parameter-space domain of each face, with seam handling;
-//! * [`tessellate`]: triangulation of the faces.
+//! * [`tessellate`]: watertight triangulation of the trimmed faces.
 
 use foiley_core::Vec3;
 
@@ -17,6 +17,7 @@ pub mod tessellate;
 pub mod trim;
 
 pub use surfaces::{Curve, Frame, Surface};
+pub use tessellate::{import_step, CadMesh, FaceMesh, StepImport};
 pub use trim::{Domain, Model, ParamLoop, StepOptions};
 
 pub type Tri = [Vec3; 3];
@@ -411,17 +412,101 @@ pub fn write_stl(tris: &[Tri], name: &str) -> Vec<u8> {
 
 // ---------------------------------------------------------------- STEP
 
-/// Read the surfaces of a STEP file as triangles (metres).
-/// `density` = segments per control-polygon span.  Returns (triangles, notes).
+/// Read a STEP file as triangles (metres): trimmed, watertight
+/// tessellation of its faces (see [`tessellate`]).  `density` refines the
+/// tolerances (1 = 0.2 % chordal deviation and 30 % longest side, relative
+/// to the model size; each step divides the chordal tolerance by density^2
+/// and the side by density).  Returns (triangles, notes).
 pub fn read_step(text: &str, density: usize) -> Result<(Vec<Tri>, Vec<String>), String> {
-    tessellate::legacy(text, density as f64)
+    let d = density.max(1) as f64;
+    let opts = StepOptions { rel_chord_tol: 2e-3 / (d * d), rel_max_edge: 0.3 / d, ..Default::default() };
+    let r = tessellate::import_step(text, &opts, &foiley_core::Progress::none())?;
+    Ok((r.mesh.to_tris(), r.notes))
 }
 
 /// STEP surfaces tessellated to roughly `target` triangles in total.
 pub fn read_step_target(text: &str, target: usize) -> Result<(Vec<Tri>, Vec<String>), String> {
-    let (probe, _) = tessellate::legacy(text, 1.0)?;
-    let f = (target as f64 / probe.len().max(1) as f64).sqrt().clamp(0.15, 8.0);
-    tessellate::legacy(text, f)
+    read_step_target_with(text, target, &foiley_core::Progress::none())
+}
+
+/// [`read_step_target`] with progress and cancellation: tolerances are
+/// scaled from the default until the triangle count is near the target.
+pub fn read_step_target_with(text: &str, target: usize, p: &foiley_core::Progress) -> Result<(Vec<Tri>, Vec<String>), String> {
+    let file = step_parse::StepFile::parse(text)?;
+    let target = target.max(8) as f64;
+    let mut opts = StepOptions::default();
+    let mut best: Option<(f64, CadMesh, Vec<String>)> = None;
+    for pass in 0..4 {
+        p.check().map_err(|e| e.to_string())?;
+        let model = Model::from_file(&file, &opts)?;
+        let (mesh, notes) = tessellate::tessellate(&model, false, &p.sub(0.0, 0.25))?;
+        let n = mesh.triangles.len() as f64;
+        let miss = (n / target).ln().abs();
+        if best.as_ref().map(|b| miss < b.0).unwrap_or(true) {
+            best = Some((miss, mesh, notes));
+        }
+        if miss < 0.2 || pass == 3 {
+            break;
+        }
+        // spacing ~ max_edge ~ sqrt(chord): triangle count ~ 1 / max_edge^2
+        let k = (n / target).sqrt().clamp(0.2, 5.0);
+        opts.rel_max_edge = (opts.rel_max_edge * k).clamp(1e-4, 1.0);
+        opts.rel_chord_tol = (opts.rel_chord_tol * k * k).clamp(1e-7, 0.05);
+    }
+    let (_, mesh, notes) = best.unwrap();
+    Ok((mesh.to_tris(), notes))
+}
+
+/// Make the winding of an indexed triangle mesh consistent across shared
+/// edges, then outward (positive volume) per connected part.  Returns the
+/// number of triangles flipped.
+pub fn orient_indexed(tris: &mut [[u32; 3]], vertices: &[Vec3]) -> usize {
+    use std::collections::HashMap;
+    let mut edges: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (i, t) in tris.iter().enumerate() {
+        for k in 0..3 {
+            let (a, b) = (t[k], t[(k + 1) % 3]);
+            edges.entry((a.min(b), a.max(b))).or_default().push(i);
+        }
+    }
+    let n = tris.len();
+    let mut seen = vec![false; n];
+    let mut flipped = vec![false; n];
+    for start in 0..n {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut part = vec![start];
+        let mut q = vec![start];
+        while let Some(i) = q.pop() {
+            for k in 0..3 {
+                let (a, b) = (tris[i][k], tris[i][(k + 1) % 3]);
+                for &j in &edges[&(a.min(b), a.max(b))] {
+                    if j == i || seen[j] {
+                        continue;
+                    }
+                    let same_dir = (0..3).any(|m| tris[j][m] == a && tris[j][(m + 1) % 3] == b);
+                    if same_dir {
+                        tris[j].swap(1, 2);
+                        flipped[j] = !flipped[j];
+                    }
+                    seen[j] = true;
+                    part.push(j);
+                    q.push(j);
+                }
+            }
+        }
+        let c = part.iter().fold(Vec3::ZERO, |a, &i| a + vertices[tris[i][0] as usize]) / part.len() as f64;
+        let vol: f64 = part.iter().map(|&i| (vertices[tris[i][0] as usize] - c).dot((vertices[tris[i][1] as usize] - c).cross(vertices[tris[i][2] as usize] - c))).sum();
+        if vol < 0.0 {
+            for &i in &part {
+                tris[i].swap(1, 2);
+                flipped[i] = !flipped[i];
+            }
+        }
+    }
+    flipped.iter().filter(|f| **f).count()
 }
 
 #[cfg(test)]
@@ -459,7 +544,11 @@ mod tests {
     fn step_spline_surface() {
         let s = "ISO-10303-21;\nDATA;\n#1=CARTESIAN_POINT('',(0.,0.,0.));#2=CARTESIAN_POINT('',(0.,1.,0.));#3=CARTESIAN_POINT('',(1.,0.,0.));#4=CARTESIAN_POINT('',(1.,1.,1.));\n#5=B_SPLINE_SURFACE_WITH_KNOTS('',1,1,((#1,#2),(#3,#4)),.UNSPECIFIED.,.F.,.F.,.F.,(2,2),(2,2),(0.,1.),(0.,1.),.UNSPECIFIED.);\nENDSEC;\nEND-ISO-10303-21;\n";
         let (t, _) = read_step(s, 4).unwrap();
-        assert_eq!(t.len(), 32);
+        // adaptive since F022c (was a 4 x 4 grid, 32 triangles)
+        assert!(t.len() >= 32, "{}", t.len());
+        let area: f64 = t.iter().map(tri_area).sum();
+        // hyperbolic paraboloid z = u v over the unit square
+        assert!((area - 1.2807).abs() < 2e-3, "{area}");
         let (lo, hi) = bbox(&t);
         assert!((hi.z - 1.0).abs() < 1e-12 && lo.z.abs() < 1e-12);
     }
