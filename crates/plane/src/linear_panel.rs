@@ -228,6 +228,7 @@ impl<'a> LinearPanelSystem<'a> {
         Self::build_order(mesh, cog, wake_length, wake_panels, wake_ratio, ground, prog, 2, diag)
     }
 
+    #[allow(clippy::too_many_arguments)] // one recursion level of the ordering pass
     fn build_order(
         mesh: &'a Mesh,
         cog: Vec3,
@@ -559,8 +560,8 @@ mod tests {
             for q in quadrature(&t, 5) {
                 let r = p - q.p;
                 ss -= q.weight * t.area / (FOUR_PI * r.norm());
-                for k in 0..3 {
-                    dd[k] += q.weight * t.area * q.basis[k] * r.dot(t.normal) / (FOUR_PI * r.norm().powi(3));
+                for (k, ddk) in dd.iter_mut().enumerate() {
+                    *ddk += q.weight * t.area * q.basis[k] * r.dot(t.normal) / (FOUR_PI * r.norm().powi(3));
                 }
             }
             assert!((s - ss).abs() < 2e-9, "source {s} vs {ss}");

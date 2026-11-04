@@ -23,7 +23,13 @@ use std::time::{Duration, Instant};
 
 pub type JobId = u64;
 
+/// A target speed distribution for an inverse job and the node range it
+/// modifies (`None`: the whole surface), as `foiley_foil::inverse::modify` returns.
+pub type InverseTarget = (Vec<f64>, Option<(usize, usize)>);
+
 /// What to compute.  Inputs are owned copies.
+// one value per submitted job, moved once into the worker: its size does not matter
+#[allow(clippy::large_enum_variant)]
 pub enum JobKind {
     FoilPolar { foil: Foil, settings: AnalysisSettings, sweep: Sweep },
     FoilPoint { foil: Foil, settings: AnalysisSettings, value: f64, is_alpha: bool },
@@ -33,7 +39,7 @@ pub enum JobKind {
     PlanePolar { plane: Plane, db: FoilDb, def: PlanePolarDef },
     Mesh { plane: Plane, db: FoilDb, options: MeshOptions },
     Optimise { foil: Foil, settings: foiley_foil::optim::OptimSettings },
-    Inverse { foil: Foil, alpha: f64, mode: foiley_foil::inverse::InverseMode, paneling: foiley_foil::foil::Paneling, target: Option<(Vec<f64>, Option<(usize, usize)>)>, iterations: usize },
+    Inverse { foil: Foil, alpha: f64, mode: foiley_foil::inverse::InverseMode, paneling: foiley_foil::foil::Paneling, target: Option<InverseTarget>, iterations: usize },
     /// Read and tessellate an STL / STEP body (F024).
     CadImport(CadImport),
 }

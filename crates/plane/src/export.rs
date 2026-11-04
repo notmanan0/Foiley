@@ -764,7 +764,7 @@ fn make_wing(title: &str, s: &ASurf, right: &[ASec], left: Option<&[ASec]>, mirr
         let mut err: f64 = 0.0;
         for k in 0..n {
             let d = target[k] - fr[k].le();
-            u[k] = u[k] + d;
+            u[k] += d;
             err = err.max(d.norm());
         }
         if err <= 1e-15 * scale {

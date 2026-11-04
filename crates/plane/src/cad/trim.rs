@@ -78,6 +78,8 @@ fn turn(a: Vec3, m: Vec3, b: Vec3) -> f64 {
 /// reversal of the interval, so a curve shared by two patches is sampled
 /// identically from either side.
 pub fn sample_curve(f: &dyn Fn(f64) -> Vec3, t0: f64, t1: f64, n0: usize, tol: &Tol) -> Vec<f64> {
+    // recursion state passed explicitly
+    #[allow(clippy::too_many_arguments)]
     fn rec(f: &dyn Fn(f64) -> Vec3, a: f64, pa: Vec3, b: f64, pb: Vec3, tol: &Tol, depth: usize, out: &mut Vec<f64>) {
         let m = 0.5 * (a + b);
         let pm = f(m);
@@ -287,7 +289,7 @@ fn bspline_curve(f: &StepFile, id: u64, a: &[Val], length: bool) -> Option<Curve
     let e = f.get(id)?;
     // simple form: name, degree, ctrl, form, closed, self_int, mults, knots, spec
     // complex form: B_SPLINE_CURVE(degree, ctrl, form, closed, si) + B_SPLINE_CURVE_WITH_KNOTS(mults, knots, spec)
-    let (deg, ctrl, mk) = if let Some(b) = e.part("B_SPLINE_CURVE") { (b.first()?.num()?, b.get(1)?, &a[..]) } else { (a.get(1)?.num()?, a.get(2)?, &a[6.min(a.len())..]) };
+    let (deg, ctrl, mk) = if let Some(b) = e.part("B_SPLINE_CURVE") { (b.first()?.num()?, b.get(1)?, a) } else { (a.get(1)?.num()?, a.get(2)?, &a[6.min(a.len())..]) };
     let pts: Option<Vec<Vec3>> = ctrl.list()?.iter().map(|v| v.rf().and_then(|r| if length { f.point(r) } else { f.point_raw(r) })).collect();
     let pts = pts?;
     let (m, k) = (mk.first()?.list()?, mk.get(1)?.list()?);
@@ -619,8 +621,8 @@ impl<'a> Builder<'a> {
             join(&mut parent, 0, 3);
             join(&mut parent, 1, 2);
         }
-        for k in 0..4 {
-            if sides[k].1 {
+        for (k, side) in sides.iter().enumerate() {
+            if side.1 {
                 join(&mut parent, k, (k + 1) % 4);
             }
         }
@@ -810,8 +812,7 @@ impl Model {
         let key = |p: Vec3| ((p.x / tol).floor() as i64, (p.y / tol).floor() as i64, (p.z / tol).floor() as i64);
         let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
         let mut map: Vec<u32> = (0..self.vertices.len() as u32).collect();
-        for i in first..self.vertices.len() {
-            let p = self.vertices[i];
+        for (i, &p) in self.vertices.iter().enumerate().skip(first) {
             let k = key(p);
             let mut found = None;
             'search: for dx in -1..=1 {
@@ -972,6 +973,7 @@ impl Model {
 
     /// Join two loops winding in direction `d` (`wa` = winding of `a`) by a
     /// seam, giving one simple polygon.
+    #[allow(clippy::too_many_arguments)] // loop pair, seam direction and winding
     fn join_seam(&self, s: &Surface, dom: &mut Domain, a: &[LoopPt], b: &[LoopPt], d: usize, wa: i64, per: f64) -> ParamLoop {
         let wb = -wa;
         let shift = |p: [f64; 2], k: f64| {
@@ -1023,6 +1025,7 @@ impl Model {
 
     /// Close a loop winding once in direction `d` through the surface pole
     /// (in the other direction) on the face's side.
+    #[allow(clippy::too_many_arguments)] // loop, pole direction, winding and period
     fn close_pole(&self, s: &Surface, dom: &mut Domain, a: &[LoopPt], d: usize, wa: i64, expected: f64, per: f64) -> Result<ParamLoop, String> {
         let o = 1 - d;
         let (vmin, vmax) = a.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.uv[o]), hi.max(p.uv[o])));
@@ -1135,7 +1138,9 @@ fn unwrap_loop(s: &Surface, pts: &[LoopPt], b: &Bound, uses: &HashMap<usize, usi
     }
     seams.truncate(4);
     let combos = 1usize << seams.len();
-    let mut best: Option<((usize, u8), Vec<LoopPt>, [i64; 2])> = None;
+    // (cost, loop, winding)
+    type Candidate = ((usize, u8), Vec<LoopPt>, [i64; 2]);
+    let mut best: Option<Candidate> = None;
     for c in 0..combos {
         let signs: Vec<f64> = (0..seams.len()).map(|j| if c >> j & 1 == 1 { -1.0 } else { 1.0 }).collect();
         let vals = unwrap_with(pts, &per, &seams, &signs);
