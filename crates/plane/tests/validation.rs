@@ -57,7 +57,7 @@ fn vlm_rectangular_wing_matches_lifting_surface_theory() {
         assert!((4.5..4.75).contains(&cla), "{m:?} CLa = {cla}");
         // rectangular wing span efficiency ~0.97-0.99
         assert!((0.95..1.0).contains(&o.efficiency), "{m:?} e = {}", o.efficiency);
-        assert!(o.cy.abs() < 1e-9 && o.cn.abs() < 1e-9, "symmetric flight must have no side force / yaw");
+        assert!(o.cy.unwrap().abs() < 1e-9 && o.cn.unwrap().abs() < 1e-9, "symmetric flight must have no side force / yaw");
     }
 }
 
@@ -93,10 +93,10 @@ fn dihedral_gives_stable_roll_due_to_sideslip() {
     d.range = Range { from: -5.0, to: 5.0, step: 5.0 };
     let r = run(&p, &d);
     let (m, z, pl) = (&r.points[0], &r.points[1], &r.points[2]);
-    assert!(z.cr.abs() < 1e-9 && z.cy.abs() < 1e-9);
+    assert!(z.cr.unwrap().abs() < 1e-9 && z.cy.unwrap().abs() < 1e-9);
     // antisymmetric response
-    assert!((m.cr + pl.cr).abs() < 1e-6 * (1.0 + m.cr.abs()));
-    assert!(m.cr != 0.0 && m.cy != 0.0);
+    assert!((m.cr.unwrap() + pl.cr.unwrap()).abs() < 1e-6 * (1.0 + m.cr.unwrap().abs()));
+    assert!(m.cr.unwrap() != 0.0 && m.cy.unwrap() != 0.0);
 }
 
 #[test]
@@ -357,9 +357,9 @@ fn tri_panels_with_fuselage_consistent_with_quads() {
     d.method = Method::TriPanel;
     let t = run(&p, &d);
     for (a, b) in q.points.iter().zip(&t.points) {
-        println!("alpha {}: quad CL {:.4} CDi {:.5} Cn {:.1e} | tri CL {:.4} CDi {:.5} Cn {:.1e}", a.alpha, a.cl, a.cdi, a.cn, b.cl, b.cdi, b.cn);
+        println!("alpha {}: quad CL {:.4} CDi {:.5} Cn {:.1e} | tri CL {:.4} CDi {:.5} Cn {:.1e}", a.alpha, a.cl, a.cdi, a.cn.unwrap(), b.cl, b.cdi, b.cn.unwrap());
         assert!((b.cl - a.cl).abs() < 0.03 + 0.05 * a.cl.abs());
-        assert!(b.cn.abs() < 1e-3 && a.cn.abs() < 1e-3, "symmetric plane must have no yaw");
+        assert!(b.cn.unwrap().abs() < 1e-3 && a.cn.unwrap().abs() < 1e-3, "symmetric plane must have no yaw");
         assert!(b.cdi >= 0.0 && a.cdi >= 0.0);
     }
 }

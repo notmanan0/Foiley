@@ -48,12 +48,12 @@ fn refine_step(nx: usize, ny: usize) -> (f64, f64, f64) {
         pos.cdi,
         pos.cm,
         zero.cl,
-        pos.cn,
+        pos.cn.unwrap(),
         (pos.cp.iter().copied().fold(f32::INFINITY, f32::min), pos.cp.iter().copied().fold(f32::NEG_INFINITY, f32::max))
     );
     assert!(zero.cl.abs() < 1e-5);
     assert!((pos.cl + neg.cl).abs() < 2e-5);
-    assert!(pos.cn.abs() < 1e-6 && pos.cy.abs() < 1e-6 && pos.cr.abs() < 1e-6);
+    assert!(pos.cn.unwrap().abs() < 1e-6 && pos.cy.unwrap().abs() < 1e-6 && pos.cr.unwrap().abs() < 1e-6);
     assert!(pos.cdi > 0.0 && (pos.cdi - neg.cdi).abs() < 1e-6);
     assert!(pos.cp.iter().all(|c| c.is_finite()));
     assert!((0.39..0.46).contains(&pos.cl), "CL={}", pos.cl);
@@ -147,7 +147,7 @@ fn fuselage_carry_through_and_flapped_wing() {
     println!("fuselage CL={} CDi={} flap CL={} CDi={} Cm={} -> {}", a.cl, a.cdi, b.cl, b.cdi, a.cm, b.cm);
     assert!(b.cl > a.cl && b.cm < a.cm);
     for r in [a, b] {
-        assert!(r.cdi > 0.0 && r.cn.abs() < 1e-5 && r.cy.abs() < 1e-5);
+        assert!(r.cdi > 0.0 && r.cn.unwrap().abs() < 1e-5 && r.cy.unwrap().abs() < 1e-5);
         assert!(r.cp.iter().all(|c| c.is_finite()));
     }
 }

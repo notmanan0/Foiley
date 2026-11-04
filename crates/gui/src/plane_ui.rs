@@ -79,6 +79,8 @@ impl Default for PlaneUi {
 
 pub const VARS3: [&str; 20] = ["alpha (deg)", "beta (deg)", "V (m/s)", "control", "CL", "CD", "CDi", "CDv", "CY", "Cm", "Cl (roll)", "Cn (yaw)", "CL/CD", "CL^1.5/CD", "Vz sink (m/s)", "efficiency e", "lift (N)", "drag (N)", "root bending (N.m)", "Xcp (m)"];
 
+/// Value of plot variable `i`; NaN when the point does not have it (LLT
+/// lateral coefficients), and such points are left out of the plots.
 fn var3(o: &PlaneOpp, i: usize) -> f64 {
     match i {
         0 => o.alpha,
@@ -89,10 +91,10 @@ fn var3(o: &PlaneOpp, i: usize) -> f64 {
         5 => o.cd,
         6 => o.cdi,
         7 => o.cdv,
-        8 => o.cy,
+        8 => o.cy.unwrap_or(f64::NAN),
         9 => o.cm,
-        10 => o.cr,
-        11 => o.cn,
+        10 => o.cr.unwrap_or(f64::NAN),
+        11 => o.cn.unwrap_or(f64::NAN),
         12 => o.ld(),
         13 => {
             if o.cd > 0.0 {
@@ -666,7 +668,7 @@ impl App {
                     }
                     plot.x_axis_label(VARS3[xv]).y_axis_label(VARS3[yv]).show(ui, |pu| {
                         for (i, (name, pts, running)) in series.iter().enumerate() {
-                            let xy: Vec<[f64; 2]> = pts.iter().map(|o| [var3(o, xv), var3(o, yv)]).collect();
+                            let xy: Vec<[f64; 2]> = pts.iter().map(|o| [var3(o, xv), var3(o, yv)]).filter(|p| p[0].is_finite() && p[1].is_finite()).collect();
                             let col = series_color(i);
                             let mut l = Line::new(name.clone(), PlotPoints::from(xy.clone())).color(col);
                             if *running {
@@ -682,7 +684,7 @@ impl App {
                             if pu.response().clicked() {
                                 if let Some(c) = pu.pointer_coordinate() {
                                     let b = pu.plot_bounds();
-                                    let best = p.points.iter().enumerate().map(|(i, o)| (i, ((var3(o, xv) - c.x) / b.width()).powi(2) + ((var3(o, yv) - c.y) / b.height()).powi(2))).min_by(|a, b| a.1.total_cmp(&b.1));
+                                    let best = p.points.iter().enumerate().map(|(i, o)| (i, ((var3(o, xv) - c.x) / b.width()).powi(2) + ((var3(o, yv) - c.y) / b.height()).powi(2))).filter(|d| d.1.is_finite()).min_by(|a, b| a.1.total_cmp(&b.1));
                                     if let Some((i, d)) = best {
                                         if d < 0.003 {
                                             clicked = Some(i);

@@ -51,7 +51,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [x] **F009** · Input validation and finite output
 - [x] **F011** · No silent stability failures
 - [x] **F013** · Numerical diagnostics
-- [ ] **F023** · LLT settings honesty — after F009
+- [x] **F023** · LLT settings honesty — after F009
 - [ ] **F012** · Viscous envelope status
 - [ ] **F014** · Cancellable blocked LU
 - [ ] **F008** · LLT glide balance — after F020
