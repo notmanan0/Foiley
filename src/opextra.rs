@@ -1390,6 +1390,8 @@ pub fn pacc(s: &mut Session, iinput: &[i64]) {
 
 /// PLRADD: add current point to active polar and its save file.
 pub fn plradd(s: &mut Session) {
+    #[cfg(feature = "rawdump")]
+    crate::rawdump::point(&s.xf);
     let ip = s.ipact;
     if ip == 0 || ip > npol(s) {
         crate::outln!(" No active polar is declared. Point not stored.");

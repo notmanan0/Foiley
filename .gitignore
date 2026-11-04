@@ -1,6 +1,8 @@
 /target
 /build-ref-sp
 /build-ref-dp
+/build-ref-src
+/build-ref-v2
 /xfoil-ref
 /bench/out
 /work

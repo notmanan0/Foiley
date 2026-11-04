@@ -758,6 +758,9 @@ impl Session {
         if parallel {
             let pts = crate::sweep::run_parallel(&mut xf, lalfa, &specs, itmaxs, jobs, |_, _| {});
             self.xf = xf;
+            // the replayed points carry coefficients, not their BL arrays
+            #[cfg(feature = "rawdump")]
+            crate::rawdump::set_bl_live(false);
             let keep = {
                 let x = &self.xf;
                 (x.adeg, x.alfa, x.cl, x.cd, x.cdp, x.cm, x.minf, x.reinf, x.xoctr, x.cpmn, x.lvconv)
@@ -785,6 +788,8 @@ impl Session {
                 crate::outln!("      Cm ={:8.4}     CD ={:9.5}   =>   CDp ={:9.5}", q.cm, q.cd, q.cdp);
                 self.after_point();
             }
+            #[cfg(feature = "rawdump")]
+            crate::rawdump::set_bl_live(true);
             let x = &mut self.xf;
             (x.adeg, x.alfa, x.cl, x.cd, x.cdp, x.cm, x.minf, x.reinf, x.xoctr, x.cpmn, x.lvconv) = keep;
         } else {
