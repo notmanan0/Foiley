@@ -9,14 +9,43 @@ use foiley_core::linalg::{eigen, Complex};
 use foiley_core::{Progress, Vec3, DEG};
 use serde::{Deserialize, Serialize};
 
-/// Pitching moment coefficient (inviscid, about the CoG) at unit speed.
-fn cm_at(ctx: &Ctx, ev: &Evaluator, alpha: f64, beta: f64, prog: &Progress) -> Result<f64, PlaneError> {
-    let (raw, _) = ev.loads(wind_dir(alpha, beta), 1.0, Vec3::ZERO, prog)?;
-    Ok(raw.moment.dot(wind_side(alpha, beta)) / (0.5 * ctx.s_ref * ctx.c_ref))
+/// Which loads the stability derivatives and the T7 trim use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StabilityModel {
+    /// potential-flow forces and moments only (pressure + induced)
+    #[default]
+    Inviscid,
+    /// the reduced loads of the operating point: viscous strip drag (with
+    /// the strips' local velocity under rotation) and section Cm, extra
+    /// drag, fuselage friction
+    FullLoad,
 }
 
-/// Find the trimmed angle of attack (Cm = 0) and the speed at which lift
-/// equals weight.  Returns (alpha deg, speed m/s), or None when there is no
+/// Speed at which the potential-flow lift at unit speed `raw1` equals the
+/// weight (|lift| so the Cm curve of the trim scan stays continuous).
+fn weight_speed(ctx: &Ctx, raw1: &crate::analysis::RawLoads, alpha: f64) -> Option<f64> {
+    let l1 = (raw1.force + raw1.induced_force).dot(wind_normal(alpha)).abs() * ctx.def.fluid.rho;
+    (l1 > 1e-12 && ctx.inertia.mass > 0.0).then(|| (ctx.inertia.mass * G / l1).sqrt())
+}
+
+/// Pitching moment coefficient about the CoG: inviscid at unit speed, or
+/// (`FullLoad`) the reduced Cm at the speed where lift equals weight, which
+/// sets the Reynolds numbers of the viscous strips.
+fn cm_at(ctx: &Ctx, ev: &Evaluator, alpha: f64, beta: f64, prog: &Progress) -> Result<f64, PlaneError> {
+    let dir = wind_dir(alpha, beta);
+    let (raw, _) = ev.loads(dir, 1.0, Vec3::ZERO, prog)?;
+    match ctx.def.stability_model {
+        StabilityModel::Inviscid => Ok(raw.moment.dot(wind_side(alpha, beta)) / (0.5 * ctx.s_ref * ctx.c_ref)),
+        StabilityModel::FullLoad => {
+            let u = weight_speed(ctx, &raw, alpha).unwrap_or(ctx.def.velocity);
+            let (raw, _) = ev.loads(dir, u, Vec3::ZERO, prog)?;
+            Ok(ctx.reduce(ev.mesh(), &raw, ev.sys.cog(), alpha, beta, u, ctx.inertia.mass, None).cm)
+        }
+    }
+}
+
+/// Find the trimmed angle of attack (Cm = 0, with the definition's
+/// `stability_model`) and the speed at which lift equals weight.  Returns (alpha deg, speed m/s), or None when there is no
 /// trim; `Err` only for a solver failure or cancellation.
 pub fn trim(ctx: &Ctx, ev: &Evaluator, beta: f64, prog: &Progress) -> Result<Option<(f64, f64)>, PlaneError> {
     let cm_at = |a: f64| cm_at(ctx, ev, a, beta, prog);
@@ -168,10 +197,23 @@ pub struct StabilityResult {
     pub b_lat: [f64; 4],
 }
 
+/// Force and moment (N, N.m about the CoG, body axes) for air velocity
+/// `vinf` and body rates `omega`, under the definition's stability model.
+/// The raw loads always come from the evaluator (unit solutions); `FullLoad`
+/// adds one `reduce` per call.
 fn forces(ctx: &Ctx, ev: &Evaluator, vinf: Vec3, omega: Vec3, prog: &Progress) -> Result<(Vec3, Vec3), PlaneError> {
     let (raw, _) = ev.loads_at(vinf, omega, prog)?;
     let rho = ctx.def.fluid.rho;
-    Ok(((raw.force + raw.induced_force) * rho, raw.moment * rho))
+    match ctx.def.stability_model {
+        StabilityModel::Inviscid => Ok(((raw.force + raw.induced_force) * rho, raw.moment * rho)),
+        StabilityModel::FullLoad => {
+            let v = vinf.norm();
+            let alpha = vinf.z.atan2(vinf.x) / DEG;
+            let beta = -(vinf.y / v).clamp(-1.0, 1.0).asin() / DEG;
+            let (_, f, m) = ctx.reduce_full(ev.mesh(), &raw, ev.sys.cog(), alpha, beta, v, ctx.inertia.mass, Some(omega));
+            Ok((f, m))
+        }
+    }
 }
 
 /// Stability derivatives, state matrices and modes at a trimmed point.

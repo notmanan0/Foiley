@@ -7,7 +7,7 @@ use crate::geom::{Inertia, Plane};
 use crate::linear_panel::LinearPanelSystem;
 use crate::mesh::{build, Mesh, MeshOptions};
 use crate::panel::PanelSystem;
-use crate::stability::{self, StabilityResult};
+use crate::stability::{self, StabilityModel, StabilityResult};
 use crate::vlm::VlmSystem;
 use crate::PlaneError;
 use foiley_core::atmosphere::Fluid;
@@ -310,6 +310,10 @@ pub struct PlanePolarDef {
     pub include_fuse: bool,
     /// compute stability derivatives and modes for every point (needs mass)
     pub derivatives: bool,
+    /// loads behind the stability derivatives and the T7 trim: inviscid
+    /// (default) or the full reduced loads (viscous strip drag and section
+    /// Cm, extra drag, fuselage friction)
+    pub stability_model: StabilityModel,
     /// wake length for the panel method, in reference chords
     pub wake_length: f64,
     pub wake_panels: usize,
@@ -368,6 +372,7 @@ impl Default for PlanePolarDef {
             fuse_drag: false,
             include_fuse: true,
             derivatives: false,
+            stability_model: StabilityModel::Inviscid,
             wake_length: 30.0,
             wake_panels: 5,
             wake_ratio: 1.1,
@@ -923,9 +928,21 @@ impl<'a> Ctx<'a> {
         Some((l(pa.cd, pb.cd), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), l(pa.cm, pb.cm), oa.combine(ob)))
     }
 
-    /// Reduce raw loads to an operating point.
-    pub fn reduce(&self, mesh: &Mesh, raw: &RawLoads, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64) -> PlaneOpp {
+    /// Reduce raw loads to an operating point.  `omega` (body rates, rad/s)
+    /// makes every strip use its local air velocity V - omega x (c4 - cog)
+    /// for Re, drag direction and dynamic pressure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce(&self, mesh: &Mesh, raw: &RawLoads, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64, omega: Option<Vec3>) -> PlaneOpp {
+        self.reduce_full(mesh, raw, cog, alpha, beta, v, mass, omega).0
+    }
+
+    /// [`Ctx::reduce`], also returning the total force and moment (about
+    /// `cog`, N and N.m, body axes).  With `StabilityModel::FullLoad` the
+    /// moment (and Cm) include the sections' viscous Cm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce_full(&self, mesh: &Mesh, raw: &RawLoads, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64, omega: Option<Vec3>) -> (PlaneOpp, Vec3, Vec3) {
         let rho = self.def.fluid.rho;
+        let section_cm = self.def.stability_model == StabilityModel::FullLoad;
         let nu = self.def.fluid.nu();
         let q = 0.5 * rho * v * v;
         let (wd, wn, ws) = (wind_dir(alpha, beta), wind_normal(alpha), wind_side(alpha, beta));
@@ -936,7 +953,18 @@ impl<'a> Ctx<'a> {
         let mut m_visc = Vec3::ZERO;
         let mut missing_polars: Vec<String> = Vec::new();
         let mut n_env = [0usize; 5];
+        let mut m_sec = Vec3::ZERO;
         for (i, s) in mesh.strips.iter().enumerate() {
+            // local air velocity of the strip (the freestream without rotation)
+            let (v, wd, q, da) = match omega {
+                Some(w) => {
+                    let vloc = wd * v - w.cross(s.c4 - cog);
+                    let vl = vloc.norm().max(1e-30);
+                    let da = ((vloc.dot(s.normal) / vl).clamp(-1.0, 1.0).asin() - (wd.dot(s.normal)).clamp(-1.0, 1.0).asin()) / DEG;
+                    (vl, vloc / vl, 0.5 * rho * vl * vl, da)
+                }
+                None => (v, wd, q, 0.0),
+            };
             let f = raw.strip_force[i] * rho;
             let area = s.area.max(1e-30);
             let cl = f.dot(s.normal) / (q * area);
@@ -946,7 +974,7 @@ impl<'a> Ctx<'a> {
             let fi = wi.cross(s.te_b - s.te_a) * (gamma * rho);
             let cdi = fi.dot(wd) / (q * area);
             let re = v * s.chord / nu;
-            let alpha_eff = alpha + s.twist + ai;
+            let alpha_eff = alpha + s.twist + ai + da;
             let mut sr = StripResult {
                 wing: s.wing,
                 span_pos: s.span_pos,
@@ -976,6 +1004,11 @@ impl<'a> Ctx<'a> {
                         let dfv = wd * (q * area * cd);
                         f_visc += dfv;
                         m_visc += (s.c4 - cog).cross(dfv);
+                        if section_cm {
+                            // nose-up couple about n x chord
+                            let chord_dir = ((s.te_a + s.te_b) * 0.5 - s.le).normalized();
+                            m_sec += s.normal.cross(chord_dir) * (q * area * s.chord * cm);
+                        }
                     }
                     None => {
                         sr.envelope = Envelope::Missing as u8;
@@ -1035,7 +1068,7 @@ impl<'a> Ctx<'a> {
         let f_inv = raw.force * rho;
         let f_ind = raw.induced_force * rho;
         let f_tot = f_inv + f_ind + f_visc + wd * d_extra;
-        let m_tot = raw.moment * rho + m_visc;
+        let m_tot = raw.moment * rho + m_visc + m_sec;
         let lift = f_tot.dot(wn);
         let cl = lift / qs;
         let cdi = f_ind.dot(wd) / qs;
@@ -1050,7 +1083,7 @@ impl<'a> Ctx<'a> {
         let efficiency = if cdi.abs() > 1e-12 { cl * cl / (std::f64::consts::PI * ar * cdi) } else { 0.0 };
         // root bending of the main wing = max over its strips
         let root_bending = mesh.wings.iter().enumerate().find(|(_, w)| w.kind == crate::geom::WingKind::Main).map(|(_, w)| w.strips.clone().map(|i| strips[i].bending.abs()).fold(0.0, f64::max)).unwrap_or(0.0);
-        PlaneOpp {
+        let opp = PlaneOpp {
             alpha,
             beta,
             velocity: v,
@@ -1078,7 +1111,8 @@ impl<'a> Ctx<'a> {
             wake: vec![],
             balance_residual: None,
             diagnostics: None,
-        }
+        };
+        (opp, f_tot, m_tot)
     }
 }
 
@@ -1196,7 +1230,7 @@ fn point_failure(def: &PlanePolarDef, o: &PlaneOpp) -> Option<String> {
 fn evaluate(ctx: &Ctx, ev: &Evaluator, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64, prog: &Progress) -> Result<PlaneOpp, PlaneError> {
     let wd = wind_dir(alpha, beta);
     let (raw, wrep) = ev.loads(wd, v, Vec3::ZERO, prog)?;
-    let mut opp = ctx.reduce(ev.mesh(), &raw, cog, alpha, beta, v, mass);
+    let mut opp = ctx.reduce(ev.mesh(), &raw, cog, alpha, beta, v, mass, None);
     if ctx.def.diagnostics != Diagnostics::Off {
         opp.diagnostics = Some(ev.sys.point_diagnostics(&raw, wd * v, Vec3::ZERO, ctx.s_ref, wrep.relaxed));
     }

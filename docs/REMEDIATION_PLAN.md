@@ -62,7 +62,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [ ] **F004a** · Multi-body meshing
 - [ ] **F010a** · AVL export fidelity and importer
 - [ ] **F003** · Flap-deflected polars — after F002, F004a
-- [ ] **F005a** · `FullLoad` stability model — after F007
+- [x] **F005a** · `FullLoad` stability model — after F007
 - [ ] **F016** · Provenance and project format v2 — after F002
 - [ ] **F015a** · Raw-bit hooks and harness
 - [ ] **F021** · Coverage-aware auto-polars — after F003
