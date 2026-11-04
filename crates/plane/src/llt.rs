@@ -235,6 +235,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
                 bending: 0.0,
                 out_of_polar: env.is_clamped(),
                 envelope: env as u8,
+                flap_clamped: false,
             });
         }
         strips.reverse();

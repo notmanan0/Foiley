@@ -144,7 +144,7 @@ impl FamilyKey {
     /// Moment reference used when a polar does not record one.
     pub const DEFAULT_MOM_REF_X: f64 = 0.25;
     pub fn of(p: &FoilPolar, foil_geom_hash: Hash32) -> FamilyKey {
-        FamilyKey { foil_geom_hash, polar_type: p.polar_type, mach: p.mach, ncrit: p.ncrit, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, flap_deg: 0.0, mom_ref_x: FamilyKey::DEFAULT_MOM_REF_X }
+        FamilyKey { foil_geom_hash, polar_type: p.polar_type, mach: p.mach, ncrit: p.ncrit, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, flap_deg: p.flap_deg, mom_ref_x: FamilyKey::DEFAULT_MOM_REF_X }
     }
     fn q(&self) -> (Hash32, u8, [i64; 6]) {
         (self.foil_geom_hash, self.polar_type, [qv(self.mach), qv(self.ncrit), qv(self.xtr_top), qv(self.xtr_bot), qv(self.flap_deg), qv(self.mom_ref_x)])
@@ -337,6 +337,16 @@ impl FoilDb {
             0 => Err(format!("no 2D polar family of foil '{foil}' matches the selection ({}); candidates:\n{}", sel.describe(), list(&all))),
             _ => Err(format!("{} 2D polar families of foil '{foil}' match the selection ({}): set the family's Mach, Ncrit or trips to choose one; candidates:\n{}", hit.len(), sel.describe(), list(&hit))),
         }
+    }
+
+    /// The families that differ from `base` only in flap angle (`base`
+    /// included), sorted by flap angle: what a deflected strip brackets.
+    pub fn flap_families(&self, base: FamilyId) -> Vec<(f64, FamilyId)> {
+        let k = self.family(base).key;
+        let foil = &self.family(base).foil;
+        let mut v: Vec<(f64, FamilyId)> = self.families_of(foil).into_iter().filter(|&i| self.family(i).key.same_except_flap(&k)).map(|i| (self.family(i).key.flap_deg, i)).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
     }
 
     /// Re range covered by a family.

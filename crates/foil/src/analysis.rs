@@ -520,6 +520,7 @@ pub fn analyze(foil: &Foil, st: &AnalysisSettings, sweep: &Sweep, prog: &Progres
         viscous: st.viscous,
         points: vec![],
         failed: vec![],
+        flap_deg: 0.0,
     };
     let values = sweep.values();
     if values.is_empty() {
