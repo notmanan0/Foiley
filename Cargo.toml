@@ -16,11 +16,12 @@ foiley-plane = { path = "crates/plane" }
 foiley-app = { path = "crates/app" }
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 faer = { version = "0.24", default-features = false, features = ["std", "rayon"] }
 crossbeam-channel = "0.5"
 clap = { version = "4.6", features = ["derive"] }
 quick-xml = "0.42"
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
 mimalloc = { version = "0.1.52", default-features = false }
 
 [package]

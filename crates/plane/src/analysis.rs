@@ -2,10 +2,10 @@
 //! raw loads to coefficients and span distributions.
 
 use crate::evaluator::{Evaluator, WakeReport};
-use crate::foildb::{Envelope, FoilDb};
+use crate::foildb::{Envelope, FamilyId, FamilySelector, FoilDb};
 use crate::geom::{Inertia, Plane};
 use crate::linear_panel::LinearPanelSystem;
-use crate::mesh::{build, Mesh, MeshOptions};
+use crate::mesh::{build, Mesh, MeshOptions, Strip};
 use crate::panel::PanelSystem;
 use crate::stability::{self, StabilityModel, StabilityResult};
 use crate::vlm::VlmSystem;
@@ -346,6 +346,9 @@ pub struct PlanePolarDef {
     /// fail a point if any strip's viscous interpolation is clamped to the
     /// 2D polar envelope (or has no polar), instead of warning
     pub strict_envelope: bool,
+    /// which 2D polar family of each foil the viscous interpolation (and
+    /// the lifting line) uses; must select exactly one per foil
+    pub family: FamilySelector,
 }
 
 impl Default for PlanePolarDef {
@@ -381,6 +384,7 @@ impl Default for PlanePolarDef {
             keep_strips: true,
             allow_missing_foils: false,
             strict_envelope: false,
+            family: FamilySelector::default(),
             free_wake: 0,
             wake_tol: 1e-3,
             wake_nseg: 24,
@@ -671,6 +675,10 @@ pub struct StripResult {
     /// `foildb::Envelope` of the viscous interpolation, as a u8
     #[serde(default)]
     pub envelope: u8,
+    /// deflected strip with no 2D polar family at its flap angle: its
+    /// section data came from the nearest family's angle (F003)
+    #[serde(default)]
+    pub flap_clamped: bool,
 }
 
 /// One 3D operating point.
@@ -774,6 +782,9 @@ pub struct PlanePolar {
     pub ref_dims: (f64, f64, f64),
     /// number of panels / unknowns
     pub unknowns: usize,
+    /// provenance of the run (F016); None for polars from older versions
+    #[serde(default)]
+    pub manifest: Option<foiley_core::provenance::RunManifest>,
 }
 
 impl PlanePolar {
@@ -902,6 +913,26 @@ pub struct Ctx<'a> {
     pub b_ref: f64,
     pub c_ref: f64,
     pub inertia: Inertia,
+    /// polar family of every wing section's foil: `[wing][section][left]`
+    /// (resolved once, so the per-strip lookup is two array indexes)
+    pub section_family: Vec<Vec<[Option<FamilyId>; 2]>>,
+    /// the same per foil name (setup code only)
+    pub foil_family: Vec<(String, Option<FamilyId>)>,
+    /// per resolved family (indexed by `FamilyId`): it and the families that
+    /// differ from it only in flap angle, sorted by angle
+    pub flap_sets: Vec<Vec<(f64, FamilyId)>>,
+}
+
+/// Section data a strip's viscous interpolation produced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StripViscous {
+    pub cd: f64,
+    pub xtr_top: f64,
+    pub xtr_bot: f64,
+    pub cm: f64,
+    pub envelope: Envelope,
+    /// deflected strip without a family at its flap angle (see `StripResult`)
+    pub flap_clamped: bool,
 }
 
 impl<'a> Ctx<'a> {
@@ -915,17 +946,87 @@ impl<'a> Ctx<'a> {
             return Err(PlaneError::Input(format!("reference dimensions must be positive (area {s}, span {b}, chord {c})")));
         }
         let inertia = def.inertia.unwrap_or_else(|| plane.inertia(db));
-        Ok(Ctx { plane, db, def, s_ref: s, b_ref: b, c_ref: c, inertia })
+        // the 2D polar family of every foil, once; ambiguity is an error
+        let uses_polars = def.viscous || def.method == Method::Llt;
+        let mut foil_family: Vec<(String, Option<FamilyId>)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for f in plane.foil_names() {
+            let id = if uses_polars {
+                db.resolve(&f, &def.family).unwrap_or_else(|e| {
+                    errors.push(e);
+                    None
+                })
+            } else {
+                None
+            };
+            foil_family.push((f, id));
+        }
+        if !errors.is_empty() {
+            return Err(PlaneError::Input(errors.join("
+")));
+        }
+        let fam = |name: &str| foil_family.iter().find(|(n, _)| n == name).and_then(|(_, id)| *id);
+        let section_family = plane.wings.iter().map(|w| (0..w.sections.len()).map(|i| [fam(w.foil(i, false)), fam(w.foil(i, true))]).collect()).collect();
+        let mut flap_sets = vec![Vec::new(); db.families().len()];
+        for id in foil_family.iter().filter_map(|f| f.1) {
+            flap_sets[id.0 as usize] = db.flap_families(id);
+        }
+        Ok(Ctx { plane, db, def, s_ref: s, b_ref: b, c_ref: c, inertia, section_family, foil_family, flap_sets })
+    }
+
+    /// The resolved polar family of a foil (setup code; not for hot loops).
+    pub fn family_of(&self, foil: &str) -> Option<FamilyId> {
+        self.foil_family.iter().find(|(n, _)| n == foil).and_then(|(_, id)| *id)
+    }
+
+    /// Polar families of a strip's two end foils (no string lookups).
+    pub fn strip_families(&self, s: &Strip) -> (Option<FamilyId>, Option<FamilyId>) {
+        let at = |i: usize| self.section_family.get(s.wing).and_then(|w| w.get(i)).and_then(|f| f[s.left as usize]);
+        (at(s.surf), at(s.surf + 1))
+    }
+
+    /// Section data of one foil at a flap angle: linear between the two
+    /// nearest families of its flap set, then in Re.  The flag is set when
+    /// the angle lies outside the deflected families (none, or beyond them).
+    fn section_at(&self, base: FamilyId, flap: f64, re: f64, cl: f64, alpha_eff: f64) -> Option<(foiley_foil::FoilPoint, Envelope, bool)> {
+        let get = |f: FamilyId| if self.def.viscous_from_cl { self.db.at_re_cl(f, re, cl) } else { self.db.at_re_alpha(f, re, alpha_eff) };
+        if flap.abs() <= 1e-9 {
+            let (p, e) = get(base)?;
+            return Some((p, e, false));
+        }
+        let set = self.flap_sets.get(base.0 as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+        if set.len() < 2 {
+            let (p, e) = get(base)?;
+            return Some((p, e, true));
+        }
+        let (first, last) = (set[0], set[set.len() - 1]);
+        if flap <= first.0 {
+            let (p, e) = get(first.1)?;
+            return Some((p, e, flap < first.0 - 1e-6));
+        }
+        if flap >= last.0 {
+            let (p, e) = get(last.1)?;
+            return Some((p, e, flap > last.0 + 1e-6));
+        }
+        let j = set.partition_point(|x| x.0 < flap);
+        let (lo, hi) = (set[j - 1], set[j]);
+        let (pa, ea) = get(lo.1)?;
+        let (pb, eb) = get(hi.1)?;
+        let t = (flap - lo.0) / (hi.0 - lo.0);
+        Some((foiley_foil::polar::lerp_point(&pa, &pb, t), ea.combine(eb), false))
     }
 
     /// Viscous drag, transition and section Cm for a strip: interpolated
-    /// between the strip's two end foils.  Returns None if no polar exists.
-    pub fn strip_viscous(&self, foil_a: &str, foil_b: &str, tau: f64, re: f64, cl: f64, alpha_eff: f64) -> Option<(f64, f64, f64, f64, Envelope)> {
-        let get = |f: &str| if self.def.viscous_from_cl { self.db.at_re_cl(f, re, cl) } else { self.db.at_re_alpha(f, re, alpha_eff) };
-        let (pa, oa) = get(foil_a)?;
-        let (pb, ob) = if foil_b == foil_a { (pa, oa) } else { get(foil_b)? };
+    /// between the strip's two end foils (each at the strip's flap angle).
+    /// Returns None if no polar exists.
+    pub fn strip_viscous(&self, s: &Strip, re: f64, cl: f64, alpha_eff: f64) -> Option<StripViscous> {
+        let (fa, fb) = self.strip_families(s);
+        let (fa, fb) = (fa?, fb?);
+        let (pa, oa, ca) = self.section_at(fa, s.flap_deg, re, cl, alpha_eff)?;
+        let (pb, ob, cb) = if fb == fa { (pa, oa, ca) } else { self.section_at(fb, s.flap_deg, re, cl, alpha_eff)? };
+        let tau = s.tau;
         let l = |x: f64, y: f64| x + tau * (y - x);
-        Some((l(pa.cd, pb.cd), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), l(pa.cm, pb.cm), oa.combine(ob)))
+        Some(StripViscous { cd: l(pa.cd, pb.cd), xtr_top: l(pa.xtr_top, pb.xtr_top), xtr_bot: l(pa.xtr_bot, pb.xtr_bot), cm: l(pa.cm, pb.cm), envelope: oa.combine(ob), flap_clamped: ca || cb })
     }
 
     /// Reduce raw loads to an operating point.  `omega` (body rates, rad/s)
@@ -954,6 +1055,7 @@ impl<'a> Ctx<'a> {
         let mut missing_polars: Vec<String> = Vec::new();
         let mut n_env = [0usize; 5];
         let mut m_sec = Vec3::ZERO;
+        let mut n_flap = 0usize;
         for (i, s) in mesh.strips.iter().enumerate() {
             // local air velocity of the strip (the freestream without rotation)
             let (v, wd, q, da) = match omega {
@@ -992,12 +1094,14 @@ impl<'a> Ctx<'a> {
                 ..Default::default()
             };
             if self.def.viscous {
-                match self.strip_viscous(&s.foil_a, &s.foil_b, s.tau, re, cl, alpha_eff) {
-                    Some((cd, xt, xb, cm, env)) => {
+                match self.strip_viscous(s, re, cl, alpha_eff) {
+                    Some(StripViscous { cd, xtr_top: xt, xtr_bot: xb, cm, envelope: env, flap_clamped }) => {
                         sr.cdv = cd;
                         sr.xtr_top = xt;
                         sr.xtr_bot = xb;
                         sr.cm_c4 = cm;
+                        sr.flap_clamped = flap_clamped;
+                        n_flap += flap_clamped as usize;
                         sr.out_of_polar = env.is_clamped();
                         sr.envelope = env as u8;
                         n_env[env as usize] += 1;
@@ -1028,6 +1132,9 @@ impl<'a> Ctx<'a> {
         }
         if let Some(w) = envelope_warning(&n_env, "strip") {
             warnings.push(w);
+        }
+        if n_flap > 0 {
+            warnings.push(format!("{n_flap} deflected strip(s) have no 2D polar family at their flap angle: section data from the nearest angle (add deflected polars)"));
         }
         // bending moments (per wing, from the tip inwards, about the strip centre)
         for w in &mesh.wings {
@@ -1156,11 +1263,15 @@ pub fn envelope_failure(def: &PlanePolarDef, o: &PlaneOpp) -> Option<String> {
         counts[(s.envelope as usize).min(4)] += 1;
     }
     let bad: usize = counts[1..].iter().sum();
-    if bad == 0 {
+    let flap = o.strips.iter().filter(|s| s.flap_clamped).count();
+    if bad == 0 && flap == 0 {
         return None;
     }
-    let parts: Vec<String> = Envelope::KINDS[1..].iter().filter(|e| counts[**e as usize] > 0).map(|e| format!("{} {}", counts[*e as usize], e.label())).collect();
-    Some(format!("strict envelope: {bad} strip(s) outside the 2D polars ({})", parts.join(", ")))
+    let mut parts: Vec<String> = Envelope::KINDS[1..].iter().filter(|e| counts[**e as usize] > 0).map(|e| format!("{} {}", counts[*e as usize], e.label())).collect();
+    if flap > 0 {
+        parts.push(format!("{flap} without a polar family at their flap angle"));
+    }
+    Some(format!("strict envelope: {} strip(s) outside the 2D polars ({})", o.strips.iter().filter(|s| s.envelope != 0 || s.flap_clamped).count(), parts.join(", ")))
 }
 
 /// Run the stability analysis for a point, recording a failure on the point
@@ -1255,7 +1366,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
     }
     let cog = if mass > 0.0 { ctx.inertia.cog } else { Vec3::ZERO };
     let name = if def.name.is_empty() { def.auto_name() } else { def.name.clone() };
-    let mut polar = PlanePolar { name: name.clone(), plane: plane.name.clone(), def: Some(def.clone()), ref_dims: (ctx.s_ref, ctx.b_ref, ctx.c_ref), ..Default::default() };
+    let mut polar = PlanePolar { name: name.clone(), plane: plane.name.clone(), def: Some(def.clone()), ref_dims: (ctx.s_ref, ctx.b_ref, ctx.c_ref), manifest: Some(crate::provenance::run_manifest(&ctx)), ..Default::default() };
     prog.stage(format!("{}: {}", plane.name, name));
     prog.info(format!("{} - {} - {}", plane.name, def.kind.label(), def.method.label()));
     if mass > 0.0 {

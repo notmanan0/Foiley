@@ -1,5 +1,8 @@
 //! 2D polar storage, interpolation and I/O.
 
+use crate::analysis::AnalysisSettings;
+use foiley_core::hash::Hash32;
+use foiley_core::provenance::RunManifest;
 use serde::{Deserialize, Serialize};
 
 /// One converged 2D operating point.
@@ -76,6 +79,25 @@ pub struct FoilPolar {
     /// operating points that could not be converged (alpha or CL or Re spec)
     #[serde(default)]
     pub failed: Vec<f64>,
+    /// trailing-edge flap deflection of the geometry the polar was computed
+    /// on, degrees (+ down), relative to the foil `foil` as stored (whose
+    /// hinge it uses).  0 for the undeflected foil.
+    #[serde(default)]
+    pub flap_deg: f64,
+    /// the settings the polar was computed with (None: imported or legacy)
+    #[serde(default)]
+    pub settings: Option<AnalysisSettings>,
+    /// `Foil::geom_hash` of the geometry it was computed on (before any flap
+    /// deflection `flap_deg`); a foil whose hash differs no longer matches
+    #[serde(default)]
+    pub foil_hash: Option<Hash32>,
+    /// provenance of the run that produced it
+    #[serde(default)]
+    pub manifest: Option<RunManifest>,
+    /// migrated from a format-1 project: its family (Mach, Ncrit, trips) was
+    /// taken from the stored fields and its hash computed on load
+    #[serde(default)]
+    pub legacy: bool,
 }
 
 impl FoilPolar {

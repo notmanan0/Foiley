@@ -606,13 +606,17 @@ impl App {
         }
         let title = format!("{} - {}", plane.name, def.name);
         if (def.viscous || def.method == Method::Llt) && self.pui.auto_polars > 0 {
-            let need: Vec<_> = auto::foils_needing_polars(plane, &self.project.foils, &db).into_iter().cloned().collect();
-            if !need.is_empty() {
-                let (cases, st, sweep) = auto::polar_mesh_cases(plane, &db, &def, self.pui.auto_polars);
-                let names = need.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(", ");
-                self.notify(format!("computing 2D polars for {names} first ({} Re values)", cases.len()), false);
-                self.submit(format!("2D polars for {}", plane.name), JobKind::Batch { foils: need, cases, settings: st, sweep }, Pending::AutoPolarsThen(Box::new((plane.clone(), def))));
-                return;
+            match auto::plan(plane, &self.project.foils, &db, &def, self.pui.auto_polars) {
+                Ok(plan) if !plan.is_empty() => {
+                    self.notify(format!("computing {} first", plan.describe()), false);
+                    self.submit(format!("2D polars for {}", plane.name), JobKind::AutoPolars { batches: plan.batches }, Pending::AutoPolarsThen(Box::new((plane.clone(), def))));
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.notify(e, true);
+                    return;
+                }
             }
         }
         self.submit(title, JobKind::PlanePolar { plane: plane.clone(), db, def }, Pending::PlanePolar);

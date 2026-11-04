@@ -5,7 +5,9 @@ use foiley_plane::{FoilDb, Plane, PlanePolar};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 1;
+/// Project file format.  2: polar provenance (settings snapshot, geometry
+/// hash, run manifest) and explicit families; 1 files migrate on load.
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {
@@ -46,13 +48,56 @@ impl Project {
         if p.format > FORMAT_VERSION {
             return Err(format!("{} was written by a newer Foiley (format {})", path.display(), p.format));
         }
+        if p.format < 2 {
+            p.migrate_v1();
+        }
+        p.fill_polar_hashes();
         p.format = FORMAT_VERSION;
         Ok(p)
     }
 
-    /// Save atomically (write to a temp file, then rename).
+    /// Format 1 -> 2: every 2D polar without a settings snapshot or manifest
+    /// becomes a legacy member of the family its stored Mach, Ncrit and trip
+    /// fields name; its geometry hash is that of the foil it is stored with.
+    fn migrate_v1(&mut self) {
+        for q in &mut self.foil_polars {
+            if q.settings.is_none() && q.manifest.is_none() {
+                q.legacy = true;
+            }
+        }
+    }
+
+    /// Give every 2D polar without a geometry hash the hash of its foil
+    /// (legacy and imported polars), so later geometry edits are detected.
+    fn fill_polar_hashes(&mut self) {
+        let hashes: Vec<(String, foiley_core::hash::Hash32)> = self.foils.iter().map(|f| (f.name.clone(), f.geom_hash())).collect();
+        for q in &mut self.foil_polars {
+            if q.foil_hash.is_none() {
+                q.foil_hash = hashes.iter().find(|h| h.0 == q.foil).map(|h| h.1);
+            }
+        }
+    }
+
+    /// Drop the 2D polars that no longer describe their foil: computed on
+    /// other coordinates (hash mismatch), or deflected about a hinge that
+    /// has moved.  Returns how many were dropped.
+    pub fn drop_stale_polars(&mut self, foil: &str, old_hinge: Option<(f64, f64)>) -> usize {
+        let Some(f) = self.foil(foil) else { return 0 };
+        let (h, hinge) = (f.geom_hash(), f.hinge);
+        let n = self.foil_polars.len();
+        self.foil_polars.retain(|q| q.foil != foil || (q.foil_hash.is_none_or(|qh| qh == h) && (q.flap_deg == 0.0 || hinge == old_hinge)));
+        n - self.foil_polars.len()
+    }
+
+    /// Save atomically (write to a temp file, then rename).  Always writes
+    /// the current format.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let text = serde_json::to_string(self).map_err(|e| e.to_string())?;
+        let text = if self.format == FORMAT_VERSION {
+            serde_json::to_string(self)
+        } else {
+            serde_json::to_string(&Project { format: FORMAT_VERSION, ..self.clone() })
+        }
+        .map_err(|e| e.to_string())?;
         let tmp = path.with_extension("foiley.tmp");
         std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
@@ -70,15 +115,17 @@ impl Project {
         (2..).map(|i| format!("{base} ({i})")).find(|n| self.foil(n).is_none()).unwrap()
     }
 
-    /// Add or replace a foil (by name).  Replacing a foil drops its polars,
-    /// since they no longer describe its geometry.
+    /// Add or replace a foil (by name).  Replacing a foil's coordinates
+    /// drops the polars computed on the old ones (geometry hash mismatch),
+    /// and moving its hinge drops its deflected polars; a renamed note
+    /// keeps them.
     pub fn upsert_foil(&mut self, f: Foil) {
         if let Some(i) = self.foils.iter().position(|g| g.name == f.name) {
-            if self.foils[i] != f {
-                let name = f.name.clone();
-                self.foil_polars.retain(|p| p.foil != name);
-            }
+            let old_hinge = self.foils[i].hinge;
+            let name = f.name.clone();
+            self.fill_polar_hashes();
             self.foils[i] = f;
+            self.drop_stale_polars(&name, old_hinge);
         } else {
             self.foils.push(f);
         }
@@ -89,8 +136,14 @@ impl Project {
         self.foil_polars.retain(|p| p.foil != name);
     }
 
-    /// Add or merge a 2D polar (same foil + name: points are merged).
+    /// Add or merge a 2D polar (same foil + name: points are merged).  A
+    /// polar without a geometry hash gets its foil's.
     pub fn add_foil_polar(&mut self, p: FoilPolar) {
+        // a deflected copy from an automatic batch goes under its base foil
+        let mut p = crate::auto::adopt(p, |base| self.foil(base).map(|f| f.geom_hash()));
+        if p.foil_hash.is_none() {
+            p.foil_hash = self.foil(&p.foil).map(|f| f.geom_hash());
+        }
         if let Some(q) = self.foil_polars.iter_mut().find(|q| q.foil == p.foil && q.name == p.name) {
             for pt in p.points {
                 q.insert(pt);

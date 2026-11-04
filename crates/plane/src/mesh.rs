@@ -131,6 +131,10 @@ pub struct Strip {
     pub te_low2: Option<usize>,
     #[serde(default)]
     pub te_up2: Option<usize>,
+    /// deflection of the flap this strip belongs to, degrees (+ down; 0 off a
+    /// flap), from `MeshOptions::flaps`
+    #[serde(default)]
+    pub flap_deg: f64,
 }
 
 impl Strip {
@@ -334,6 +338,7 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                 }
                 // flap
                 let mut flap_id = None;
+                let mut strip_flap = 0.0;
                 let mut normal_turn: Option<(Vec3, f64)> = None;
                 if let (Some((xh, ya, yb)), Some(_)) = (hinge, flap_from) {
                     let ha = fi.point(xh, sha.lower_at(xh) + ya * (sha.upper_at(xh) - sha.lower_at(xh)));
@@ -347,6 +352,7 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                     mesh.flaps.push(FlapInfo { wing: iw, index: idx, name: format!("{} flap {} ({side})", wing.name, idx + 1), hinge_a: h_a, hinge_b: h_b });
                     flap_id = Some(id);
                     if let Some(d) = opt.flaps.get(&(iw, idx)) {
+                        strip_flap = *d;
                         if d.abs() > 1e-9 && opt.flap_normals && !opt.thick {
                             // vortex-lattice model: the sheet stays where it is and
                             // the flap panels' normals turn (see MeshOptions::flap_normals)
@@ -412,6 +418,7 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                         te_up: 0,
                         te_low2: None,
                         te_up2: None,
+                        flap_deg: strip_flap,
                     };
                     let push = |mesh: &mut Mesh, nodes: [Vec3; 4], kind: PanelKind, lead: bool, trail: bool, flap: bool| -> usize {
                         let mut p = Panel::new(nodes, kind, iw, Some(strip_id));

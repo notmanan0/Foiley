@@ -9,9 +9,11 @@
 //! * interpolation helpers and a standard atmosphere.
 
 pub mod atmosphere;
+pub mod hash;
 pub mod interp;
 pub mod linalg;
 pub mod progress;
+pub mod provenance;
 pub mod vec3;
 
 pub use progress::{Cancelled, LogLevel, Progress};

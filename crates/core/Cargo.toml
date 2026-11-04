@@ -9,3 +9,5 @@ license.workspace = true
 serde.workspace = true
 faer.workspace = true
 rayon.workspace = true
+blake3.workspace = true
+serde_json.workspace = true

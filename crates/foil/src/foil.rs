@@ -302,6 +302,16 @@ impl Foil {
         0.5 * (u + l)
     }
 
+    /// Hash of the normalized coordinates (unit chord, LE at the origin,
+    /// de-rotated), quantized to 1e-9 chord.  Name, note and hinge are not
+    /// part of it.
+    pub fn geom_hash(&self) -> foiley_core::hash::Hash32 {
+        let g = if self.n() >= 3 { self.normalized() } else { self.clone() };
+        let mut h = foiley_core::hash::Hasher::new();
+        h.tag("foiley.foil.v1").f64s(&g.x).f64s(&g.y);
+        h.finish()
+    }
+
     /// Normalise: de-rotate, unit chord, LE at origin.
     pub fn normalized(&self) -> Foil {
         let ile = self.le_index();
