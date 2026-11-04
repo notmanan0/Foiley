@@ -319,9 +319,9 @@ impl ConversionReport {
 #[derive(Clone, Debug)]
 pub struct AvlImport {
     pub plane: Plane,
-    /// NACA foils the file names (hinged where a `CONTROL` needs it); add
-    /// them to the project.  `AFILE` foils are matched by name against the
-    /// foils passed to [`import_avl`].
+    /// NACA foils the file names, and copies of `AFILE` foils (matched by
+    /// name against the foils passed to [`import_avl`]) that needed a hinge,
+    /// hinged where a `CONTROL` needs it; add them to the project.
     pub foils: Vec<Foil>,
     /// controls as flap mixing: (AVL control name, flap, gain in degrees per unit)
     pub mixing: Vec<(String, ControlTarget, f64)>,
@@ -547,6 +547,7 @@ pub fn import_avl(text: &str, foils: &[Foil]) -> Result<AvlImport, String> {
     let mut plane = Plane { name: title, description: "imported from AVL".into(), wings: vec![], fuses: vec![], point_masses: vec![] };
     let mut mixing = Vec::new();
     let mut naca_hinge: HashMap<String, Vec<Option<f64>>> = HashMap::new();
+    let mut afile_hinge: HashMap<String, Vec<Option<f64>>> = HashMap::new();
     let mut i = 0;
     while i < surfs.len() {
         let mut s = surfs[i].clone();
@@ -599,17 +600,14 @@ pub fn import_avl(text: &str, foils: &[Foil]) -> Result<AvlImport, String> {
                 }
             }
         }
-        for (_, secs, _) in &ctrl_sides {
-            for (k, sec) in secs.iter().enumerate() {
-                if !sec.naca {
-                    if let Some(c) = sec.ctrls.first() {
-                        match foils.iter().find(|f| f.name == sec.foil) {
-                            Some(f) if f.hinge.map(|h| (h.0 - c.xhinge).abs() < 1e-6).unwrap_or(false) => {}
-                            _ => rep.approx(format!("CONTROL '{}' at section {} of '{}'", c.name, k + 1, wing.name), format!("Foiley flaps come from foil hinges: give foil '{}' a hinge at x/c = {}", sec.foil, num(c.xhinge))),
-                        }
-                    }
+        // the YDUPLICATE image repeats the same sections: count them once
+        for (_, secs, _) in ctrl_sides.iter().filter(|c| !c.2) {
+            for sec in secs {
+                let h = sec.ctrls.first().map(|c| c.xhinge);
+                if sec.naca {
+                    naca_hinge.entry(sec.foil.clone()).or_default().push(h);
                 } else {
-                    naca_hinge.entry(sec.foil.clone()).or_default().push(sec.ctrls.first().map(|c| c.xhinge));
+                    afile_hinge.entry(sec.foil.clone()).or_default().push(h);
                 }
             }
         }
@@ -630,6 +628,25 @@ pub fn import_avl(text: &str, foils: &[Foil]) -> Result<AvlImport, String> {
             }
         }
         out_foils.push(f);
+    }
+    // AFILE foils carrying a control need a hinge at its x/c
+    let mut names: Vec<&String> = afile_hinge.keys().collect();
+    names.sort();
+    for name in names {
+        let uses = &afile_hinge[name];
+        let hinges: Vec<f64> = uses.iter().flatten().copied().collect();
+        let Some(&h) = hinges.first() else { continue };
+        let mixed = hinges.iter().any(|x| (x - h).abs() > 1e-9) || hinges.len() != uses.len();
+        match foils.iter().find(|f| &f.name == name) {
+            Some(f) if f.hinge.map(|g| (g.0 - h).abs() < 1e-6).unwrap_or(false) && !mixed => {}
+            Some(f) => {
+                let mut f = f.clone();
+                f.hinge = Some((h, 0.5));
+                rep.approx(format!("foil {}", f.name), format!("hinge set at x/c = {} for its CONTROL (Foiley flaps come from foil hinges){}", num(h), if mixed { "; the file uses this foil with different or no controls too" } else { "" }));
+                out_foils.push(f);
+            }
+            None => rep.approx(format!("foil {name}"), format!("its sections carry a CONTROL: give the foil a hinge at x/c = {} once it is loaded", num(h))),
+        }
     }
     if plane.wings.is_empty() {
         return Err("the AVL file has no wing surface".into());
