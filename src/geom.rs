@@ -378,6 +378,8 @@ pub fn geopar(x: &[f64], xp: &[f64], y: &[f64], yp: &[f64], s: &[f64], n: usize,
 }
 
 /// Max panel corner angle (CANG). Returns (imax, amax).
+// 3.1415926 is the Fortran literal; PI would change the result bits
+#[allow(clippy::approx_constant)]
 pub fn cang(x: &[f64], y: &[f64], n: usize) -> (usize, f64) {
     let mut amax: f64 = 0.0;
     let mut imax = 1;
@@ -406,7 +408,7 @@ pub fn cang(x: &[f64], y: &[f64], n: usize) -> (usize, f64) {
 /// (blanks/commas/tabs separate). Returns None on a parse error.
 pub fn getflt(line: &str, nmax: usize) -> Option<Vec<f64>> {
     let mut out = Vec::new();
-    for tok in line.split(|c: char| c == ' ' || c == ',' || c == '\t').filter(|t| !t.is_empty()) {
+    for tok in line.split([' ', ',', '\t']).filter(|t| !t.is_empty()) {
         if out.len() >= nmax {
             break;
         }
@@ -718,6 +720,9 @@ impl XFoil {
     }
 
     /// Curvature-based paneling from buffer airfoil (PANGEN).
+    // the corner loop grows N and then exits; the range bound is fixed at
+    // entry exactly like a Fortran DO bound
+    #[allow(clippy::mut_range_bound)]
     pub fn pangen(&mut self, shopar: bool) {
         let nb = self.nb;
         if nb < 2 {

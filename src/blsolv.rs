@@ -363,7 +363,7 @@ pub fn blsolv_blocked(
                 }
             };
             if par && nrows * (nsys - b1) > 12000 {
-                (first..nsys + 1).into_par_iter().with_min_len(8).for_each(|kv| work(kv));
+                (first..nsys + 1).into_par_iter().with_min_len(8).for_each(work);
             } else {
                 for kv in first..=nsys {
                     work(kv);

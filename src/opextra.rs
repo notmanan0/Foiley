@@ -2616,11 +2616,7 @@ pub fn getdef(s: &mut Session, filnam: &str, lask: bool) {
     let txt = match std::fs::read(filnam.trim_end()) {
         Ok(b) => String::from_utf8_lossy(&b).to_string(),
         Err(_) => {
-            if !lask {
-                crate::outln!("\n File  {}  not found", filnam);
-            } else {
-                crate::outln!("\n File  {}  not found", filnam);
-            }
+            crate::outln!("\n File  {}  not found", filnam);
             return;
         }
     };
@@ -2823,7 +2819,7 @@ pub fn oplset(s: &mut Session) {
                 std::mem::swap(&mut e.xpage, &mut e.ypage);
             }
             'C' => {
-                let lcolor = !(e.idevrp == 4);
+                let lcolor = e.idevrp != 4;
                 e.idevrp = if lcolor { 4 } else { 2 };
             }
             _ => crate::outln!(" *** Item not recognized ***"),

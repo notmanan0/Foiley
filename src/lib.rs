@@ -1,6 +1,16 @@
 //! Foiley: a Rust port of Mark Drela's XFoil 6.97 subsonic airfoil
 //! analysis code, with multithreading and SIMD-friendly kernels.
 
+// Style lints allowed crate-wide: this crate is a line-by-line port of the
+// Fortran, and keeping the code shaped like the Fortran is what lets it be
+// checked against the reference bit for bit.
+// - 1-based `DO I = 1, N` loops over several parallel arrays stay index loops
+#![allow(clippy::needless_range_loop)]
+// - element-wise copy loops mirror the Fortran DO loops they port
+#![allow(clippy::manual_memcpy)]
+// - routine signatures follow the Fortran SUBROUTINE argument lists
+#![allow(clippy::too_many_arguments)]
+
 pub mod bl;
 pub mod blsolv;
 pub mod blsys;

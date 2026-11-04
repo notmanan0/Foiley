@@ -342,6 +342,8 @@ pub fn clis(x: &[f64], xp: &[f64], y: &[f64], yp: &[f64], s: &[f64], n: usize) {
 }
 
 /// CANG with printing option. IPRINT=2 all angles, 1 max only, 0 none.
+// 3.1415926 is the Fortran literal; PI would change the result bits
+#[allow(clippy::approx_constant)]
 pub fn cang_p(x: &[f64], y: &[f64], n: usize, iprint: i32) -> (usize, f64) {
     use crate::fmt::f_fmt;
     let mut amax: f64 = 0.0;
@@ -561,6 +563,8 @@ pub fn bendump(n: usize, x: &[f64], y: &[f64]) {
 /// AREFINE: add points around corners exceeding ATOL degrees, within X1..X2.
 /// Returns NNEW (0 on overflow).
 #[allow(clippy::too_many_arguments)]
+// 3.14159 is the Fortran literal; PI would change the result bits
+#[allow(clippy::approx_constant)]
 pub fn arefine(
     x: &[f64],
     y: &[f64],

@@ -324,7 +324,7 @@ pub fn substr(s: &str, a: usize, b: usize) -> String {
 
 /// Parse one Fortran list-directed real (first item of string).
 pub fn list_real1(s: &str) -> Option<f64> {
-    let tok = s.split(|c: char| c == ' ' || c == ',' || c == '\t' || c == '/').find(|t| !t.is_empty())?;
+    let tok = s.split([' ', ',', '\t', '/']).find(|t| !t.is_empty())?;
     parse_fortran_real(tok)
 }
 
@@ -350,7 +350,7 @@ pub fn parse_fortran_real(tok: &str) -> Option<f64> {
 
 /// Parse one Fortran list-directed integer.
 pub fn list_int1(s: &str) -> Option<i64> {
-    let tok = s.split(|c: char| c == ' ' || c == ',' || c == '\t' || c == '/').find(|t| !t.is_empty())?;
+    let tok = s.split([' ', ',', '\t', '/']).find(|t| !t.is_empty())?;
     tok.trim().parse::<i64>().ok()
 }
 
@@ -367,7 +367,7 @@ pub fn polread(txt: &str, pol: &mut Polar) -> bool {
     pol.retyp = 0;
     pol.matyp = 0;
     let mut kf = 0usize;
-    let mut rinp = vec![0.0f64; IPTOT + 2 * JPTOT + 1];
+    let mut rinp = [0.0f64; IPTOT + 2 * JPTOT + 1];
 
     for raw in txt.lines() {
         // CHARACTER*128 LINE
@@ -831,6 +831,16 @@ pub fn ufread(data: &[u8]) -> (Vec<Vec<u8>>, bool) {
     (recs, true)
 }
 
+/// Formatted-file record terminators as written by the (Windows) gfortran
+/// runtime: "\r\n" on Windows, "\n" elsewhere.
+pub fn eol(s: &str) -> String {
+    if cfg!(windows) {
+        s.replace('\n', "\r\n")
+    } else {
+        s.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,15 +850,5 @@ mod tests {
         let ix = hsort(4, &a);
         let v: Vec<f64> = (1..=4).map(|i| a[ix[i]]).collect();
         assert_eq!(v, vec![1.0, 1.0, 2.0, 3.0]);
-    }
-}
-
-/// Formatted-file record terminators as written by the (Windows) gfortran
-/// runtime: "\r\n" on Windows, "\n" elsewhere.
-pub fn eol(s: &str) -> String {
-    if cfg!(windows) {
-        s.replace('\n', "\r\n")
-    } else {
-        s.to_string()
     }
 }

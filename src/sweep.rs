@@ -298,7 +298,8 @@ pub fn run_parallel(
     // dedicated worker threads pulling chunks from a shared counter (no
     // work-stealing interplay with nested parallel regions)
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::Mutex<Option<(XFoil, Vec<SeqPoint>)>>> = (0..nch).map(|_| std::sync::Mutex::new(None)).collect();
+    type Slot = std::sync::Mutex<Option<(XFoil, Vec<SeqPoint>)>>;
+    let slots: Vec<Slot> = (0..nch).map(|_| std::sync::Mutex::new(None)).collect();
     std::thread::scope(|sc| {
         for _ in 0..threads.min(nch) {
             sc.spawn(|| loop {
