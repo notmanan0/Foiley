@@ -105,7 +105,7 @@ pub fn show(ui: &mut Ui, cam: &mut Camera, mesh: Option<&Mesh>, field: Option<&C
     let mut emesh = egui::Mesh::default();
     let mouse = resp.hover_pos();
     let mut hovered = None;
-    let edge = Stroke::new(0.5, Color32::from_black_alpha(90));
+    let edge = Stroke::new(0.5_f32, Color32::from_black_alpha(90));
     for (_, i) in &order {
         let p = &mesh.panels[*i];
         let pts: Vec<Pos2> = p.nodes.iter().map(|n| to_screen(*n).0).collect();
@@ -152,7 +152,7 @@ pub fn show(ui: &mut Ui, cam: &mut Camera, mesh: Option<&Mesh>, field: Option<&C
     all.extend(shapes);
     painter.extend(all);
     for (a, b, col) in &overlay.lines {
-        painter.line_segment([to_screen(*a).0, to_screen(*b).0], Stroke::new(1.5, *col));
+        painter.line_segment([to_screen(*a).0, to_screen(*b).0], Stroke::new(1.5_f32, *col));
     }
     for (p, col, label) in &overlay.points {
         let s = to_screen(*p).0;
@@ -166,7 +166,7 @@ pub fn show(ui: &mut Ui, cam: &mut Camera, mesh: Option<&Mesh>, field: Option<&C
     for (d, name, col) in [(Vec3::X, "x", Color32::RED), (Vec3::Y, "y", Color32::GREEN), (Vec3::Z, "z", Color32::from_rgb(80, 120, 255))] {
         let (u, v, _) = cam.rotate(d);
         let e = o + Vec2::new(u, -v) * 25.0;
-        painter.line_segment([o, e], Stroke::new(2.0, col));
+        painter.line_segment([o, e], Stroke::new(2.0_f32, col));
         painter.text(e, egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(12.0), col);
     }
     if let Some(f) = field {

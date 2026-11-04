@@ -489,20 +489,20 @@ impl App {
             let h = ui.available_height();
             Plot::new("foilshape").data_aspect(1.0).height(if extra { h * 0.55 } else { h }).legend(Legend::default()).show(ui, |pu| {
                 if let Some(best) = live.as_ref().and_then(|r| r.best.as_ref()) {
-                    pu.line(Line::new("optimiser best", PlotPoints::from(foil_lines(&best.foil))).color(Color32::from_rgb(90, 220, 120)).width(1.5));
+                    pu.line(Line::new("optimiser best", PlotPoints::from(foil_lines(&best.foil))).color(Color32::from_rgb(90, 220, 120)).width(1.5_f32));
                 }
                 if let Some(f) = &foil {
-                    pu.line(Line::new(f.name.clone(), PlotPoints::from(foil_lines(f))).color(series_color(0)).width(2.0));
+                    pu.line(Line::new(f.name.clone(), PlotPoints::from(foil_lines(f))).color(series_color(0)).width(2.0_f32));
                     let (xs, c, _) = f.camber_thickness(60);
                     pu.line(Line::new("camber line", PlotPoints::from(xs.iter().zip(&c).map(|(x, y)| [*x, *y]).collect::<Vec<_>>())).color(Color32::GRAY).style(egui_plot::LineStyle::dashed_dense()));
-                    pu.points(Points::new("nodes", PlotPoints::from(foil_lines(f))).radius(1.5).color(series_color(0)));
+                    pu.points(Points::new("nodes", PlotPoints::from(foil_lines(f))).radius(1.5_f32).color(series_color(0)));
                     if let Some((x, yr)) = f.hinge {
                         let (u, l) = f.surface_y(x);
-                        pu.points(Points::new("hinge", PlotPoints::from(vec![[x, l + yr * (u - l)]])).radius(5.0).color(Color32::YELLOW));
+                        pu.points(Points::new("hinge", PlotPoints::from(vec![[x, l + yr * (u - l)]])).radius(5.0_f32).color(Color32::YELLOW));
                     }
                 }
                 if let Some(p) = &pv {
-                    pu.line(Line::new("preview", PlotPoints::from(foil_lines(p))).color(Color32::from_rgb(255, 160, 60)).width(2.0));
+                    pu.line(Line::new("preview", PlotPoints::from(foil_lines(p))).color(Color32::from_rgb(255, 160, 60)).width(2.0_f32));
                 }
             });
             if extra {
@@ -531,7 +531,7 @@ impl App {
                             Plot::new("opthist").height(hh - 24.0).x_axis_label("iteration").show(ui, |pu| {
                                 let pts: Vec<[f64; 2]> = r.history.iter().map(|(i, v)| [*i as f64, *v]).collect();
                                 pu.line(Line::new("best", PlotPoints::from(pts.clone())).color(series_color(2)));
-                                pu.points(Points::new("best", PlotPoints::from(pts)).radius(3.0).color(series_color(2)));
+                                pu.points(Points::new("best", PlotPoints::from(pts)).radius(3.0_f32).color(series_color(2)));
                             });
                         });
                     }
@@ -809,12 +809,12 @@ impl App {
                                 let pts: Vec<[f64; 2]> = p.points.iter().map(|q| [var(q, xv), var(q, yv)]).collect();
                                 let name = format!("{} {}", p.foil, p.name);
                                 pu.line(Line::new(name.clone(), PlotPoints::from(pts.clone())).color(series_color(i)));
-                                pu.points(Points::new(name.clone(), PlotPoints::from(pts)).radius(2.0).color(series_color(i)));
+                                pu.points(Points::new(name.clone(), PlotPoints::from(pts)).radius(2.0_f32).color(series_color(i)));
                                 if self.fui.show_failed && xv == 0 && !p.failed.is_empty() && p.polar_type <= 3 {
                                     // unconverged alphas as crosses on the x axis value line
                                     let lo = p.points.iter().map(|q| var(q, yv)).fold(f64::MAX, f64::min);
                                     let fpts: Vec<[f64; 2]> = p.failed.iter().map(|a| [*a, lo]).collect();
-                                    pu.points(Points::new(format!("{name} not converged"), PlotPoints::from(fpts)).shape(egui_plot::MarkerShape::Cross).radius(5.0).color(Color32::from_rgb(230, 80, 70)));
+                                    pu.points(Points::new(format!("{name} not converged"), PlotPoints::from(fpts)).shape(egui_plot::MarkerShape::Cross).radius(5.0_f32).color(Color32::from_rgb(230, 80, 70)));
                                 }
                             }
                             if pu.response().clicked() {
@@ -897,7 +897,7 @@ impl App {
                 ui.set_width(w / 2.0 - 6.0);
                 Plot::new("cp").height(h).legend(Legend::default()).y_axis_label("-Cp").x_axis_label("x/c").show(ui, |pu| {
                     let pts: Vec<[f64; 2]> = d.x.iter().zip(&d.cp_visc).map(|(x, c)| [*x, -c]).collect();
-                    pu.line(Line::new("-Cp viscous", PlotPoints::from(pts)).color(series_color(0)).width(2.0));
+                    pu.line(Line::new("-Cp viscous", PlotPoints::from(pts)).color(series_color(0)).width(2.0_f32));
                     if self.fui.cp_inviscid {
                         let pts: Vec<[f64; 2]> = d.x.iter().zip(&d.cp_inv).map(|(x, c)| [*x, -c]).collect();
                         pu.line(Line::new("-Cp inviscid", PlotPoints::from(pts)).color(Color32::GRAY).style(egui_plot::LineStyle::dashed_loose()));
