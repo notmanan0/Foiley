@@ -1,12 +1,13 @@
 //! 3D polars: definitions (types 1-8), the drivers, and the reduction of
 //! raw loads to coefficients and span distributions.
 
+use crate::evaluator::{Evaluator, WakeReport};
 use crate::foildb::{Envelope, FoilDb};
 use crate::geom::{Inertia, Plane};
 use crate::linear_panel::LinearPanelSystem;
 use crate::mesh::{build, Mesh, MeshOptions};
 use crate::panel::PanelSystem;
-use crate::stability::{self, StabilityResult};
+use crate::stability::{self, StabilityModel, StabilityResult};
 use crate::vlm::VlmSystem;
 use crate::PlaneError;
 use foiley_core::atmosphere::Fluid;
@@ -63,8 +64,8 @@ impl Method {
         let llt = self == Method::Llt;
         match setting {
             Setting::PolarType => !llt || matches!(kind, FixedSpeed | FixedLift | Glide | FixedAlpha),
-            // the control and stability drivers solve with the rigid wake
-            Setting::FreeWake => vlm && !matches!(kind, Control | Stability),
+            // every VLM driver goes through the wake-aware evaluator
+            Setting::FreeWake => vlm,
             // the lifting line is a symmetric main-wing model in free air:
             // no sideslip, ground, control surfaces, fuselage or derivatives
             Setting::Sideslip | Setting::GroundEffect | Setting::Flaps | Setting::Tilts | Setting::FuseDrag | Setting::Derivatives => !llt,
@@ -309,6 +310,10 @@ pub struct PlanePolarDef {
     pub include_fuse: bool,
     /// compute stability derivatives and modes for every point (needs mass)
     pub derivatives: bool,
+    /// loads behind the stability derivatives and the T7 trim: inviscid
+    /// (default) or the full reduced loads (viscous strip drag and section
+    /// Cm, extra drag, fuselage friction)
+    pub stability_model: StabilityModel,
     /// wake length for the panel method, in reference chords
     pub wake_length: f64,
     pub wake_panels: usize,
@@ -319,8 +324,21 @@ pub struct PlanePolarDef {
     /// keep the span distributions (strips) in the results; turn off for
     /// large sweeps, where they dominate memory and project size
     pub keep_strips: bool,
-    /// VLM free-wake relaxation iterations (0 = rigid wake along x)
+    /// VLM free-wake relaxation: the iteration cap (0 = rigid wake along x)
     pub free_wake: usize,
+    /// free wake: converged when the max node displacement / c_ref and
+    /// ||dGamma||inf / ||Gamma||inf of a step are both below this
+    pub wake_tol: f64,
+    /// free wake: segments per trailing line
+    pub wake_nseg: usize,
+    /// free wake: under-relaxation of the node update, in (0, 1]
+    pub wake_relax: f64,
+    /// free wake: fail a point whose wake did not converge (default: warn)
+    pub strict_wake: bool,
+    /// free wake: re-relax the wake for each of the 12 derivative
+    /// perturbations (12 relaxations per point) instead of freezing the
+    /// converged wake of the reference state and superposing unit solutions
+    pub relaxed_derivatives: bool,
     /// linear-solve and force-balance checks (off by default)
     pub diagnostics: Diagnostics,
     /// treat foils without loaded geometry as flat plates
@@ -354,6 +372,7 @@ impl Default for PlanePolarDef {
             fuse_drag: false,
             include_fuse: true,
             derivatives: false,
+            stability_model: StabilityModel::Inviscid,
             wake_length: 30.0,
             wake_panels: 5,
             wake_ratio: 1.1,
@@ -363,6 +382,11 @@ impl Default for PlanePolarDef {
             allow_missing_foils: false,
             strict_envelope: false,
             free_wake: 0,
+            wake_tol: 1e-3,
+            wake_nseg: 24,
+            wake_relax: 0.5,
+            strict_wake: false,
+            relaxed_derivatives: false,
             diagnostics: Diagnostics::Off,
         }
     }
@@ -508,6 +532,19 @@ impl PlanePolarDef {
         }
         if !(self.wake_length > 0.0) || self.wake_panels == 0 || !(self.wake_ratio > 0.0) {
             return Err("wake length, ratio and panel count must be positive".into());
+        }
+        if self.free_wake > 0 {
+            fin("free-wake tolerance", self.wake_tol)?;
+            fin("free-wake relaxation", self.wake_relax)?;
+            if self.wake_tol < 0.0 {
+                return Err("free-wake tolerance must not be negative".into());
+            }
+            if !(self.wake_relax > 0.0 && self.wake_relax <= 1.0) {
+                return Err(format!("free-wake relaxation must be in (0, 1] (got {})", self.wake_relax));
+            }
+            if self.wake_nseg < 2 {
+                return Err(format!("free wake needs at least 2 segments per line (got {})", self.wake_nseg));
+            }
         }
         if let Some(s) = self.unsupported().first() {
             return Err(if *s == Setting::PolarType {
@@ -705,6 +742,10 @@ pub struct PointDiagnostics {
     /// pressure (near-field) minus wake (Kutta-Joukowski on the shed
     /// circulation) lift coefficient
     pub cl_pressure_minus_wake: f64,
+    /// relaxed-wake convergence; set on every relaxed-wake point, also with
+    /// diagnostics off (the other fields are then zero)
+    #[serde(default)]
+    pub wake: Option<WakeReport>,
 }
 
 impl PlaneOpp {
@@ -840,6 +881,7 @@ impl<'a> System<'a> {
             refined: rep.refined.iter().any(|r| *r),
             cd_near_minus_trefftz: (raw.pressure_force - raw.induced_force).dot(wd) / qs,
             cl_pressure_minus_wake: dp.dot(wn) / qs,
+            wake: None,
         }
     }
     pub fn cog(&self) -> Vec3 {
@@ -886,9 +928,21 @@ impl<'a> Ctx<'a> {
         Some((l(pa.cd, pb.cd), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), l(pa.cm, pb.cm), oa.combine(ob)))
     }
 
-    /// Reduce raw loads to an operating point.
-    pub fn reduce(&self, mesh: &Mesh, raw: &RawLoads, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64) -> PlaneOpp {
+    /// Reduce raw loads to an operating point.  `omega` (body rates, rad/s)
+    /// makes every strip use its local air velocity V - omega x (c4 - cog)
+    /// for Re, drag direction and dynamic pressure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce(&self, mesh: &Mesh, raw: &RawLoads, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64, omega: Option<Vec3>) -> PlaneOpp {
+        self.reduce_full(mesh, raw, cog, alpha, beta, v, mass, omega).0
+    }
+
+    /// [`Ctx::reduce`], also returning the total force and moment (about
+    /// `cog`, N and N.m, body axes).  With `StabilityModel::FullLoad` the
+    /// moment (and Cm) include the sections' viscous Cm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce_full(&self, mesh: &Mesh, raw: &RawLoads, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64, omega: Option<Vec3>) -> (PlaneOpp, Vec3, Vec3) {
         let rho = self.def.fluid.rho;
+        let section_cm = self.def.stability_model == StabilityModel::FullLoad;
         let nu = self.def.fluid.nu();
         let q = 0.5 * rho * v * v;
         let (wd, wn, ws) = (wind_dir(alpha, beta), wind_normal(alpha), wind_side(alpha, beta));
@@ -899,7 +953,18 @@ impl<'a> Ctx<'a> {
         let mut m_visc = Vec3::ZERO;
         let mut missing_polars: Vec<String> = Vec::new();
         let mut n_env = [0usize; 5];
+        let mut m_sec = Vec3::ZERO;
         for (i, s) in mesh.strips.iter().enumerate() {
+            // local air velocity of the strip (the freestream without rotation)
+            let (v, wd, q, da) = match omega {
+                Some(w) => {
+                    let vloc = wd * v - w.cross(s.c4 - cog);
+                    let vl = vloc.norm().max(1e-30);
+                    let da = ((vloc.dot(s.normal) / vl).clamp(-1.0, 1.0).asin() - (wd.dot(s.normal)).clamp(-1.0, 1.0).asin()) / DEG;
+                    (vl, vloc / vl, 0.5 * rho * vl * vl, da)
+                }
+                None => (v, wd, q, 0.0),
+            };
             let f = raw.strip_force[i] * rho;
             let area = s.area.max(1e-30);
             let cl = f.dot(s.normal) / (q * area);
@@ -909,7 +974,7 @@ impl<'a> Ctx<'a> {
             let fi = wi.cross(s.te_b - s.te_a) * (gamma * rho);
             let cdi = fi.dot(wd) / (q * area);
             let re = v * s.chord / nu;
-            let alpha_eff = alpha + s.twist + ai;
+            let alpha_eff = alpha + s.twist + ai + da;
             let mut sr = StripResult {
                 wing: s.wing,
                 span_pos: s.span_pos,
@@ -939,6 +1004,11 @@ impl<'a> Ctx<'a> {
                         let dfv = wd * (q * area * cd);
                         f_visc += dfv;
                         m_visc += (s.c4 - cog).cross(dfv);
+                        if section_cm {
+                            // nose-up couple about n x chord
+                            let chord_dir = ((s.te_a + s.te_b) * 0.5 - s.le).normalized();
+                            m_sec += s.normal.cross(chord_dir) * (q * area * s.chord * cm);
+                        }
                     }
                     None => {
                         sr.envelope = Envelope::Missing as u8;
@@ -998,7 +1068,7 @@ impl<'a> Ctx<'a> {
         let f_inv = raw.force * rho;
         let f_ind = raw.induced_force * rho;
         let f_tot = f_inv + f_ind + f_visc + wd * d_extra;
-        let m_tot = raw.moment * rho + m_visc;
+        let m_tot = raw.moment * rho + m_visc + m_sec;
         let lift = f_tot.dot(wn);
         let cl = lift / qs;
         let cdi = f_ind.dot(wd) / qs;
@@ -1013,7 +1083,7 @@ impl<'a> Ctx<'a> {
         let efficiency = if cdi.abs() > 1e-12 { cl * cl / (std::f64::consts::PI * ar * cdi) } else { 0.0 };
         // root bending of the main wing = max over its strips
         let root_bending = mesh.wings.iter().enumerate().find(|(_, w)| w.kind == crate::geom::WingKind::Main).map(|(_, w)| w.strips.clone().map(|i| strips[i].bending.abs()).fold(0.0, f64::max)).unwrap_or(0.0);
-        PlaneOpp {
+        let opp = PlaneOpp {
             alpha,
             beta,
             velocity: v,
@@ -1041,7 +1111,8 @@ impl<'a> Ctx<'a> {
             wake: vec![],
             balance_residual: None,
             diagnostics: None,
-        }
+        };
+        (opp, f_tot, m_tot)
     }
 }
 
@@ -1093,16 +1164,19 @@ pub fn envelope_failure(def: &PlanePolarDef, o: &PlaneOpp) -> Option<String> {
 }
 
 /// Run the stability analysis for a point, recording a failure on the point
-/// (`stability_error` plus a warning) instead of dropping it.
-fn attach_stability(opp: &mut PlaneOpp, res: Result<StabilityResult, PlaneError>) {
+/// (`stability_error` plus a warning) instead of dropping it.  Only a
+/// cancellation propagates.
+fn attach_stability(opp: &mut PlaneOpp, res: Result<StabilityResult, PlaneError>) -> Result<(), PlaneError> {
     match res {
         Ok(s) => opp.stability = Some(s),
+        Err(PlaneError::Cancelled) => return Err(PlaneError::Cancelled),
         Err(e) => {
             let msg = format!("stability analysis failed: {e}");
             opp.warnings.push(msg.clone());
             opp.stability_error = Some(msg);
         }
     }
+    Ok(())
 }
 
 /// Stability needs a mass; say so on the point when it is missing.
@@ -1137,6 +1211,39 @@ fn balance_speed(ctx: &Ctx, raw1: &RawLoads, alpha: f64, mass: f64) -> Option<f6
     Some((mass * G / l1).sqrt())
 }
 
+/// With `strict_wake`, why a point fails (its relaxed wake did not converge).
+pub fn wake_failure(def: &PlanePolarDef, o: &PlaneOpp) -> Option<String> {
+    if !def.strict_wake {
+        return None;
+    }
+    o.diagnostics.as_ref().and_then(|d| d.wake.as_ref()).and_then(|w| w.warning()).map(|w| format!("strict wake: {w}"))
+}
+
+/// Why a computed point is not reportable (non-finite, strict envelope, strict wake).
+fn point_failure(def: &PlanePolarDef, o: &PlaneOpp) -> Option<String> {
+    nonfinite_reason(o).or_else(|| envelope_failure(def, o)).or_else(|| wake_failure(def, o))
+}
+
+/// Loads of one state through the evaluator, reduced to an operating point,
+/// with its diagnostics, relaxed wake lines and wake report.
+#[allow(clippy::too_many_arguments)]
+fn evaluate(ctx: &Ctx, ev: &Evaluator, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64, prog: &Progress) -> Result<PlaneOpp, PlaneError> {
+    let wd = wind_dir(alpha, beta);
+    let (raw, wrep) = ev.loads(wd, v, Vec3::ZERO, prog)?;
+    let mut opp = ctx.reduce(ev.mesh(), &raw, cog, alpha, beta, v, mass, None);
+    if ctx.def.diagnostics != Diagnostics::Off {
+        opp.diagnostics = Some(ev.sys.point_diagnostics(&raw, wd * v, Vec3::ZERO, ctx.s_ref, wrep.relaxed));
+    }
+    if wrep.relaxed {
+        opp.wake = ev.wake_lines(wd, v, Vec3::ZERO);
+        if let Some(w) = wrep.warning() {
+            opp.warnings.push(w);
+        }
+        opp.diagnostics.get_or_insert_with(Default::default).wake = Some(wrep);
+    }
+    Ok(opp)
+}
+
 /// Run a 3D polar.  Points are streamed to `on_point` as they are computed.
 pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync)) -> Result<PlanePolar, PlaneError> {
     def.validate().map_err(PlaneError::Input)?;
@@ -1169,7 +1276,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
             let mesh = build(plane, db, &mesh_options(def, &HashMap::new(), &HashMap::new()))?;
             polar.unknowns = def.method.unknowns(mesh.panels.len());
             prog.info(format!("mesh: {} panels, {} strips", mesh.panels.len(), mesh.strips.len()));
-            let sys = make_system(def, &mesh, cog, ctx.c_ref, &prog.sub(0.0, 0.5))?;
+            let ev = Evaluator::new(make_system(def, &mesh, cog, ctx.c_ref, &prog.sub(0.0, 0.5))?, def, ctx.c_ref);
             let ops: Vec<(f64, f64, f64)> = match def.kind {
                 PolarKind::FixedSpeed | PolarKind::FixedLift | PolarKind::Glide => def.range.values().into_iter().map(|a| (a, def.beta, def.velocity)).collect(),
                 PolarKind::FixedAlpha => def.range.values().into_iter().map(|v| (def.alpha, def.beta, v)).collect(),
@@ -1186,7 +1293,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
                     .map(|(k, &(a, b, v))| {
                         rest.check()?;
                         let part = rest.part(k, n);
-                        let r = solve_point(&ctx, &sys, &mesh, cog, mass, a, b, v, &part);
+                        let r = solve_point(&ctx, &ev, cog, mass, a, b, v, &part);
                         if !matches!(r, Err(PlaneError::Cancelled)) {
                             part.set(1.0);
                         }
@@ -1241,12 +1348,13 @@ fn drop_strips(polar: &mut PlanePolar) {
 #[allow(clippy::too_many_arguments)]
 /// Solve one operating point.  `Ok(Err(reason))` is a point that failed
 /// (it goes to the polar's `failed` list); `Err` aborts the whole polar.
-fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha: f64, beta: f64, v_spec: f64, prog: &Progress) -> Result<Result<PlaneOpp, String>, PlaneError> {
+fn solve_point(ctx: &Ctx, ev: &Evaluator, cog: Vec3, mass: f64, alpha: f64, beta: f64, v_spec: f64, prog: &Progress) -> Result<Result<PlaneOpp, String>, PlaneError> {
     let def = ctx.def;
-    let wd = wind_dir(alpha, beta);
     let v = match def.kind {
         PolarKind::FixedLift | PolarKind::Glide => {
-            let raw1 = sys.loads(wd, Vec3::ZERO);
+            // lift = weight from the loads at unit speed (a relaxed wake does
+            // not depend on the speed, so the balance holds at the result)
+            let (raw1, _) = ev.loads(wind_dir(alpha, beta), 1.0, Vec3::ZERO, prog)?;
             match balance_speed(ctx, &raw1, alpha, mass) {
                 Some(v) => v,
                 None => return Ok(Err("no positive lift for the speed balance".into())),
@@ -1254,19 +1362,7 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
         }
         _ => v_spec,
     };
-    let (raw, wake) = match (sys, def.free_wake) {
-        (System::Vlm(s), it) if it > 0 => {
-            let (g, fw) = s.solve_free_wake(wd * v, it, def.wake_length * ctx.c_ref, 24, prog)?;
-            (s.loads(&g, wd * v, Vec3::ZERO), fw.lines.iter().map(|l| l.iter().map(|p| [p.x as f32, p.y as f32, p.z as f32]).collect()).collect())
-        }
-        _ => (sys.loads(wd * v, Vec3::ZERO), vec![]),
-    };
-    let relaxed = !wake.is_empty();
-    let mut opp = ctx.reduce(mesh, &raw, cog, alpha, beta, v, mass);
-    if def.diagnostics != Diagnostics::Off {
-        opp.diagnostics = Some(sys.point_diagnostics(&raw, wd * v, Vec3::ZERO, ctx.s_ref, relaxed));
-    }
-    opp.wake = wake;
+    let mut opp = evaluate(ctx, ev, cog, alpha, beta, v, mass, prog)?;
     if def.kind == PolarKind::Glide {
         // speed from the total aerodynamic force (viscous drag depends on Re)
         let weight = mass * G;
@@ -1283,22 +1379,18 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
                 return Ok(Err("no aerodynamic force for the glide speed balance".into()));
             }
             let vn = (2.0 * weight / (def.fluid.rho * ctx.s_ref * ca)).sqrt();
-            let raw = sys.loads(wd * vn, Vec3::ZERO);
-            opp = ctx.reduce(mesh, &raw, cog, alpha, beta, vn, mass);
-            if def.diagnostics != Diagnostics::Off {
-                opp.diagnostics = Some(sys.point_diagnostics(&raw, wd * vn, Vec3::ZERO, ctx.s_ref, false));
-            }
+            opp = evaluate(ctx, ev, cog, alpha, beta, vn, mass, prog)?;
             res = residual(&opp);
         }
         opp.balance_residual = Some(res);
     }
-    if let Some(why) = nonfinite_reason(&opp).or_else(|| envelope_failure(def, &opp)) {
+    if let Some(why) = point_failure(def, &opp) {
         return Ok(Err(why));
     }
     if def.derivatives {
         if mass > 0.0 {
-            let res = stability::analyse(ctx, sys, cog, alpha, opp.velocity);
-            attach_stability(&mut opp, res);
+            let res = stability::analyse(ctx, ev, cog, alpha, beta, opp.velocity, prog);
+            attach_stability(&mut opp, res)?;
         } else {
             stability_needs_mass(&mut opp);
         }
@@ -1325,12 +1417,15 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
         if let Some(m) = control_value(def, t, ControlTarget::Mass) {
             inertia.mass = m;
         }
-        if let Some(x) = control_value(def, t, ControlTarget::CogX) {
+        let (cx, cz) = (control_value(def, t, ControlTarget::CogX), control_value(def, t, ControlTarget::CogZ));
+        if let Some(x) = cx {
             inertia.cog.x = x;
         }
-        if let Some(z) = control_value(def, t, ControlTarget::CogZ) {
+        if let Some(z) = cz {
             inertia.cog.z = z;
         }
+        // moments about the CoG as in T1 (the origin for a massless plane)
+        let cog = if inertia.mass > 0.0 || cx.is_some() || cz.is_some() { inertia.cog } else { Vec3::ZERO };
         let mut flaps = HashMap::new();
         let mut tilts = HashMap::new();
         for r in &def.ranges {
@@ -1347,14 +1442,10 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
         }
         let mesh = build(ctx.plane, ctx.db, &mesh_options(def, &flaps, &tilts))?;
         polar.unknowns = def.method.unknowns(mesh.panels.len());
-        let sys = make_system(def, &mesh, inertia.cog, ctx.c_ref, &sub.sub(0.0, 0.9))?;
-        let raw = sys.loads(wind_dir(a, b) * v, Vec3::ZERO);
-        let mut opp = ctx.reduce(&mesh, &raw, inertia.cog, a, b, v, inertia.mass);
-        if def.diagnostics != Diagnostics::Off {
-            opp.diagnostics = Some(sys.point_diagnostics(&raw, wind_dir(a, b) * v, Vec3::ZERO, ctx.s_ref, false));
-        }
+        let ev = Evaluator::new(make_system(def, &mesh, cog, ctx.c_ref, &sub.sub(0.0, 0.9))?, def, ctx.c_ref);
+        let mut opp = evaluate(ctx, &ev, cog, a, b, v, inertia.mass, &sub)?;
         opp.ctrl = t;
-        if let Some(why) = nonfinite_reason(&opp).or_else(|| envelope_failure(def, &opp)) {
+        if let Some(why) = point_failure(def, &opp) {
             sub.set(1.0);
             prog.count_failed();
             polar.failed.push(format!("ctrl {t:.3}: {why}"));
@@ -1363,7 +1454,7 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
         if def.derivatives {
             if inertia.mass > 0.0 {
                 let c2 = Ctx { inertia, ..Ctx::new(ctx.plane, ctx.db, def)? };
-                attach_stability(&mut opp, stability::analyse(&c2, &sys, inertia.cog, a, v));
+                attach_stability(&mut opp, stability::analyse(&c2, &ev, cog, a, b, v, &sub))?;
             } else {
                 stability_needs_mass(&mut opp);
             }
@@ -1376,6 +1467,24 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
     Ok(())
 }
 
+/// Flap and tilt deflections of the T7 gains at control parameter `t`.
+fn gain_deflections(def: &PlanePolarDef, t: f64) -> (HashMap<(usize, usize), f64>, HashMap<usize, f64>) {
+    let mut flaps = HashMap::new();
+    let mut tilts = HashMap::new();
+    for (target, gain) in &def.gains {
+        match target {
+            ControlTarget::Flap { wing, index } => {
+                flaps.insert((*wing, *index), gain * t);
+            }
+            ControlTarget::Tilt { wing } => {
+                tilts.insert(*wing, gain * t);
+            }
+            _ => {}
+        }
+    }
+    (flaps, tilts)
+}
+
 fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync)) -> Result<(), PlaneError> {
     let def = ctx.def;
     let ts = def.range.values();
@@ -1386,57 +1495,34 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
         prog.check()?;
         let sub = prog.part(k, n);
         sub.stage(format!("Stability: control {t:.3} ({}/{n}) - trimming", k + 1));
-        let mut flaps = HashMap::new();
-        let mut tilts = HashMap::new();
-        for (target, gain) in &def.gains {
-            match target {
-                ControlTarget::Flap { wing, index } => {
-                    flaps.insert((*wing, *index), gain * t);
-                }
-                ControlTarget::Tilt { wing } => {
-                    tilts.insert(*wing, gain * t);
-                }
-                _ => {}
-            }
-        }
+        let (flaps, tilts) = gain_deflections(def, t);
         let mesh = build(ctx.plane, ctx.db, &mesh_options(def, &flaps, &tilts))?;
         polar.unknowns = def.method.unknowns(mesh.panels.len());
-        let sys = make_system(def, &mesh, cog, ctx.c_ref, &sub.sub(0.0, 0.7))?;
-        match stability::trim(ctx, &sys, cog, def.beta) {
+        let ev = Evaluator::new(make_system(def, &mesh, cog, ctx.c_ref, &sub.sub(0.0, 0.7))?, def, ctx.c_ref);
+        match stability::trim(ctx, &ev, def.beta, &sub)? {
             Some((alpha, u0)) => {
-                let raw = sys.loads(wind_dir(alpha, def.beta) * u0, Vec3::ZERO);
-                let mut opp = ctx.reduce(&mesh, &raw, cog, alpha, def.beta, u0, mass);
-                if def.diagnostics != Diagnostics::Off {
-                    opp.diagnostics = Some(sys.point_diagnostics(&raw, wind_dir(alpha, def.beta) * u0, Vec3::ZERO, ctx.s_ref, false));
-                }
+                let mut opp = evaluate(ctx, &ev, cog, alpha, def.beta, u0, mass, &sub)?;
                 opp.ctrl = t;
-                if let Some(why) = nonfinite_reason(&opp).or_else(|| envelope_failure(def, &opp)) {
+                if let Some(why) = point_failure(def, &opp) {
                     prog.count_failed();
                     polar.failed.push(format!("ctrl {t:.3}: {why}"));
                     sub.set(1.0);
                     continue;
                 }
                 sub.stage(format!("Stability: control {t:.3} - derivatives and modes"));
-                match stability::analyse(ctx, &sys, cog, alpha, u0) {
+                match stability::analyse(ctx, &ev, cog, alpha, def.beta, u0, &sub) {
                     Ok(mut s) => {
                         // control derivatives: rebuild with the control parameter nudged
                         let gmax = def.gains.iter().map(|g| g.1.abs()).fold(0.0, f64::max);
                         if gmax > 0.0 {
                             let dt = 0.5 / gmax;
-                            let mut f2 = HashMap::new();
-                            let mut t2 = HashMap::new();
-                            for (target, gain) in &def.gains {
-                                match target {
-                                    ControlTarget::Flap { wing, index } => {
-                                        f2.insert((*wing, *index), gain * (t + dt));
-                                    }
-                                    ControlTarget::Tilt { wing } => {
-                                        t2.insert(*wing, gain * (t + dt));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            match build(ctx.plane, ctx.db, &mesh_options(def, &f2, &t2)).and_then(|m2| make_system(def, &m2, cog, ctx.c_ref, &Progress::none()).map(|s2| stability::add_control_derivatives(ctx, &sys, &s2, &mut s, dt))) {
+                            let (f2, t2) = gain_deflections(def, t + dt);
+                            let r = (|| -> Result<(), PlaneError> {
+                                let m2 = build(ctx.plane, ctx.db, &mesh_options(def, &f2, &t2))?;
+                                let ev2 = Evaluator::new(make_system(def, &m2, cog, ctx.c_ref, &Progress::none())?, def, ctx.c_ref);
+                                stability::add_control_derivatives(ctx, &ev, &ev2, &mut s, dt, &sub)
+                            })();
+                            match r {
                                 Ok(()) => {}
                                 Err(PlaneError::Cancelled) => return Err(PlaneError::Cancelled),
                                 Err(e) => opp.warnings.push(format!("control derivatives not computed: {e}")),
@@ -1444,7 +1530,7 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
                         }
                         opp.stability = Some(s)
                     }
-                    Err(e) => attach_stability(&mut opp, Err(e)),
+                    Err(e) => attach_stability(&mut opp, Err(e))?,
                 }
                 prog.count_ok();
                 prog.info(format!("ctrl {t:.3}: trimmed at alpha={alpha:.3} deg, V={u0:.3} m/s, CL={:.4}", opp.cl));
@@ -1458,6 +1544,5 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
         }
         sub.set(1.0);
     }
-    let _ = mass;
     Ok(())
 }

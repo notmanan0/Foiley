@@ -10,11 +10,13 @@
 //! * [`panel`]: constant source/doublet panel method (Dirichlet).
 //! * [`linear_panel`]: Galerkin linear-doublet triangles and a linear TE wake.
 //! * [`analysis`]: polar definitions (types 1-8) and the drivers.
+//! * [`evaluator`]: the wake-aware load evaluator every driver goes through.
 //! * [`stability`]: stability derivatives, state matrices, modes, time response.
 //! * [`xml`]: import of xflr5 / flow5 plane XML files.
 
 pub mod analysis;
 pub mod cad;
+pub mod evaluator;
 pub mod export;
 pub mod foildb;
 pub mod geom;

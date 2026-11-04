@@ -58,11 +58,12 @@ fn f009_nonfinite_scalars_rejected() {
 
 #[test]
 fn f009_unsupported_settings_rejected() {
-    // free wake: VLM only, and not in the control / stability drivers
+    // free wake: VLM only (every VLM driver, T6 and T7 included, since F007)
     let fw = PlanePolarDef { method: Method::Panel, ..review_def() };
     assert!(fw.validate().unwrap_err().contains("free-wake"));
     let t6 = PlanePolarDef { kind: PolarKind::Control, range: Range { from: 0.0, to: 0.0, step: 1.0 }, ..review_def() };
-    assert!(t6.validate().is_err());
+    t6.validate().unwrap();
+    PlanePolarDef { kind: PolarKind::Stability, ..review_def() }.validate().unwrap();
     let llt5 = PlanePolarDef { method: Method::Llt, kind: PolarKind::Sideslip, free_wake: 0, ..review_def() };
     assert!(llt5.validate().is_err());
     // clear_unsupported makes any definition valid for its method
