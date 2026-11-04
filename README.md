@@ -3,7 +3,7 @@
 Airfoil, wing and plane design and analysis in Rust. It covers the
 xflr5 / flow5 workflow:
 
-* **2D:** XFoil 6.97, ported line by line, with numbers identical to the original.
+* **2D:** XFoil 6.97, ported line by line. Measured against the double-precision Fortran on a 48-case raw-bit corpus (`tests/f015.rs`): the same points, boundary-layer stations and transition stations, and values within 1.5e-5 of each quantity's scale (CL within 4.5e-7), but not the same bits.
 * **3D:** LLT, VLM1/VLM2 and a 3D panel method.
 * **Flight dynamics:** stability analysis.
 
@@ -30,7 +30,7 @@ Use `cargo build --profile dist` for a fully optimised (fat LTO) release.
 
 | crate | contents |
 |---|---|
-| `foiley` (repo root, `src/`) | the XFoil 6.97 engine: panel method, boundary layer, Newton solver, GDES/QDES/MDES. Results are bit-exact with the Fortran. |
+| `foiley` (repo root, `src/`) | the XFoil 6.97 engine: panel method, boundary layer, Newton solver, GDES/QDES/MDES. Results agree with the Fortran to ~1e-5 of each quantity's scale (F015 matrix); Foiley's pipelined, fine-parallel, scalar and AVX2 paths are bit-identical to its own sequential run. |
 | `crates/core` | `Vec3`, progress and cancellation handles, dense LU and eigenvalues (faer, multithreaded), interpolation, ISA atmosphere |
 | `crates/foil` | `Foil` geometry and file I/O (Selig and Lednicer .dat), NACA 4/5 digit, every XFoil design operation as a function, inverse design (QDES/MDES), the optimiser (MOPSO/GA), the 2D analysis service with convergence recovery, polar types 1/2/3/4/6, batch polar meshes |
 | `crates/plane` | plane/wing/fuselage model (elliptic, NURBS, STL/STEP), reference dimensions, inertia, meshing (thin and thick, quads or triangles, flaps, tips, fuselage), LLT, VLM1, VLM2 with optional free wake, source/doublet panel methods, polar types T1 to T8, trim, stability and control derivatives, modes, time responses, XML/AVL/STL exchange |
@@ -244,8 +244,8 @@ gfortran-built Fortran XFoil are in `bench/run_bench.py`:
 
 | variable | default | effect |
 |---|---|---|
-| `FOILEY_JOBS` | min(8, logical CPUs / 2) | parallel sweep chunks; `1` gives exact XFoil semantics (bit-identical output) |
-| `FOILEY_PIPELINE` | `1` | `0` disables the bit-exact helper-thread pipelining of ASEQ |
+| `FOILEY_JOBS` | min(8, logical CPUs / 2) | parallel sweep chunks; `1` gives exact XFoil sweep semantics. Parallel chunks warm-start from other neighbours: bit-identical to the sequential sweep on 15 of 48 corpus cases, otherwise within 1.3e-4 scaled (F015 matrix) |
+| `FOILEY_PIPELINE` | `1` | `0` disables the helper-thread pipelining of ASEQ (bit-identical either way, 48 of 48 corpus cases) |
 | `FOILEY_FINE_PAR` | `0` | `1` enables intra-iteration parallelism |
 
 **3D method details.** The panel method takes forces from the far field
