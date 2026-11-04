@@ -7,10 +7,17 @@ use foiley_plane::geom::*;
 use foiley_plane::FoilDb;
 
 fn run(p: &Plane, db: &FoilDb, d: &PlanePolarDef) -> PlaneOpp {
-    run_polar(p, db, d, &Progress::none(), &|_| {})
-        .unwrap()
-        .points
-        .remove(0)
+    match run_polar(p, db, d, &Progress::none(), &|_| {}) {
+        Ok(mut pol) if !pol.points.is_empty() => pol.points.remove(0),
+        Ok(pol) => {
+            println!("  (no point: {:?})", pol.failed);
+            PlaneOpp::default()
+        }
+        Err(e) => {
+            println!("  (rejected: {e})");
+            PlaneOpp::default()
+        }
+    }
 }
 
 fn polar(foil: &str, name: &str, re: f64, ncrit: f64, cd: f64) -> FoilPolar {

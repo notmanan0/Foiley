@@ -1229,6 +1229,8 @@ fn real_main() -> Result<(), String> {
                     def.gains.push((ControlTarget::Flap { wing: v[0] as usize, index: v[1] as usize }, v[2]));
                 }
                 def.name = def.auto_name();
+                // the shared Method::supports table, before any 2D polar work
+                def.validate()?;
                 ensure_polars(&mut mgr, &mut ui, &mut proj, &plane, &def, auto_polars)?;
                 let db = proj.foil_db();
                 let title = format!("{} {}", plane.name, def.name);

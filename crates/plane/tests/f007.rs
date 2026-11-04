@@ -25,7 +25,7 @@ fn f007_t3_relaxed_differs_from_rigid() {
 }
 
 #[test]
-#[ignore = "F019: T6 ignores the relaxed wake that T1 uses"]
+#[ignore = "F019: T6 ignores the relaxed wake that T1 uses (F009 rejects free wake in T6 until F007 routes it)"]
 fn f019_t1_t6_equivalent() {
     let f = naca0012();
     let (p, db) = (review_rect(&f), db_with(&f));

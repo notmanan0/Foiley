@@ -53,6 +53,19 @@ impl Method {
             Method::TriLinear => "3D panels on triangles (linear doublets, Galerkin)",
         }
     }
+    /// The one compatibility table between methods, polar types and optional
+    /// settings.  `PlanePolarDef::validate`, the GUI (which greys out what is
+    /// unsupported) and the CLI all go through it.
+    pub fn supports(self, kind: PolarKind, setting: Setting) -> bool {
+        use PolarKind::*;
+        let vlm = matches!(self, Method::Vlm1 | Method::Vlm2);
+        match setting {
+            Setting::PolarType => self != Method::Llt || matches!(kind, FixedSpeed | FixedLift | Glide | FixedAlpha),
+            // the control and stability drivers solve with the rigid wake
+            Setting::FreeWake => vlm && !matches!(kind, Control | Stability),
+            Setting::Sideslip | Setting::GroundEffect | Setting::Flaps | Setting::Tilts | Setting::FuseDrag | Setting::Derivatives => true,
+        }
+    }
     pub fn short(self) -> &'static str {
         match self {
             Method::Llt => "LLT",
@@ -61,6 +74,40 @@ impl Method {
             Method::Panel => "Panel",
             Method::TriPanel => "TriPanel",
             Method::TriLinear => "TriLinear",
+        }
+    }
+}
+
+/// Optional parts of a polar definition that not every method honours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Setting {
+    /// the polar type itself
+    PolarType,
+    /// nonzero sideslip (beta, T5 sweep, T6 beta range, T8 betas)
+    Sideslip,
+    GroundEffect,
+    /// flap deflections (presets, T6 ranges, T7 gains)
+    Flaps,
+    /// wing tilts (T6 ranges, T7 gains)
+    Tilts,
+    FuseDrag,
+    Derivatives,
+    /// free-wake relaxation
+    FreeWake,
+}
+
+impl Setting {
+    pub const ALL: [Setting; 8] = [Setting::PolarType, Setting::Sideslip, Setting::GroundEffect, Setting::Flaps, Setting::Tilts, Setting::FuseDrag, Setting::Derivatives, Setting::FreeWake];
+    pub fn label(self) -> &'static str {
+        match self {
+            Setting::PolarType => "this polar type",
+            Setting::Sideslip => "sideslip",
+            Setting::GroundEffect => "ground effect",
+            Setting::Flaps => "flap deflections",
+            Setting::Tilts => "wing tilts",
+            Setting::FuseDrag => "fuselage friction drag",
+            Setting::Derivatives => "stability derivatives",
+            Setting::FreeWake => "free-wake relaxation",
         }
     }
 }
@@ -330,24 +377,162 @@ impl PlanePolarDef {
         s
     }
 
+    /// Whether this definition asks for `setting` (see `Method::supports`).
+    pub fn uses(&self, setting: Setting) -> bool {
+        let range_on = |f: &dyn Fn(&ControlTarget) -> bool| self.ranges.iter().any(|r| f(&r.target) && (r.min != 0.0 || r.max != 0.0));
+        let gain_on = |f: &dyn Fn(&ControlTarget) -> bool| self.gains.iter().any(|(t, g)| f(t) && *g != 0.0);
+        match setting {
+            Setting::PolarType => true,
+            Setting::Sideslip => match self.kind {
+                PolarKind::Sideslip => true,
+                PolarKind::List => self.list.iter().any(|p| p.1 != 0.0),
+                PolarKind::Control => self.beta != 0.0 || range_on(&|t| *t == ControlTarget::Beta),
+                _ => self.beta != 0.0,
+            },
+            Setting::GroundEffect => self.ground_height.is_some(),
+            Setting::Flaps => {
+                let fl = |t: &ControlTarget| matches!(t, ControlTarget::Flap { .. });
+                self.flaps.iter().any(|f| f.1 != 0.0) || (self.kind == PolarKind::Control && range_on(&fl)) || (self.kind == PolarKind::Stability && gain_on(&fl))
+            }
+            Setting::Tilts => {
+                let tl = |t: &ControlTarget| matches!(t, ControlTarget::Tilt { .. });
+                (self.kind == PolarKind::Control && range_on(&tl)) || (self.kind == PolarKind::Stability && gain_on(&tl))
+            }
+            Setting::FuseDrag => self.fuse_drag,
+            Setting::Derivatives => self.derivatives,
+            Setting::FreeWake => self.free_wake > 0,
+        }
+    }
+
+    /// Settings this definition uses that its method does not support.
+    pub fn unsupported(&self) -> Vec<Setting> {
+        Setting::ALL.into_iter().filter(|s| self.uses(*s) && !self.method.supports(self.kind, *s)).collect()
+    }
+
+    /// Reset every setting the method does not support to its default (the
+    /// GUI calls this when the method or polar type changes, so a greyed-out
+    /// option cannot keep a value that would fail validation).
+    pub fn clear_unsupported(&mut self) {
+        let (m, k) = (self.method, self.kind);
+        let ok = |s| m.supports(k, s);
+        if !ok(Setting::Sideslip) {
+            self.beta = 0.0;
+            self.list.iter_mut().for_each(|p| p.1 = 0.0);
+            self.ranges.retain(|r| r.target != ControlTarget::Beta);
+        }
+        if !ok(Setting::GroundEffect) {
+            self.ground_height = None;
+        }
+        if !ok(Setting::Flaps) {
+            self.flaps.clear();
+            self.ranges.retain(|r| !matches!(r.target, ControlTarget::Flap { .. }));
+            self.gains.retain(|g| !matches!(g.0, ControlTarget::Flap { .. }));
+        }
+        if !ok(Setting::Tilts) {
+            self.ranges.retain(|r| !matches!(r.target, ControlTarget::Tilt { .. }));
+            self.gains.retain(|g| !matches!(g.0, ControlTarget::Tilt { .. }));
+        }
+        if !ok(Setting::FuseDrag) {
+            self.fuse_drag = false;
+        }
+        if !ok(Setting::Derivatives) {
+            self.derivatives = false;
+        }
+        if !ok(Setting::FreeWake) {
+            self.free_wake = 0;
+        }
+    }
+
+    /// Check the definition, including every operating point it expands to.
     pub fn validate(&self) -> Result<(), String> {
+        let fin = |name: &str, v: f64| if v.is_finite() { Ok(()) } else { Err(format!("{name} must be a finite number (got {v})")) };
+        fin("speed", self.velocity)?;
+        fin("alpha", self.alpha)?;
+        fin("sideslip", self.beta)?;
+        fin("range start", self.range.from)?;
+        fin("range end", self.range.to)?;
+        fin("range step", self.range.step)?;
+        fin("fluid density", self.fluid.rho)?;
+        fin("fluid viscosity", self.fluid.mu)?;
+        fin("speed of sound", self.fluid.a)?;
+        fin("wake length", self.wake_length)?;
+        fin("wake ratio", self.wake_ratio)?;
+        fin("LLT relaxation", self.llt.relax)?;
+        fin("LLT tolerance", self.llt.tolerance)?;
+        if let RefDims::Custom { area, span, chord } = self.reference {
+            for (n, v) in [("reference area", area), ("reference span", span), ("reference chord", chord)] {
+                fin(n, v)?;
+                if v <= 0.0 {
+                    return Err(format!("{n} must be positive"));
+                }
+            }
+        }
+        if let Some(i) = &self.inertia {
+            for (n, v) in [("mass", i.mass), ("CoG x", i.cog.x), ("CoG y", i.cog.y), ("CoG z", i.cog.z), ("Ixx", i.ixx), ("Iyy", i.iyy), ("Izz", i.izz), ("Ixz", i.ixz)] {
+                fin(n, v)?;
+            }
+            if i.mass < 0.0 {
+                return Err("mass must not be negative".into());
+            }
+        }
+        if let Some(h) = self.ground_height {
+            fin("ground height", h)?;
+        }
+        for e in &self.extra_drag {
+            fin(&format!("extra drag '{}' area", e.name), e.area)?;
+            fin(&format!("extra drag '{}' CD", e.name), e.cd)?;
+        }
+        for (_, v) in &self.flaps {
+            fin("flap deflection", *v)?;
+        }
+        for (_, g) in &self.gains {
+            fin("control gain", *g)?;
+        }
+        for r in &self.ranges {
+            fin("control range minimum", r.min)?;
+            fin("control range maximum", r.max)?;
+        }
         if !(self.fluid.rho > 0.0 && self.fluid.mu > 0.0) {
             return Err("fluid density and viscosity must be positive".into());
         }
-        if matches!(self.kind, PolarKind::FixedSpeed | PolarKind::Sideslip | PolarKind::Control) && !(self.velocity > 0.0) && !self.ranges.iter().any(|r| r.target == ControlTarget::Velocity) {
-            return Err("speed must be positive".into());
+        if !(self.wake_length > 0.0) || self.wake_panels == 0 || !(self.wake_ratio > 0.0) {
+            return Err("wake length, ratio and panel count must be positive".into());
         }
-        if self.kind == PolarKind::FixedAlpha && self.range.values().iter().any(|v| *v <= 0.0) {
-            return Err("speed range of a T4 polar must be positive".into());
+        if let Some(s) = self.unsupported().first() {
+            return Err(if *s == Setting::PolarType {
+                format!("{} does not support {}", self.method.short(), self.kind.label())
+            } else {
+                format!("{} does not support {} in {}", self.method.short(), s.label(), self.kind.label())
+            });
         }
-        if self.kind == PolarKind::List && self.list.is_empty() {
-            return Err("T8 polar needs a list of (alpha, beta, speed)".into());
+        let v_range = self.ranges.iter().find(|r| r.target == ControlTarget::Velocity);
+        match self.kind {
+            PolarKind::FixedSpeed | PolarKind::Sideslip if !(self.velocity > 0.0) => return Err("speed must be positive".into()),
+            PolarKind::Control => match v_range {
+                Some(r) if !(r.min > 0.0 && r.max > 0.0) => return Err(format!("T6 speed range must stay positive (from {} to {} m/s)", r.min, r.max)),
+                None if !(self.velocity > 0.0) => return Err("speed must be positive".into()),
+                _ => {}
+            },
+            PolarKind::FixedAlpha if self.range.values().iter().any(|v| *v <= 0.0) => return Err("speed range of a T4 polar must be positive".into()),
+            PolarKind::List => {
+                if self.list.is_empty() {
+                    return Err("T8 polar needs a list of (alpha, beta, speed)".into());
+                }
+                for (k, &(a, b, v)) in self.list.iter().enumerate() {
+                    if !(a.is_finite() && b.is_finite() && v.is_finite()) {
+                        return Err(format!("T8 point {} has a non-finite value ({a}, {b}, {v})", k + 1));
+                    }
+                    if v <= 0.0 {
+                        return Err(format!("T8 point {} needs a positive speed (got {v} m/s)", k + 1));
+                    }
+                }
+            }
+            _ => {}
         }
-        if self.method == Method::Llt && !matches!(self.kind, PolarKind::FixedSpeed | PolarKind::FixedLift | PolarKind::Glide | PolarKind::FixedAlpha) {
-            return Err("LLT supports polar types 1-4 only; use VLM or panels".into());
-        }
-        if self.wake_length <= 0.0 || self.wake_panels == 0 {
-            return Err("wake length and panel count must be positive".into());
+        if let Some(r) = self.ranges.iter().find(|r| r.target == ControlTarget::Mass) {
+            if r.min < 0.0 || r.max < 0.0 {
+                return Err("T6 mass range must not be negative".into());
+            }
         }
         Ok(())
     }
@@ -779,6 +964,17 @@ pub fn make_system<'a>(def: &PlanePolarDef, mesh: &'a Mesh, cog: Vec3, c_ref: f6
     })
 }
 
+/// Why an operating point is not reportable, if any coefficient is not finite.
+pub fn nonfinite_reason(o: &PlaneOpp) -> Option<String> {
+    let vals = [("alpha", o.alpha), ("V", o.velocity), ("CL", o.cl), ("CD", o.cd), ("CY", o.cy), ("Cm", o.cm), ("Cl", o.cr), ("Cn", o.cn), ("lift", o.lift), ("drag", o.drag)];
+    let bad: Vec<&str> = vals.iter().filter(|(_, v)| !v.is_finite()).map(|(n, _)| *n).collect();
+    if bad.is_empty() {
+        None
+    } else {
+        Some(format!("non-finite {}", bad.join(", ")))
+    }
+}
+
 /// Tolerance on |resultant - weight| / weight for the T3 speed balance.
 pub const GLIDE_TOL: f64 = 1e-4;
 /// Passes of the T3 speed balance before the point is declared unconverged.
@@ -941,6 +1137,9 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
         }
         opp.balance_residual = Some(res);
     }
+    if let Some(why) = nonfinite_reason(&opp) {
+        return Ok(Err(why));
+    }
     if def.derivatives && mass > 0.0 {
         opp.stability = stability::analyse(ctx, sys, cog, alpha, opp.velocity).ok();
     }
@@ -992,6 +1191,12 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
         let raw = sys.loads(wind_dir(a, b) * v, Vec3::ZERO);
         let mut opp = ctx.reduce(&mesh, &raw, inertia.cog, a, b, v, inertia.mass);
         opp.ctrl = t;
+        if let Some(why) = nonfinite_reason(&opp) {
+            sub.set(1.0);
+            prog.count_failed();
+            polar.failed.push(format!("ctrl {t:.3}: {why}"));
+            continue;
+        }
         if def.derivatives && inertia.mass > 0.0 {
             let c2 = Ctx { inertia, ..Ctx::new(ctx.plane, ctx.db, def)? };
             opp.stability = stability::analyse(&c2, &sys, inertia.cog, a, v).ok();
@@ -1035,6 +1240,12 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
                 let raw = sys.loads(wind_dir(alpha, def.beta) * u0, Vec3::ZERO);
                 let mut opp = ctx.reduce(&mesh, &raw, cog, alpha, def.beta, u0, mass);
                 opp.ctrl = t;
+                if let Some(why) = nonfinite_reason(&opp) {
+                    prog.count_failed();
+                    polar.failed.push(format!("ctrl {t:.3}: {why}"));
+                    sub.set(1.0);
+                    continue;
+                }
                 sub.stage(format!("Stability: control {t:.3} - derivatives and modes"));
                 match stability::analyse(ctx, &sys, cog, alpha, u0) {
                     Ok(mut s) => {
