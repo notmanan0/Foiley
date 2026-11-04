@@ -6,6 +6,7 @@
 //! captured.  Planform only: sweep and dihedral are ignored, as in xflr5.
 
 use crate::analysis::{Ctx, PlaneOpp, PolarKind, StripResult, G};
+use crate::foildb::Envelope;
 use crate::geom::Wing;
 use crate::PlaneError;
 use foiley_core::{Progress, Vec3};
@@ -109,11 +110,11 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
         PolarKind::FixedAlpha => def.range.values().into_iter().map(|v| (def.alpha, v)).collect(),
         _ => def.range.values().into_iter().map(|a| (a, def.velocity)).collect(),
     };
-    let interp = |s: &Station, re: f64, a: f64| -> Option<(f64, f64, f64, f64, f64, bool)> {
+    let interp = |s: &Station, re: f64, a: f64| -> Option<(f64, f64, f64, f64, f64, Envelope)> {
         let (pa, oa) = ctx.db.at_re_alpha(&s.foil_a, re, a)?;
         let (pb, ob) = ctx.db.at_re_alpha(&s.foil_b, re, a)?;
         let l = |x: f64, y: f64| x + s.tau * (y - x);
-        Some((l(pa.cl, pb.cl), l(pa.cd, pb.cd), l(pa.cm, pb.cm), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), oa || ob))
+        Some((l(pa.cl, pb.cl), l(pa.cd, pb.cd), l(pa.cm, pb.cm), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), oa.combine(ob)))
     };
     let mut ai = vec![0.0; m];
     let mut out = Vec::new();
@@ -141,7 +142,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
         }
         let mut converged = false;
         let mut cl = vec![0.0; m];
-        let mut extra = vec![(0.0, 0.0, 1.0, 1.0, false); m];
+        let mut extra = vec![(0.0, 0.0, 1.0, 1.0, Envelope::Inside); m];
         let mut ok = true;
         for _it in 0..def.llt.max_iter {
             let mut maxd: f64 = 0.0;
@@ -196,13 +197,11 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
         let mut dv = 0.0;
         let mut my = 0.0;
         let mut strips = Vec::with_capacity(m);
-        let mut n_out = 0;
+        let mut n_env = [0usize; 5];
         for k in 0..m {
             let s = &st[k];
-            let (cd, cm, xt, xb, o) = extra[k];
-            if o {
-                n_out += 1;
-            }
+            let (cd, cm, xt, xb, env) = extra[k];
+            n_env[env as usize] += 1;
             let dy = s.width;
             let lk = q * cl[k] * s.chord * dy;
             let cdi = -cl[k] * ai[k].to_radians();
@@ -227,7 +226,8 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
                 alpha_eff: alpha + s.twist + ai[k],
                 cm_c4: cm,
                 bending: 0.0,
-                out_of_polar: o,
+                out_of_polar: env.is_clamped(),
+                envelope: env as u8,
             });
         }
         strips.reverse();
@@ -253,8 +253,8 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
         let cdi_t = di / qs;
         let cdv_t = d_extra / qs;
         let mut warnings = vec!["LLT: main wing only; sweep and dihedral ignored".to_string()];
-        if n_out > 0 {
-            warnings.push(format!("{n_out} station(s) outside the 2D polar envelope"));
+        if let Some(w) = crate::analysis::envelope_warning(&n_env, "station") {
+            warnings.push(w);
         }
         let opp = PlaneOpp {
             alpha,
@@ -285,7 +285,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             balance_residual: None,
             diagnostics: None,
         };
-        if let Some(why) = crate::analysis::nonfinite_reason(&opp) {
+        if let Some(why) = crate::analysis::nonfinite_reason(&opp).or_else(|| crate::analysis::envelope_failure(def, &opp)) {
             prog.count_failed();
             failed.push(format!("alpha={alpha:.2} V={v:.2}: LLT {why}"));
             ai.iter_mut().for_each(|a| *a = 0.0);

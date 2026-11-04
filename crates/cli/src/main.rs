@@ -453,6 +453,9 @@ enum PlaneCmd {
         /// stability derivatives and modes for every point (needs mass)
         #[arg(long)]
         derivatives: bool,
+        /// fail points whose viscous drag is clamped to the 2D polar envelope
+        #[arg(long)]
+        strict_envelope: bool,
         /// flap preset "wing,flap,deg" (repeatable)
         #[arg(long = "flap", allow_hyphen_values = true)]
         flaps: Vec<String>,
@@ -625,12 +628,12 @@ fn plane_polar_table(p: &PlanePolar) -> String {
 }
 
 fn strips_csv(p: &PlanePolar) -> String {
-    let mut s = String::from("alpha,V,ctrl,wing,span_pos,chord,Cl,Cdi,Cdv,ai_deg,Re,Xtr_top,Xtr_bot,gamma,lift_per_span,bending,out_of_polar\n");
+    let mut s = String::from("alpha,V,ctrl,wing,span_pos,chord,Cl,Cdi,Cdv,ai_deg,Re,Xtr_top,Xtr_bot,gamma,lift_per_span,bending,out_of_polar,envelope\n");
     for o in &p.points {
         for r in &o.strips {
             s.push_str(&format!(
-                "{:.3},{:.3},{:.3},{},{:.5},{:.5},{:.5},{:.6},{:.6},{:.4},{:.0},{:.4},{:.4},{:.5},{:.4},{:.4},{}\n",
-                o.alpha, o.velocity, o.ctrl, r.wing, r.span_pos, r.chord, r.cl, r.cdi, r.cdv, r.ai, r.re, r.xtr_top, r.xtr_bot, r.gamma, r.lift_per_span, r.bending, r.out_of_polar
+                "{:.3},{:.3},{:.3},{},{:.5},{:.5},{:.5},{:.6},{:.6},{:.4},{:.0},{:.4},{:.4},{:.5},{:.4},{:.4},{},{}\n",
+                o.alpha, o.velocity, o.ctrl, r.wing, r.span_pos, r.chord, r.cl, r.cdi, r.cdv, r.ai, r.re, r.xtr_top, r.xtr_bot, r.gamma, r.lift_per_span, r.bending, r.out_of_polar, foiley_plane::foildb::Envelope::from_u8(r.envelope).label()
             ));
         }
     }
@@ -1140,7 +1143,7 @@ fn real_main() -> Result<(), String> {
                 proj.save(&save)?;
                 eprintln!("  saved {}", save.display());
             }
-            PlaneCmd::Analyze { src, ptype, method, free_wake, response, response_amp, response_time, response_out, range, speed, alpha, beta, list, inviscid, altitude, water, mass, cog, ground, derivatives, flaps, gains, reference, auto_polars, llt_stations, strips, save, out } => {
+            PlaneCmd::Analyze { src, ptype, method, free_wake, response, response_amp, response_time, response_out, range, speed, alpha, beta, list, inviscid, altitude, water, mass, cog, ground, derivatives, strict_envelope, flaps, gains, reference, auto_polars, llt_stations, strips, save, out } => {
                 let (mut proj, plane) = load_plane(&src)?;
                 let kind = match ptype.to_lowercase().trim_start_matches('t') {
                     "1" => PolarKind::FixedSpeed,
@@ -1167,6 +1170,7 @@ fn real_main() -> Result<(), String> {
                 let mut def = PlanePolarDef { kind, method, velocity: speed, alpha, beta, range: Range { from: a, to: b, step: s }, viscous: !inviscid, fluid, ground_height: ground, derivatives, ..Default::default() };
                 def.llt.stations = llt_stations;
                 def.free_wake = free_wake;
+                def.strict_envelope = strict_envelope;
                 if kind == PolarKind::Stability && a == -4.0 && b == 10.0 {
                     def.range = Range { from: 0.0, to: 0.0, step: 1.0 };
                 }

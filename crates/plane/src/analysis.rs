@@ -1,7 +1,7 @@
 //! 3D polars: definitions (types 1-8), the drivers, and the reduction of
 //! raw loads to coefficients and span distributions.
 
-use crate::foildb::FoilDb;
+use crate::foildb::{Envelope, FoilDb};
 use crate::geom::{Inertia, Plane};
 use crate::linear_panel::LinearPanelSystem;
 use crate::mesh::{build, Mesh, MeshOptions};
@@ -325,6 +325,9 @@ pub struct PlanePolarDef {
     pub diagnostics: Diagnostics,
     /// treat foils without loaded geometry as flat plates
     pub allow_missing_foils: bool,
+    /// fail a point if any strip's viscous interpolation is clamped to the
+    /// 2D polar envelope (or has no polar), instead of warning
+    pub strict_envelope: bool,
 }
 
 impl Default for PlanePolarDef {
@@ -358,6 +361,7 @@ impl Default for PlanePolarDef {
             keep_cp: true,
             keep_strips: true,
             allow_missing_foils: false,
+            strict_envelope: false,
             free_wake: 0,
             diagnostics: Diagnostics::Off,
         }
@@ -625,8 +629,11 @@ pub struct StripResult {
     pub cm_c4: f64,
     /// bending moment at this station from the outboard loads, N.m
     pub bending: f64,
-    /// viscous interpolation outside the 2D polar envelope
+    /// viscous interpolation outside the 2D polar envelope (clamped)
     pub out_of_polar: bool,
+    /// `foildb::Envelope` of the viscous interpolation, as a u8
+    #[serde(default)]
+    pub envelope: u8,
 }
 
 /// One 3D operating point.
@@ -871,12 +878,12 @@ impl<'a> Ctx<'a> {
 
     /// Viscous drag, transition and section Cm for a strip: interpolated
     /// between the strip's two end foils.  Returns None if no polar exists.
-    pub fn strip_viscous(&self, foil_a: &str, foil_b: &str, tau: f64, re: f64, cl: f64, alpha_eff: f64) -> Option<(f64, f64, f64, f64, bool)> {
+    pub fn strip_viscous(&self, foil_a: &str, foil_b: &str, tau: f64, re: f64, cl: f64, alpha_eff: f64) -> Option<(f64, f64, f64, f64, Envelope)> {
         let get = |f: &str| if self.def.viscous_from_cl { self.db.at_re_cl(f, re, cl) } else { self.db.at_re_alpha(f, re, alpha_eff) };
         let (pa, oa) = get(foil_a)?;
         let (pb, ob) = if foil_b == foil_a { (pa, oa) } else { get(foil_b)? };
         let l = |x: f64, y: f64| x + tau * (y - x);
-        Some((l(pa.cd, pb.cd), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), l(pa.cm, pb.cm), oa || ob))
+        Some((l(pa.cd, pb.cd), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), l(pa.cm, pb.cm), oa.combine(ob)))
     }
 
     /// Reduce raw loads to an operating point.
@@ -891,7 +898,7 @@ impl<'a> Ctx<'a> {
         let mut f_visc = Vec3::ZERO;
         let mut m_visc = Vec3::ZERO;
         let mut missing_polars: Vec<String> = Vec::new();
-        let mut n_out = 0;
+        let mut n_env = [0usize; 5];
         for (i, s) in mesh.strips.iter().enumerate() {
             let f = raw.strip_force[i] * rho;
             let area = s.area.max(1e-30);
@@ -921,20 +928,21 @@ impl<'a> Ctx<'a> {
             };
             if self.def.viscous {
                 match self.strip_viscous(&s.foil_a, &s.foil_b, s.tau, re, cl, alpha_eff) {
-                    Some((cd, xt, xb, cm, out)) => {
+                    Some((cd, xt, xb, cm, env)) => {
                         sr.cdv = cd;
                         sr.xtr_top = xt;
                         sr.xtr_bot = xb;
                         sr.cm_c4 = cm;
-                        sr.out_of_polar = out;
-                        if out {
-                            n_out += 1;
-                        }
+                        sr.out_of_polar = env.is_clamped();
+                        sr.envelope = env as u8;
+                        n_env[env as usize] += 1;
                         let dfv = wd * (q * area * cd);
                         f_visc += dfv;
                         m_visc += (s.c4 - cog).cross(dfv);
                     }
                     None => {
+                        sr.envelope = Envelope::Missing as u8;
+                        n_env[Envelope::Missing as usize] += 1;
                         for f in [&s.foil_a, &s.foil_b] {
                             if !missing_polars.contains(f) {
                                 missing_polars.push(f.clone());
@@ -948,8 +956,8 @@ impl<'a> Ctx<'a> {
         if !missing_polars.is_empty() {
             warnings.push(format!("no 2D polars for foil(s) {}: viscous drag not counted for those strips", missing_polars.join(", ")));
         }
-        if n_out > 0 {
-            warnings.push(format!("{n_out} strip(s) outside the 2D polar envelope (Re or CL out of range): viscous drag extrapolated"));
+        if let Some(w) = envelope_warning(&n_env, "strip") {
+            warnings.push(w);
         }
         // bending moments (per wing, from the tip inwards, about the strip centre)
         for w in &mesh.wings {
@@ -1054,6 +1062,34 @@ pub fn make_system<'a>(def: &PlanePolarDef, mesh: &'a Mesh, cog: Vec3, c_ref: f6
         Method::TriLinear => System::TriLinear(LinearPanelSystem::build_with(mesh, cog, def.wake_length * c_ref, def.wake_panels, def.wake_ratio, def.ground_height, prog, def.diagnostics)?),
         Method::Llt => return Err(PlaneError::Input("LLT has no panel system".into())),
     })
+}
+
+/// "viscous drag clamped to the 2D polar envelope on N strip(s): a in Re,
+/// b in CL, c in both", or None when nothing was clamped.
+pub fn envelope_warning(counts: &[usize; 5], what: &str) -> Option<String> {
+    let n: usize = counts[1..4].iter().sum();
+    if n == 0 {
+        return None;
+    }
+    let parts: Vec<String> = [(1, "in Re"), (2, "in CL"), (3, "in both")].iter().filter(|(k, _)| counts[*k] > 0).map(|(k, l)| format!("{} {l}", counts[*k])).collect();
+    Some(format!("viscous drag clamped to the 2D polar envelope on {n} {what}(s): {}", parts.join(", ")))
+}
+
+/// With `strict_envelope`, why a point fails (any clamped or polar-less strip).
+pub fn envelope_failure(def: &PlanePolarDef, o: &PlaneOpp) -> Option<String> {
+    if !def.strict_envelope || !def.viscous {
+        return None;
+    }
+    let mut counts = [0usize; 5];
+    for s in &o.strips {
+        counts[(s.envelope as usize).min(4)] += 1;
+    }
+    let bad: usize = counts[1..].iter().sum();
+    if bad == 0 {
+        return None;
+    }
+    let parts: Vec<String> = Envelope::KINDS[1..].iter().filter(|e| counts[**e as usize] > 0).map(|e| format!("{} {}", counts[*e as usize], e.label())).collect();
+    Some(format!("strict envelope: {bad} strip(s) outside the 2D polars ({})", parts.join(", ")))
 }
 
 /// Run the stability analysis for a point, recording a failure on the point
@@ -1256,7 +1292,7 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
         }
         opp.balance_residual = Some(res);
     }
-    if let Some(why) = nonfinite_reason(&opp) {
+    if let Some(why) = nonfinite_reason(&opp).or_else(|| envelope_failure(def, &opp)) {
         return Ok(Err(why));
     }
     if def.derivatives {
@@ -1318,7 +1354,7 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
             opp.diagnostics = Some(sys.point_diagnostics(&raw, wind_dir(a, b) * v, Vec3::ZERO, ctx.s_ref, false));
         }
         opp.ctrl = t;
-        if let Some(why) = nonfinite_reason(&opp) {
+        if let Some(why) = nonfinite_reason(&opp).or_else(|| envelope_failure(def, &opp)) {
             sub.set(1.0);
             prog.count_failed();
             polar.failed.push(format!("ctrl {t:.3}: {why}"));
@@ -1374,7 +1410,7 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
                     opp.diagnostics = Some(sys.point_diagnostics(&raw, wind_dir(alpha, def.beta) * u0, Vec3::ZERO, ctx.s_ref, false));
                 }
                 opp.ctrl = t;
-                if let Some(why) = nonfinite_reason(&opp) {
+                if let Some(why) = nonfinite_reason(&opp).or_else(|| envelope_failure(def, &opp)) {
                     prog.count_failed();
                     polar.failed.push(format!("ctrl {t:.3}: {why}"));
                     sub.set(1.0);

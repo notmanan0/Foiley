@@ -45,6 +45,63 @@ impl FoilShape {
     }
 }
 
+/// Where a viscous interpolation landed relative to the 2D polar data.
+/// Stored per strip as a `u8` (`StripResult.envelope`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Envelope {
+    #[default]
+    Inside = 0,
+    /// Reynolds number outside the polars' range (clamped to the nearest)
+    ClampedRe = 1,
+    /// CL (or angle of attack, when interpolating by angle) outside a polar
+    ClampedCl = 2,
+    ClampedBoth = 3,
+    /// no usable polar for the foil
+    Missing = 4,
+}
+
+impl Envelope {
+    pub const KINDS: [Envelope; 5] = [Envelope::Inside, Envelope::ClampedRe, Envelope::ClampedCl, Envelope::ClampedBoth, Envelope::Missing];
+    pub fn from_flags(re: bool, cl: bool) -> Envelope {
+        match (re, cl) {
+            (false, false) => Envelope::Inside,
+            (true, false) => Envelope::ClampedRe,
+            (false, true) => Envelope::ClampedCl,
+            (true, true) => Envelope::ClampedBoth,
+        }
+    }
+    pub fn from_u8(v: u8) -> Envelope {
+        Envelope::KINDS.get(v as usize).copied().unwrap_or(Envelope::Missing)
+    }
+    pub fn re_clamped(self) -> bool {
+        matches!(self, Envelope::ClampedRe | Envelope::ClampedBoth)
+    }
+    pub fn cl_clamped(self) -> bool {
+        matches!(self, Envelope::ClampedCl | Envelope::ClampedBoth)
+    }
+    pub fn is_clamped(self) -> bool {
+        self.re_clamped() || self.cl_clamped()
+    }
+    /// The worse of two (Missing dominates, clamp flags add up).
+    pub fn combine(self, o: Envelope) -> Envelope {
+        if self == Envelope::Missing || o == Envelope::Missing {
+            Envelope::Missing
+        } else {
+            Envelope::from_flags(self.re_clamped() || o.re_clamped(), self.cl_clamped() || o.cl_clamped())
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Envelope::Inside => "inside",
+            Envelope::ClampedRe => "clamped in Re",
+            Envelope::ClampedCl => "clamped in CL",
+            Envelope::ClampedBoth => "clamped in Re and CL",
+            Envelope::Missing => "no polar",
+        }
+    }
+}
+
 /// The set of foils and 2D polars known to an analysis.
 #[derive(Clone, Debug, Default)]
 pub struct FoilDb {
@@ -91,36 +148,37 @@ impl FoilDb {
     }
 
     /// Interpolate a 2D point at (Re, CL) for one foil: linear in Re
-    /// between the bracketing polars.  Returns (point, out_of_envelope).
-    pub fn at_re_cl(&self, foil: &str, re: f64, cl: f64) -> Option<(FoilPoint, bool)> {
+    /// between the bracketing polars.  Returns the point and where it fell
+    /// relative to the data (never `Missing`: that is `None`).
+    pub fn at_re_cl(&self, foil: &str, re: f64, cl: f64) -> Option<(FoilPoint, Envelope)> {
         self.interp_re(foil, re, |p| p.at_cl(cl))
     }
 
     /// Interpolate at (Re, alpha).
-    pub fn at_re_alpha(&self, foil: &str, re: f64, alpha: f64) -> Option<(FoilPoint, bool)> {
+    pub fn at_re_alpha(&self, foil: &str, re: f64, alpha: f64) -> Option<(FoilPoint, Envelope)> {
         self.interp_re(foil, re, |p| p.at_alpha(alpha))
     }
 
-    fn interp_re(&self, foil: &str, re: f64, f: impl Fn(&FoilPolar) -> Option<(FoilPoint, bool)>) -> Option<(FoilPoint, bool)> {
+    fn interp_re(&self, foil: &str, re: f64, f: impl Fn(&FoilPolar) -> Option<(FoilPoint, bool)>) -> Option<(FoilPoint, Envelope)> {
         let v = self.t1(foil);
         if v.is_empty() {
             return None;
         }
         if re <= v[0].re {
             let (p, o) = f(v[0])?;
-            return Some((p, o || re < v[0].re * 0.98));
+            return Some((p, Envelope::from_flags(re < v[0].re * 0.98, o)));
         }
         let last = v[v.len() - 1];
         if re >= last.re {
             let (p, o) = f(last)?;
-            return Some((p, o || re > last.re * 1.02));
+            return Some((p, Envelope::from_flags(re > last.re * 1.02, o)));
         }
         let j = v.partition_point(|p| p.re < re);
         let (a, b) = (v[j - 1], v[j]);
         let (pa, oa) = f(a)?;
         let (pb, ob) = f(b)?;
         let t = (re - a.re) / (b.re - a.re);
-        Some((foiley_foil::polar::lerp_point(&pa, &pb, t), oa || ob))
+        Some((foiley_foil::polar::lerp_point(&pa, &pb, t), Envelope::from_flags(false, oa || ob)))
     }
 
     /// Linearised lift: (zero-lift angle deg, slope per degree) at a Re.
