@@ -577,8 +577,8 @@ fn plane_polar_table(p: &PlanePolar) -> String {
     t.push_str("  alpha   beta      V    ctrl       CL        CD      CDi      CDv        Cm        Cn    L/D     Vz\n");
     for o in &p.points {
         t.push_str(&format!(
-            "{:7.2} {:6.2} {:6.2} {:7.3} {:8.4} {:9.5} {:8.5} {:8.5} {:9.5} {:9.5} {:6.2} {:6.3}\n",
-            o.alpha, o.beta, o.velocity, o.ctrl, o.cl, o.cd, o.cdi, o.cdv, o.cm, o.cn, o.ld(), o.vz()
+            "{:7.2} {:6.2} {:6.2} {:7.3} {:8.4} {:9.5} {:8.5} {:8.5} {:9.5} {:>9} {:6.2} {:6.3}\n",
+            o.alpha, o.beta, o.velocity, o.ctrl, o.cl, o.cd, o.cdi, o.cdv, o.cm, o.cn.map(|v| format!("{v:.5}")).unwrap_or_else(|| "-".into()), o.ld(), o.vz()
         ));
     }
     for o in &p.points {

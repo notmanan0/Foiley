@@ -60,11 +60,14 @@ impl Method {
     pub fn supports(self, kind: PolarKind, setting: Setting) -> bool {
         use PolarKind::*;
         let vlm = matches!(self, Method::Vlm1 | Method::Vlm2);
+        let llt = self == Method::Llt;
         match setting {
-            Setting::PolarType => self != Method::Llt || matches!(kind, FixedSpeed | FixedLift | Glide | FixedAlpha),
+            Setting::PolarType => !llt || matches!(kind, FixedSpeed | FixedLift | Glide | FixedAlpha),
             // the control and stability drivers solve with the rigid wake
             Setting::FreeWake => vlm && !matches!(kind, Control | Stability),
-            Setting::Sideslip | Setting::GroundEffect | Setting::Flaps | Setting::Tilts | Setting::FuseDrag | Setting::Derivatives => true,
+            // the lifting line is a symmetric main-wing model in free air:
+            // no sideslip, ground, control surfaces, fuselage or derivatives
+            Setting::Sideslip | Setting::GroundEffect | Setting::Flaps | Setting::Tilts | Setting::FuseDrag | Setting::Derivatives => !llt,
         }
     }
     pub fn short(self) -> &'static str {
@@ -637,12 +640,13 @@ pub struct PlaneOpp {
     pub cd: f64,
     pub cdi: f64,
     pub cdv: f64,
-    pub cy: f64,
+    /// side-force coefficient; None when the method has no lateral model (LLT)
+    pub cy: Option<f64>,
     pub cm: f64,
-    /// rolling moment coefficient
-    pub cr: f64,
-    /// yawing moment coefficient
-    pub cn: f64,
+    /// rolling moment coefficient; None when the method has no lateral model
+    pub cr: Option<f64>,
+    /// yawing moment coefficient; None when the method has no lateral model
+    pub cn: Option<f64>,
     pub lift: f64,
     pub drag: f64,
     pub x_cp: f64,
@@ -739,12 +743,17 @@ impl PlanePolar {
         let mut s = String::from("alpha,beta,V,ctrl,CL,CD,CDi,CDv,CY,Cm,Cl_roll,Cn,L/D,Lift_N,Drag_N,Xcp,efficiency,Vz,root_bending\n");
         for p in &self.points {
             s.push_str(&format!(
-                "{:.3},{:.3},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.4},{:.4},{:.5},{:.5},{:.4},{:.5},{:.4}\n",
-                p.alpha, p.beta, p.velocity, p.ctrl, p.cl, p.cd, p.cdi, p.cdv, p.cy, p.cm, p.cr, p.cn, p.ld(), p.lift, p.drag, p.x_cp, p.efficiency, p.vz(), p.root_bending
+                "{:.3},{:.3},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{},{:.6},{},{},{:.4},{:.4},{:.5},{:.5},{:.4},{:.5},{:.4}\n",
+                p.alpha, p.beta, p.velocity, p.ctrl, p.cl, p.cd, p.cdi, p.cdv, opt6(p.cy), p.cm, opt6(p.cr), opt6(p.cn), p.ld(), p.lift, p.drag, p.x_cp, p.efficiency, p.vz(), p.root_bending
             ));
         }
         s
     }
+}
+
+/// A CSV field for an optional coefficient (empty when absent).
+fn opt6(v: Option<f64>) -> String {
+    v.map(|v| format!("{v:.6}")).unwrap_or_default()
 }
 
 /// Air-relative velocity direction for alpha, beta (degrees);
@@ -1005,10 +1014,10 @@ impl<'a> Ctx<'a> {
             cd,
             cdi,
             cdv,
-            cy,
+            cy: Some(cy),
             cm,
-            cr,
-            cn,
+            cr: Some(cr),
+            cn: Some(cn),
             lift,
             drag: cd * qs,
             x_cp,
@@ -1069,7 +1078,7 @@ fn stability_needs_mass(opp: &mut PlaneOpp) {
 
 /// Why an operating point is not reportable, if any coefficient is not finite.
 pub fn nonfinite_reason(o: &PlaneOpp) -> Option<String> {
-    let vals = [("alpha", o.alpha), ("V", o.velocity), ("CL", o.cl), ("CD", o.cd), ("CY", o.cy), ("Cm", o.cm), ("Cl", o.cr), ("Cn", o.cn), ("lift", o.lift), ("drag", o.drag)];
+    let vals = [("alpha", o.alpha), ("V", o.velocity), ("CL", o.cl), ("CD", o.cd), ("CY", o.cy.unwrap_or(0.0)), ("Cm", o.cm), ("Cl", o.cr.unwrap_or(0.0)), ("Cn", o.cn.unwrap_or(0.0)), ("lift", o.lift), ("drag", o.drag)];
     let bad: Vec<&str> = vals.iter().filter(|(_, v)| !v.is_finite()).map(|(n, _)| *n).collect();
     if bad.is_empty() {
         None
