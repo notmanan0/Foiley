@@ -69,7 +69,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [ ] **F004b** · GUI editing of every body — after F004a, F024
 - [ ] **F010b** · `.xfl`/`.fl5` import and conversion report
 - [ ] **F015b** · Raw-bit corpus and configuration matrix — after F015a
-- [ ] **F005b** · Coupled 8×8 stability and nonzero beta (+F006) — after F005a
+- [x] **F005b** · Coupled 8×8 stability and nonzero beta (+F006) — after F005a
 - [ ] **F022a** · STEP parse, topology, analytic surfaces, seams
 - [ ] **F022b** · B-spline surfaces and curves — after F022a
 - [ ] **F022c** · Watertight tessellation — after F022a

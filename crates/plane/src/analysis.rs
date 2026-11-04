@@ -1389,7 +1389,7 @@ fn solve_point(ctx: &Ctx, ev: &Evaluator, cog: Vec3, mass: f64, alpha: f64, beta
     }
     if def.derivatives {
         if mass > 0.0 {
-            let res = stability::analyse(ctx, ev, cog, alpha, opp.velocity, prog);
+            let res = stability::analyse(ctx, ev, cog, alpha, beta, opp.velocity, prog);
             attach_stability(&mut opp, res)?;
         } else {
             stability_needs_mass(&mut opp);
@@ -1454,7 +1454,7 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
         if def.derivatives {
             if inertia.mass > 0.0 {
                 let c2 = Ctx { inertia, ..Ctx::new(ctx.plane, ctx.db, def)? };
-                attach_stability(&mut opp, stability::analyse(&c2, &ev, cog, a, v, &sub))?;
+                attach_stability(&mut opp, stability::analyse(&c2, &ev, cog, a, b, v, &sub))?;
             } else {
                 stability_needs_mass(&mut opp);
             }
@@ -1510,7 +1510,7 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
                     continue;
                 }
                 sub.stage(format!("Stability: control {t:.3} - derivatives and modes"));
-                match stability::analyse(ctx, &ev, cog, alpha, u0, &sub) {
+                match stability::analyse(ctx, &ev, cog, alpha, def.beta, u0, &sub) {
                     Ok(mut s) => {
                         // control derivatives: rebuild with the control parameter nudged
                         let gmax = def.gains.iter().map(|g| g.1.abs()).fold(0.0, f64::max);
