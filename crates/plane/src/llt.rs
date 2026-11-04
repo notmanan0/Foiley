@@ -6,7 +6,7 @@
 //! captured.  Planform only: sweep and dihedral are ignored, as in xflr5.
 
 use crate::analysis::{Ctx, PlaneOpp, PolarKind, StripResult, G};
-use crate::foildb::Envelope;
+use crate::foildb::{Envelope, FamilyId};
 use crate::geom::Wing;
 use crate::PlaneError;
 use foiley_core::{Progress, Vec3};
@@ -20,6 +20,9 @@ struct Station {
     twist: f64,
     foil_a: String,
     foil_b: String,
+    /// polar families of the two end foils (resolved by `Ctx::new`)
+    fam_a: Option<FamilyId>,
+    fam_b: Option<FamilyId>,
     tau: f64,
     width: f64,
 }
@@ -59,6 +62,8 @@ fn stations(w: &Wing, n: usize) -> Vec<Station> {
             twist,
             foil_a: w.foil(i, left).to_string(),
             foil_b: w.foil(i + 1, left).to_string(),
+            fam_a: None,
+            fam_b: None,
             tau: t,
             width: w_th,
         });
@@ -71,18 +76,20 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
     let def = ctx.def;
     let wing = ctx.plane.main_wing().ok_or_else(|| PlaneError::Geometry("no main wing".into()))?;
     let n = def.llt.stations.clamp(8, 400);
-    let st = stations(wing, n);
+    let mut st = stations(wing, n);
     let b = wing.planform_span();
     let s_w = wing.planform_area();
     if b <= 0.0 || s_w <= 0.0 {
         return Err(PlaneError::Geometry("main wing has zero span or area".into()));
     }
-    for s in &st {
+    for s in &mut st {
         for f in [&s.foil_a, &s.foil_b] {
-            if ctx.db.re_range(f).is_none() {
+            if ctx.family_of(f).is_none() {
                 return Err(PlaneError::Input(format!("LLT needs type-1 viscous 2D polars for foil '{f}' (run a batch polar mesh first)")));
             }
         }
+        s.fam_a = ctx.family_of(&s.foil_a);
+        s.fam_b = ctx.family_of(&s.foil_b);
     }
     let m = st.len();
     let theta: Vec<f64> = (1..n).map(|k| k as f64 * PI / n as f64).collect();
@@ -111,8 +118,8 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
         _ => def.range.values().into_iter().map(|a| (a, def.velocity)).collect(),
     };
     let interp = |s: &Station, re: f64, a: f64| -> Option<(f64, f64, f64, f64, f64, Envelope)> {
-        let (pa, oa) = ctx.db.at_re_alpha(&s.foil_a, re, a)?;
-        let (pb, ob) = ctx.db.at_re_alpha(&s.foil_b, re, a)?;
+        let (pa, oa) = ctx.db.at_re_alpha(s.fam_a?, re, a)?;
+        let (pb, ob) = ctx.db.at_re_alpha(s.fam_b?, re, a)?;
         let l = |x: f64, y: f64| x + s.tau * (y - x);
         Some((l(pa.cl, pb.cl), l(pa.cd, pb.cd), l(pa.cm, pb.cm), l(pa.xtr_top, pb.xtr_top), l(pa.xtr_bot, pb.xtr_bot), oa.combine(ob)))
     };
@@ -124,7 +131,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
     let omega: Vec<f64> = (0..m)
         .map(|k| {
             let re = def.velocity.max(1.0) * st[k].chord / nu;
-            let slope = ctx.db.linear_lift(&st[k].foil_a, re).map(|v| v.1).unwrap_or(0.1).clamp(0.02, 0.2);
+            let slope = st[k].fam_a.and_then(|f| ctx.db.linear_lift(f, re)).map(|v| v.1).unwrap_or(0.1).clamp(0.02, 0.2);
             let lam = beta[k][k] * st[k].chord / b * slope;
             1.0 / (def.llt.relax.max(1.0) * (1.0 + lam))
         })

@@ -39,7 +39,7 @@ pub fn reynolds_range(plane: &Plane, db: &FoilDb, def: &PlanePolarDef) -> (f64, 
 /// Foils of the plane that have no type-1 viscous polars yet.
 pub fn foils_needing_polars<'a>(plane: &Plane, foils: &'a [Foil], db: &FoilDb) -> Vec<&'a Foil> {
     let names = plane.foil_names();
-    foils.iter().filter(|f| names.contains(&f.name) && db.re_range(&f.name).is_none()).collect()
+    foils.iter().filter(|f| names.contains(&f.name) && !db.has_polars(&f.name)).collect()
 }
 
 /// Cases and sweep for an automatic polar mesh.

@@ -21,6 +21,7 @@ faer = { version = "0.24", default-features = false, features = ["std", "rayon"]
 crossbeam-channel = "0.5"
 clap = { version = "4.6", features = ["derive"] }
 quick-xml = "0.42"
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
 mimalloc = { version = "0.1.52", default-features = false }
 
 [package]
