@@ -2,7 +2,7 @@
 //! evaluation, first derivatives, periodicity, singular (pole) lines, and
 //! point inversion (closest parameter) by Newton from a seed.
 
-use super::NurbsSurface;
+use super::{NurbsCurve, NurbsSurface};
 use foiley_core::Vec3;
 use std::f64::consts::{FRAC_PI_2, TAU};
 
@@ -93,6 +93,7 @@ pub enum Curve {
     Ellipse { f: Frame, a: f64, b: f64 },
     /// piecewise linear through the points, t in [0, n - 1]
     Polyline(Vec<Vec3>),
+    BSpline(NurbsCurve),
 }
 
 impl Curve {
@@ -102,6 +103,7 @@ impl Curve {
             Curve::Circle { .. } => "CIRCLE",
             Curve::Ellipse { .. } => "ELLIPSE",
             Curve::Polyline(_) => "POLYLINE",
+            Curve::BSpline(_) => "B_SPLINE_CURVE",
         }
     }
     pub fn eval(&self, t: f64) -> Vec3 {
@@ -124,6 +126,7 @@ impl Curve {
                 let i = (t.floor() as usize).min(n - 2);
                 p[i].lerp(p[i + 1], t - i as f64)
             }
+            Curve::BSpline(c) => c.eval(t),
         }
     }
     pub fn deriv(&self, t: f64) -> Vec3 {
@@ -145,6 +148,7 @@ impl Curve {
                 let i = (t.clamp(0.0, (n - 1) as f64).floor() as usize).min(n - 2);
                 p[i + 1] - p[i]
             }
+            Curve::BSpline(c) => c.eval_deriv(t).1,
         }
     }
     /// Parameter period of a closed periodic curve.
@@ -158,6 +162,7 @@ impl Curve {
     pub fn range(&self) -> Option<(f64, f64)> {
         match self {
             Curve::Polyline(p) => Some((0.0, p.len().saturating_sub(1) as f64)),
+            Curve::BSpline(c) => Some(c.domain()),
             _ => None,
         }
     }
@@ -165,6 +170,7 @@ impl Curve {
     pub fn pieces(&self) -> usize {
         match self {
             Curve::Polyline(p) => p.len().saturating_sub(1).max(1),
+            Curve::BSpline(c) => c.spans(),
             _ => 1,
         }
     }
@@ -209,6 +215,24 @@ impl Curve {
                 }
                 best.1
             }
+            Curve::BSpline(c) => {
+                let (a, b) = c.domain();
+                let mut t = min1d(|t| (c.eval(t) - p).norm2(), a, b, 8 * c.spans());
+                for _ in 0..30 {
+                    let (q, d) = c.eval_deriv(t);
+                    let step = (q - p).dot(d) / d.norm2().max(1e-300);
+                    let nt = (t - step).clamp(a, b);
+                    if (c.eval(nt) - p).norm2() > (q - p).norm2() {
+                        break;
+                    }
+                    let done = (nt - t).abs() <= 1e-15 * (1.0 + t.abs());
+                    t = nt;
+                    if done {
+                        break;
+                    }
+                }
+                t
+            }
         }
     }
     /// Minimise `f(t)` over the curve parameter: sampled over the period or
@@ -249,7 +273,9 @@ pub enum Surface {
     Revolution { curve: Box<Curve>, o: Vec3, a: Vec3 },
     /// S = C(u) + v d
     Extrusion { curve: Box<Curve>, d: Vec3 },
-    BSpline(NurbsSurface),
+    /// `closed[k]`: the surface closes on itself in that parameter (first
+    /// and last control rows coincide), which is then treated as periodic
+    BSpline { s: NurbsSurface, closed: [bool; 2] },
 }
 
 impl Surface {
@@ -262,7 +288,7 @@ impl Surface {
             Surface::Torus { .. } => "TOROIDAL_SURFACE",
             Surface::Revolution { .. } => "SURFACE_OF_REVOLUTION",
             Surface::Extrusion { .. } => "SURFACE_OF_LINEAR_EXTRUSION",
-            Surface::BSpline(_) => "B_SPLINE_SURFACE",
+            Surface::BSpline { .. } => "B_SPLINE_SURFACE",
         }
     }
 
@@ -289,7 +315,10 @@ impl Surface {
             }
             Surface::Revolution { curve, o, a } => *o + rotate(curve.eval(v) - *o, *a, u),
             Surface::Extrusion { curve, d } => curve.eval(u) + *d * v,
-            Surface::BSpline(s) => s.eval(u, v),
+            Surface::BSpline { s, closed } => {
+                let (u, v) = Self::wrap_closed(s, closed, u, v);
+                s.eval(u, v)
+            }
         }
     }
 
@@ -323,14 +352,9 @@ impl Surface {
                 (p, a.cross(p - *o), rotate(curve.deriv(v), *a, u))
             }
             Surface::Extrusion { curve, d } => (self.eval(u, v), curve.deriv(u), *d),
-            Surface::BSpline(s) => {
-                let ((u0, u1), (v0, v1)) = s.domain();
-                let (hu, hv) = (1e-6 * (u1 - u0).max(1e-300), 1e-6 * (v1 - v0).max(1e-300));
-                let (ua, ub) = ((u - hu).max(u0), (u + hu).min(u1));
-                let (va, vb) = ((v - hv).max(v0), (v + hv).min(v1));
-                let su = (s.eval(ub, v) - s.eval(ua, v)) / (ub - ua).max(1e-300);
-                let sv = (s.eval(u, vb) - s.eval(u, va)) / (vb - va).max(1e-300);
-                (s.eval(u, v), su, sv)
+            Surface::BSpline { s, closed } => {
+                let (u, v) = Self::wrap_closed(s, closed, u, v);
+                s.eval_derivs(u, v)
             }
         }
     }
@@ -338,7 +362,11 @@ impl Surface {
     /// Parameter periods (u, v).
     pub fn periods(&self) -> [Option<f64>; 2] {
         match self {
-            Surface::Plane(_) | Surface::BSpline(_) => [None, None],
+            Surface::Plane(_) => [None, None],
+            Surface::BSpline { s, closed } => {
+                let ((u0, u1), (v0, v1)) = s.domain();
+                [closed[0].then_some(u1 - u0), closed[1].then_some(v1 - v0)]
+            }
             Surface::Cylinder { .. } | Surface::Cone { .. } | Surface::Sphere { .. } => [Some(TAU), None],
             Surface::Torus { .. } => [Some(TAU), Some(TAU)],
             Surface::Revolution { curve, .. } => [Some(TAU), curve.period()],
@@ -352,9 +380,9 @@ impl Surface {
             Surface::Sphere { .. } => [None, Some((-FRAC_PI_2, FRAC_PI_2))],
             Surface::Revolution { curve, .. } => [None, curve.range()],
             Surface::Extrusion { curve, .. } => [curve.range(), None],
-            Surface::BSpline(s) => {
+            Surface::BSpline { s, closed } => {
                 let (a, b) = s.domain();
-                [Some(a), Some(b)]
+                [(!closed[0]).then_some(a), (!closed[1]).then_some(b)]
             }
             _ => [None, None],
         }
@@ -363,15 +391,76 @@ impl Surface {
     /// The whole parameter domain, when it is bounded (a face without
     /// bounds covers it).
     pub fn natural_domain(&self) -> Option<[(f64, f64); 2]> {
+        if let Surface::BSpline { s, .. } = self {
+            let (a, b) = s.domain();
+            return Some([a, b]);
+        }
         let p = self.periods();
         let b = self.bounds();
         let d = |i: usize| p[i].map(|per| (0.0, per)).or(b[i]);
         Some([d(0)?, d(1)?])
     }
 
+    /// A B-spline surface from its net, detecting closure in u and v.
+    pub fn bspline(s: NurbsSurface) -> Surface {
+        let nu = s.ctrl.len();
+        let nv = s.ctrl.first().map(|r| r.len()).unwrap_or(0);
+        let (mut lo, mut hi) = (Vec3::new(f64::MAX, f64::MAX, f64::MAX), Vec3::new(f64::MIN, f64::MIN, f64::MIN));
+        for p in s.ctrl.iter().flatten() {
+            lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+            hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+        }
+        let tol = 1e-10 * (hi - lo).norm().max(1e-300);
+        let closed_u = nu > 2 && (0..nv).all(|j| (s.ctrl[0][j] - s.ctrl[nu - 1][j]).norm() <= tol && (s.w[0][j] - s.w[nu - 1][j]).abs() <= 1e-12);
+        let closed_v = nv > 2 && (0..nu).all(|i| (s.ctrl[i][0] - s.ctrl[i][nv - 1]).norm() <= tol && (s.w[i][0] - s.w[i][nv - 1]).abs() <= 1e-12);
+        Surface::BSpline { s, closed: [closed_u, closed_v] }
+    }
+
+    fn wrap_closed(s: &NurbsSurface, closed: &[bool; 2], u: f64, v: f64) -> (f64, f64) {
+        if !closed[0] && !closed[1] {
+            return (u, v);
+        }
+        let ((u0, u1), (v0, v1)) = s.domain();
+        let w = |x: f64, a: f64, b: f64| if x < a || x > b { a + (x - a).rem_euclid(b - a) } else { x };
+        (if closed[0] { w(u, u0, u1) } else { u }, if closed[1] { w(v, v0, v1) } else { v })
+    }
+
     /// Parameter values v where the whole u line collapses to a point
     /// (cone apex, sphere poles), for closing a face around a pole.
     pub fn poles_v(&self) -> Vec<f64> {
+        self.poles(1)
+    }
+
+    /// Values of parameter `dir` (0 = u, 1 = v) at which the iso-line of
+    /// the other parameter collapses to a point.
+    pub fn poles(&self, dir: usize) -> Vec<f64> {
+        if let Surface::BSpline { s, .. } = self {
+            let nu = s.ctrl.len();
+            let nv = s.ctrl.first().map(|r| r.len()).unwrap_or(0);
+            let ((u0, u1), (v0, v1)) = s.domain();
+            let size = s.ctrl.iter().flatten().fold(0.0f64, |m, p| m.max(p.norm())).max(1e-300);
+            let collapsed = |pts: Vec<Vec3>| pts.iter().all(|p| (*p - pts[0]).norm() <= 1e-10 * size);
+            let mut out = Vec::new();
+            if dir == 0 {
+                if collapsed(s.ctrl[0].clone()) {
+                    out.push(u0);
+                }
+                if collapsed(s.ctrl[nu - 1].clone()) {
+                    out.push(u1);
+                }
+            } else {
+                if collapsed((0..nu).map(|i| s.ctrl[i][0]).collect()) {
+                    out.push(v0);
+                }
+                if collapsed((0..nu).map(|i| s.ctrl[i][nv - 1]).collect()) {
+                    out.push(v1);
+                }
+            }
+            return out;
+        }
+        if dir == 0 {
+            return vec![];
+        }
         match self {
             Surface::Cone { r, tan_a, .. } if tan_a.abs() > 1e-300 => vec![-r / tan_a],
             Surface::Sphere { .. } => vec![-FRAC_PI_2, FRAC_PI_2],
@@ -461,7 +550,7 @@ impl Surface {
                 let t = curve.search(perp, &seeds, span);
                 [t, (p - curve.eval(t)).dot(*d) / d.norm2().max(1e-300)]
             }
-            Surface::BSpline(s) => match seed {
+            Surface::BSpline { s, .. } => match seed {
                 Some(sd) => sd,
                 None => {
                     let ((u0, u1), (v0, v1)) = s.domain();

@@ -266,6 +266,9 @@ pub(crate) fn build_curve(f: &StepFile, id: u64, length: bool) -> Result<Curve, 
         }
         return Ok(Curve::Polyline(pts));
     }
+    if let Some(a) = e.part("B_SPLINE_CURVE_WITH_KNOTS") {
+        return bspline_curve(f, id, a, length).ok_or_else(bad);
+    }
     if let Some(a) = e.part("TRIMMED_CURVE") {
         return build_curve(f, a.get(1).and_then(|v| v.rf()).ok_or_else(bad)?, length);
     }
@@ -273,6 +276,35 @@ pub(crate) fn build_curve(f: &StepFile, id: u64, length: bool) -> Result<Curve, 
         return build_curve(f, a.get(1).and_then(|v| v.rf()).ok_or_else(bad)?, length);
     }
     Err(bad())
+}
+
+/// B_SPLINE_CURVE_WITH_KNOTS, simple or complex (rational) instance.
+fn bspline_curve(f: &StepFile, id: u64, a: &[Val], length: bool) -> Option<Curve> {
+    let e = f.get(id)?;
+    // simple form: name, degree, ctrl, form, closed, self_int, mults, knots, spec
+    // complex form: B_SPLINE_CURVE(degree, ctrl, form, closed, si) + B_SPLINE_CURVE_WITH_KNOTS(mults, knots, spec)
+    let (deg, ctrl, mk) = if let Some(b) = e.part("B_SPLINE_CURVE") { (b.first()?.num()?, b.get(1)?, &a[..]) } else { (a.get(1)?.num()?, a.get(2)?, &a[6.min(a.len())..]) };
+    let pts: Option<Vec<Vec3>> = ctrl.list()?.iter().map(|v| v.rf().and_then(|r| if length { f.point(r) } else { f.point_raw(r) })).collect();
+    let pts = pts?;
+    let (m, k) = (mk.first()?.list()?, mk.get(1)?.list()?);
+    let mut knots = Vec::new();
+    for (mm, kk) in m.iter().zip(k) {
+        for _ in 0..mm.num()? as usize {
+            knots.push(kk.num()?);
+        }
+    }
+    let p = deg as usize;
+    if pts.len() < 2 || knots.len() != pts.len() + p + 1 || p > super::MAX_DEGREE {
+        return None;
+    }
+    let w = match e.part("RATIONAL_B_SPLINE_CURVE") {
+        Some(r) => r.first()?.list()?.iter().map(|x| x.num().unwrap_or(1.0)).collect(),
+        None => vec![1.0; pts.len()],
+    };
+    if w.len() != pts.len() {
+        return None;
+    }
+    Some(Curve::BSpline(super::NurbsCurve { p, knots, ctrl: pts, w }))
 }
 
 /// Parameter-space curves of an edge geometry: (basis surface, 2D curve).
@@ -325,7 +357,7 @@ pub(crate) fn build_surface(f: &StepFile, id: u64) -> Result<Surface, String> {
         return Ok(Surface::Extrusion { curve: Box::new(c), d });
     }
     if e.has("B_SPLINE_SURFACE_WITH_KNOTS") {
-        return bspline_surface(f, id).map(Surface::BSpline).map_err(|_| bad());
+        return bspline_surface(f, id).map(Surface::bspline).map_err(|_| bad());
     }
     Err(bad())
 }
@@ -879,10 +911,11 @@ impl Model {
             }
             1 => {
                 let a = &loops[winding[0]];
-                if a.1[1] != 0 || a.1[0].abs() != 1 {
+                let d = if a.1[0] != 0 { 0 } else { 1 };
+                if a.1[1 - d] != 0 || a.1[d].abs() != 1 {
                     return Err(format!("face #{}: a loop winds around the surface in an unsupported way", face.step_id));
                 }
-                let l = self.close_pole(s, &mut dom, &a.0, a.1[0], a.2, per[0].unwrap())?;
+                let l = self.close_pole(s, &mut dom, &a.0, d, a.1[d], a.2, per[d].unwrap())?;
                 plain.push(l);
                 dom.pole_closures += 1;
             }
@@ -972,12 +1005,14 @@ impl Model {
         out
     }
 
-    /// Close a loop winding once in u through the surface pole on the
-    /// face's side.
-    fn close_pole(&self, s: &Surface, dom: &mut Domain, a: &[LoopPt], wa: i64, expected: f64, per: f64) -> Result<ParamLoop, String> {
-        let (vmin, vmax) = a.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.uv[1]), hi.max(p.uv[1])));
-        let poles = s.poles_v();
-        let side = wa as f64 * expected;
+    /// Close a loop winding once in direction `d` through the surface pole
+    /// (in the other direction) on the face's side.
+    fn close_pole(&self, s: &Surface, dom: &mut Domain, a: &[LoopPt], d: usize, wa: i64, expected: f64, per: f64) -> Result<ParamLoop, String> {
+        let o = 1 - d;
+        let (vmin, vmax) = a.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.uv[o]), hi.max(p.uv[o])));
+        let poles = s.poles(o);
+        // the face lies left of the loop when it is counter-clockwise: +v of a +u loop, -u of a +v loop
+        let side = wa as f64 * expected * if d == 0 { 1.0 } else { -1.0 };
         let eps = 1e-9 * (1.0 + vmax.abs() + vmin.abs());
         let up = poles.iter().copied().filter(|&v| v >= vmax - eps).min_by(|x, y| x.total_cmp(y));
         let down = poles.iter().copied().filter(|&v| v <= vmin + eps).max_by(|x, y| x.total_cmp(y));
@@ -996,26 +1031,31 @@ impl Model {
             let i = (ia + k) % n;
             let mut p = a[i].uv;
             if ia + k >= n {
-                p[0] += wa as f64 * per;
+                p[d] += wa as f64 * per;
             }
             out.uv.push(p);
             out.ids.push(a[i].id);
         }
+        let back = |mut q: [f64; 2]| {
+            q[d] -= wa as f64 * per;
+            q
+        };
         let a_end = *out.uv.last().unwrap();
-        let top = [a_end[0], vp];
+        let mut top = a_end;
+        top[o] = vp;
         let line = self.param_line(s, dom, a_end, top);
         let pole = self.vertices.len() as u32 + dom.extra.len() as u32;
-        dom.extra.push(s.eval(a_end[0], vp));
+        dom.extra.push(s.eval(top[0], top[1]));
         for (uv, id) in &line {
             out.uv.push(*uv);
             out.ids.push(*id);
         }
         out.uv.push(top);
         out.ids.push(pole);
-        out.uv.push([top[0] - wa as f64 * per, vp]);
+        out.uv.push(back(top));
         out.ids.push(pole);
         for (uv, id) in line.iter().rev() {
-            out.uv.push([uv[0] - wa as f64 * per, uv[1]]);
+            out.uv.push(back(*uv));
             out.ids.push(*id);
         }
         Ok(out)

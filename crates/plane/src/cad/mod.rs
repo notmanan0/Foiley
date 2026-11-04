@@ -61,6 +61,99 @@ pub fn bspline_basis(knots: &[f64], p: usize, u: f64, out: &mut Vec<f64>) {
     }
 }
 
+/// Highest B-spline degree handled by the allocation-free derivative code.
+pub const MAX_DEGREE: usize = 15;
+
+/// Span index `i` (knots[i] <= u < knots[i+1], within [knots[p], knots[n]])
+/// and the p + 1 non-zero basis functions N_{i-p..=i, p}(u) with their first
+/// derivatives (The NURBS Book, A2.1 and A2.3).
+pub fn ders_basis(knots: &[f64], p: usize, u: f64) -> Option<(usize, [f64; MAX_DEGREE + 1], [f64; MAX_DEGREE + 1])> {
+    let n = knots.len().checked_sub(p + 1)?;
+    if p > MAX_DEGREE || n <= p {
+        return None;
+    }
+    let u = u.clamp(knots[p], knots[n]);
+    let mut i = p;
+    while i < n - 1 && u >= knots[i + 1] {
+        i += 1;
+    }
+    const M: usize = MAX_DEGREE + 1;
+    let mut ndu = [[0.0f64; M]; M];
+    let mut left = [0.0f64; M];
+    let mut right = [0.0f64; M];
+    ndu[0][0] = 1.0;
+    for j in 1..=p {
+        left[j] = u - knots[i + 1 - j];
+        right[j] = knots[i + j] - u;
+        let mut saved = 0.0;
+        for r in 0..j {
+            ndu[j][r] = right[r + 1] + left[j - r];
+            let temp = if ndu[j][r].abs() > 1e-300 { ndu[r][j - 1] / ndu[j][r] } else { 0.0 };
+            ndu[r][j] = saved + right[r + 1] * temp;
+            saved = left[j - r] * temp;
+        }
+        ndu[j][j] = saved;
+    }
+    let mut nb = [0.0f64; M];
+    let mut db = [0.0f64; M];
+    for r in 0..=p {
+        nb[r] = ndu[r][p];
+        if p == 0 {
+            continue;
+        }
+        let mut d = 0.0;
+        if r >= 1 && ndu[p][r - 1].abs() > 1e-300 {
+            d += ndu[r - 1][p - 1] / ndu[p][r - 1];
+        }
+        if r < p && ndu[p][r].abs() > 1e-300 {
+            d -= ndu[r][p - 1] / ndu[p][r];
+        }
+        db[r] = p as f64 * d;
+    }
+    Some((i, nb, db))
+}
+
+/// A (rational) B-spline curve.
+#[derive(Clone, Debug)]
+pub struct NurbsCurve {
+    pub p: usize,
+    pub knots: Vec<f64>,
+    pub ctrl: Vec<Vec3>,
+    pub w: Vec<f64>,
+}
+
+impl NurbsCurve {
+    pub fn domain(&self) -> (f64, f64) {
+        (self.knots[self.p], self.knots[self.ctrl.len()])
+    }
+    /// Number of non-empty knot spans.
+    pub fn spans(&self) -> usize {
+        let n = self.ctrl.len();
+        (self.p..n).filter(|&i| self.knots[i + 1] > self.knots[i]).count().max(1)
+    }
+    /// (C, dC/dt)
+    pub fn eval_deriv(&self, t: f64) -> (Vec3, Vec3) {
+        let Some((i, nb, db)) = ders_basis(&self.knots, self.p, t) else { return (self.ctrl[0], Vec3::ZERO) };
+        let (mut a, mut ad, mut w, mut wd) = (Vec3::ZERO, Vec3::ZERO, 0.0, 0.0);
+        for k in 0..=self.p {
+            let j = i - self.p + k;
+            let (b, bd) = (nb[k] * self.w[j], db[k] * self.w[j]);
+            a += self.ctrl[j] * b;
+            ad += self.ctrl[j] * bd;
+            w += b;
+            wd += bd;
+        }
+        if w.abs() < 1e-300 {
+            return (a, ad);
+        }
+        let c = a / w;
+        (c, (ad - c * wd) / w)
+    }
+    pub fn eval(&self, t: f64) -> Vec3 {
+        self.eval_deriv(t).0
+    }
+}
+
 /// A (rational) B-spline surface: control net [u][v].
 #[derive(Clone, Debug)]
 pub struct NurbsSurface {
@@ -103,6 +196,34 @@ impl NurbsSurface {
         } else {
             p
         }
+    }
+    /// (S, dS/du, dS/dv) from the basis functions and their derivatives
+    /// (no allocation; degrees up to [`MAX_DEGREE`]).
+    pub fn eval_derivs(&self, u: f64, v: f64) -> (Vec3, Vec3, Vec3) {
+        let (Some((iu, nu, du)), Some((iv, nv, dv))) = (ders_basis(&self.ku, self.pu, u), ders_basis(&self.kv, self.pv, v)) else {
+            return (self.eval(u, v), Vec3::ZERO, Vec3::ZERO);
+        };
+        let (mut a, mut au, mut av) = (Vec3::ZERO, Vec3::ZERO, Vec3::ZERO);
+        let (mut w, mut wu, mut wv) = (0.0, 0.0, 0.0);
+        for k in 0..=self.pu {
+            let i = iu - self.pu + k;
+            for l in 0..=self.pv {
+                let j = iv - self.pv + l;
+                let (p, wij) = (self.ctrl[i][j], self.w[i][j]);
+                let (b, bu, bv) = (nu[k] * nv[l] * wij, du[k] * nv[l] * wij, nu[k] * dv[l] * wij);
+                a += p * b;
+                au += p * bu;
+                av += p * bv;
+                w += b;
+                wu += bu;
+                wv += bv;
+            }
+        }
+        if w.abs() < 1e-300 {
+            return (a, au, av);
+        }
+        let s = a / w;
+        (s, (au - s * wu) / w, (av - s * wv) / w)
     }
     /// Triangulate on a uniform parameter grid.
     pub fn tessellate(&self, nu: usize, nv: usize) -> Vec<Tri> {

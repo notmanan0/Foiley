@@ -334,6 +334,70 @@ def ellipse_prism(st, a=0.4, b=0.2, H=1.0):
     ])
 
 
+# ---------------------------------------------------------------- B-splines (F022b)
+
+W45 = math.sqrt(0.5)
+CIRCLE_W = [1.0, W45, 1.0, W45, 1.0, W45, 1.0, W45, 1.0]
+CIRCLE_MULTS = [3, 2, 2, 2, 3]
+CIRCLE_KNOTS = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+
+def circle_net(c, r, axis="x"):
+    """control points of a rational quadratic full circle about `axis` through c"""
+    sq = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1), (1, 0)]
+    if axis == "x":
+        return [(c[0], c[1] + r * a, c[2] + r * b) for a, b in sq]
+    return [(c[0] + r * a, c[1] + r * b, c[2]) for a, b in sq]
+
+
+def bezier_u2v_net():
+    """bicubic Bezier patch with S(u, v) = (u, v, u^2 v) exactly"""
+    cu = [0.0, 0.0, 1.0 / 3.0, 1.0]  # Bernstein coefficients of u^2
+    return [[(i / 3.0, j / 3.0, cu[i] * j / 3.0) for j in range(4)] for i in range(4)]
+
+
+def bspline_patch(st):
+    """two faces of the patch S = (u, v, u^2 v) split along the diagonal
+    curve S(t, t) = (t, t, t^3); no PCURVEs, so the diagonal must be inverted"""
+    surf = st.bspline_surface(3, 3, bezier_u2v_net(), [4, 4], [4, 4], [0.0, 1.0], [0.0, 1.0])
+    p00, p10, p11, p01 = (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 1.0), (0.0, 1.0, 0.0)
+    diag = st.edge(p00, p11, st.bspline_curve(3, [(0, 0, 0), (1 / 3.0, 1 / 3.0, 0), (2 / 3.0, 2 / 3.0, 0), (1, 1, 1)], [4, 4], [0.0, 1.0]))
+    bottom = st.edge(p00, p10, st.line(p00, (1, 0, 0)))  # S(u, 0)
+    right = st.edge(p10, p11, st.line(p10, (0, 1, 1)))  # S(1, v)
+    top = st.edge(p01, p11, st.bspline_curve(2, [(0, 1, 0), (0.5, 1, 0), (1, 1, 1)], [3, 3], [0.0, 1.0]))  # S(u, 1)
+    left = st.edge(p00, p01, st.line(p00, (0, 1, 0)))  # S(0, v)
+    st.solid([
+        st.face([[(bottom, True), (right, True), (diag, False)]], surf),
+        st.face([[(diag, True), (top, False), (left, False)]], surf),
+    ], closed=False)
+
+
+def bspline_plate_hole(st, r=0.2):
+    """bilinear B-spline plate [0,1]^2 (S = (u, v, 0)) with a hole bounded by a
+    rational B-spline circle"""
+    surf = st.bspline_surface(1, 1, [[(0, 0, 0), (0, 1, 0)], [(1, 0, 0), (1, 1, 0)]], [2, 2], [2, 2], [0.0, 1.0], [0.0, 1.0])
+    A, B, C, D = (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)
+    outer = [st.seg(A, B), st.seg(B, C), st.seg(C, D), st.seg(D, A)]
+    h = (0.5 + r, 0.5, 0.0)
+    hole = st.edge(h, h, st.bspline_curve(2, circle_net((0.5, 0.5, 0.0), r, axis="z"), CIRCLE_MULTS, CIRCLE_KNOTS, CIRCLE_W))
+    st.solid([st.face([outer, [(hole, False)]], surf)], closed=False)
+
+
+LOFT = [(0.0, 0.0), (0.3, 0.1), (1.0, 0.1), (1.4, 0.0)]  # (x, radius) stations
+
+
+def loft_fuselage(st):
+    """closed lofted B-spline fuselage: degree 1 along x through the stations
+    (nose and tail collapse to points), rational circle around; exact cones
+    and a cylinder.  One face bounded by its seam, like a sphere."""
+    net = [circle_net((x, 0.0, 0.0), r) for x, r in LOFT]
+    w = [CIRCLE_W[:] for _ in LOFT]
+    surf = st.bspline_surface(1, 2, net, [2, 1, 1, 2], CIRCLE_MULTS, [0.0, 1 / 3.0, 2 / 3.0, 1.0], CIRCLE_KNOTS, w)
+    nose, tail = (0.0, 0.0, 0.0), (1.4, 0.0, 0.0)
+    seam = st.edge(nose, tail, st.bspline_curve(1, [(x, r, 0.0) for x, r in LOFT], [2, 1, 1, 2], [0.0, 1 / 3.0, 2 / 3.0, 1.0]))
+    st.solid([st.face([[(seam, True), (seam, False)]], surf)])
+
+
 def one(name, build, scale=1.0, prefix="$", **kw):
     st = Step(scale)
     build(st, **kw)
@@ -351,3 +415,6 @@ if __name__ == "__main__":
     one("sphere", sphere)
     one("torus", torus)
     one("ellipse_prism", ellipse_prism)
+    one("bspline_patch", bspline_patch)
+    one("bspline_plate_hole", bspline_plate_hole)
+    one("loft_fuselage", loft_fuselage)
