@@ -60,6 +60,9 @@ impl From<foiley_core::Cancelled> for PlaneError {
 }
 impl From<foiley_core::linalg::LinalgError> for PlaneError {
     fn from(e: foiley_core::linalg::LinalgError) -> Self {
-        PlaneError::Solver(e.to_string())
+        match e {
+            foiley_core::linalg::LinalgError::Cancelled => PlaneError::Cancelled,
+            e => PlaneError::Solver(e.to_string()),
+        }
     }
 }

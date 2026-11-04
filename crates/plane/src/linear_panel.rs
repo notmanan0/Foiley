@@ -387,7 +387,7 @@ impl<'a> LinearPanelSystem<'a> {
         prog.check()?;
         let mut rhs = DenseMatrix { rows: n, cols: 6, data };
         prog.stage(format!("Factorising Galerkin system ({n} unknowns)"));
-        let lu = Lu::factor(a)?;
+        let lu = Lu::factor_with(a, prog)?;
         prog.check()?;
         let b0 = if diag != Diagnostics::Off { rhs.clone() } else { DenseMatrix::default() };
         lu.solve_many(&mut rhs);

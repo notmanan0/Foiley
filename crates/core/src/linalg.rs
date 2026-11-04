@@ -5,9 +5,11 @@
 //! filled by an independent rayon task, then factored in place by faer's
 //! blocked, multithreaded partial-pivoting LU without an extra copy.
 
+use crate::progress::Progress;
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::lu::partial_pivoting::{factor, solve};
-use faer::{MatMut, MatRef, Par};
+use faer::reborrow::{Reborrow, ReborrowMut};
+use faer::{Accum, MatMut, MatRef, Par};
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +20,8 @@ pub enum LinalgError {
     NonFinite,
     /// Eigen solver did not converge.
     NoConvergence,
+    /// The factorization was cancelled through its `Progress`.
+    Cancelled,
 }
 
 impl std::fmt::Display for LinalgError {
@@ -26,6 +30,7 @@ impl std::fmt::Display for LinalgError {
             LinalgError::Singular { col } => write!(f, "matrix is singular (pivot {col} is zero): check for duplicated or zero-area panels"),
             LinalgError::NonFinite => write!(f, "matrix contains NaN/inf values: check the geometry for degenerate panels"),
             LinalgError::NoConvergence => write!(f, "eigenvalue solver did not converge"),
+            LinalgError::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -115,9 +120,123 @@ pub struct Lu {
     pub norm1: f64,
 }
 
+/// Below this size `Lu::factor_with` uses the single faer call.
+pub const BLOCKED_LU_MIN: usize = 2000;
+
+static BLOCKED_MIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(BLOCKED_LU_MIN);
+
+/// Override the size from which `Lu::factor_with` uses the blocked LU
+/// (process-wide; for tests and benchmarks: `usize::MAX` = never).
+pub fn set_blocked_lu_min(n: usize) {
+    BLOCKED_MIN.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+/// Column panel width of the blocked LU.
+pub const BLOCKED_LU_PANEL: usize = 128;
+/// Work per uninterruptible Schur-update tile, in flops (sets the tile
+/// width from the trailing height, so the longest step stays a few tens of
+/// milliseconds on a desktop CPU).
+pub const BLOCKED_LU_TILE_FLOPS: f64 = 4e9;
+
+/// Transpositions (i, j), i < j, that turn the identity into `target` when
+/// applied in order to an array (so `a[i]` becomes `a[target[i]]`).
+fn transpositions(target: &[usize]) -> Vec<(usize, usize)> {
+    let m = target.len();
+    let mut cur: Vec<usize> = (0..m).collect();
+    let mut pos: Vec<usize> = (0..m).collect();
+    let mut out = Vec::new();
+    for i in 0..m {
+        let v = target[i];
+        let p = pos[v];
+        if p != i {
+            let u = cur[i];
+            cur.swap(i, p);
+            pos[u] = p;
+            pos[v] = i;
+            out.push((i, p));
+        }
+    }
+    out
+}
+
+/// Right-looking blocked LU with partial pivoting, cancellable between
+/// steps.  For each column panel: faer LU of the tall panel, the panel's row
+/// swaps on the other columns (column-parallel), then for each tile of
+/// trailing columns a unit-lower triangular solve for U12 and the Schur
+/// update A22 -= L21 U12 as one parallel faer matmul, with a cancellation
+/// check between tiles.  Leaves P A = L U in `a`; returns the row order
+/// (`perm[i]` = original row now at position i).
+fn blocked_lu(a: &mut DenseMatrix, nb: usize, tile_flops: f64, prog: &Progress) -> Result<Vec<usize>, LinalgError> {
+    let n = a.rows;
+    let p = par();
+    let mut perm: Vec<usize> = (0..n).collect();
+    let (mut pf, mut pb) = (vec![0usize; n], vec![0usize; n]);
+    let mut k = 0;
+    while k < n {
+        if prog.is_cancelled() {
+            return Err(LinalgError::Cancelled);
+        }
+        let b = nb.min(n - k);
+        let m = n - k;
+        {
+            let mut mem = MemBuffer::new(factor::lu_in_place_scratch::<usize, f64>(m, b, p, Default::default()));
+            let panel = a.as_mut().submatrix_mut(k, k, m, b);
+            factor::lu_in_place(panel, &mut pf[..m], &mut pb[..m], p, MemStack::new(&mut mem), Default::default());
+        }
+        let swaps = transpositions(&pf[..m]);
+        if !swaps.is_empty() {
+            a.data.par_chunks_mut(n).enumerate().filter(|(j, _)| *j < k || *j >= k + b).for_each(|(_, col)| {
+                for &(i, j) in &swaps {
+                    col.swap(k + i, k + j);
+                }
+            });
+            for &(i, j) in &swaps {
+                perm.swap(k + i, k + j);
+            }
+        }
+        let rest = n - k - b;
+        if rest > 0 {
+            let t = ((tile_flops / (2.0 * m as f64 * b as f64)) as usize).max(64).min(rest);
+            let mut c0 = k + b;
+            while c0 < n {
+                if prog.is_cancelled() {
+                    return Err(LinalgError::Cancelled);
+                }
+                let w = t.min(n - c0);
+                let am = a.as_mut();
+                let (left, right) = am.split_at_col_mut(c0);
+                let lp = left.rb().submatrix(k, k, m, b);
+                let (l11, l21) = (lp.submatrix(0, 0, b, b), lp.submatrix(b, 0, m - b, b));
+                let tile = right.submatrix_mut(k, 0, m, w);
+                let (mut a12, a22) = tile.split_at_row_mut(b);
+                faer::linalg::triangular_solve::solve_unit_lower_triangular_in_place(l11, a12.rb_mut(), p);
+                faer::linalg::matmul::matmul(a22, Accum::Add, l21, a12.rb(), -1.0, p);
+                c0 += w;
+            }
+        }
+        k += b;
+    }
+    Ok(perm)
+}
+
 impl Lu {
     /// Factor a square matrix, consuming it.
-    pub fn factor(mut a: DenseMatrix) -> Result<Lu, LinalgError> {
+    pub fn factor(a: DenseMatrix) -> Result<Lu, LinalgError> {
+        Self::factor_with(a, &Progress::none())
+    }
+
+    /// Factor, cancellable through `prog` (blocked above `BLOCKED_LU_MIN`
+    /// unknowns; below it the single faer call is fast enough).
+    pub fn factor_with(a: DenseMatrix, prog: &Progress) -> Result<Lu, LinalgError> {
+        let blocked = a.rows >= BLOCKED_MIN.load(std::sync::atomic::Ordering::Relaxed);
+        Self::factor_impl(a, prog, blocked, BLOCKED_LU_PANEL, BLOCKED_LU_TILE_FLOPS)
+    }
+
+    /// Always use the blocked algorithm with these block sizes (tests, tuning).
+    pub fn factor_blocked(a: DenseMatrix, prog: &Progress, nb: usize, tile_flops: f64) -> Result<Lu, LinalgError> {
+        Self::factor_impl(a, prog, true, nb.max(1), tile_flops)
+    }
+
+    fn factor_impl(mut a: DenseMatrix, prog: &Progress, blocked: bool, nb: usize, tile_flops: f64) -> Result<Lu, LinalgError> {
         assert_eq!(a.rows, a.cols, "LU needs a square matrix");
         let n = a.rows;
         // one O(N^2) pass: finiteness and the 1-norm (max column sum)
@@ -128,7 +247,26 @@ impl Lu {
         };
         let mut fwd = vec![0usize; n];
         let mut bwd = vec![0usize; n];
-        {
+        if blocked {
+            fwd = match blocked_lu(&mut a, nb, tile_flops, prog) {
+                Ok(f) => f,
+                Err(e) => {
+                    // Releasing a multi-GB buffer can take tens of ms (page
+                    // decommit); do it off the cancelling thread.
+                    let data = std::mem::take(&mut a.data);
+                    if data.len() > 1 << 24 {
+                        std::thread::spawn(move || drop(data));
+                    }
+                    return Err(e);
+                }
+            };
+            for (i, &f) in fwd.iter().enumerate() {
+                bwd[f] = i;
+            }
+        } else {
+            if prog.is_cancelled() {
+                return Err(LinalgError::Cancelled);
+            }
             let p = par();
             let mut mem = MemBuffer::new(factor::lu_in_place_scratch::<usize, f64>(n, n, p, Default::default()));
             let stack = MemStack::new(&mut mem);

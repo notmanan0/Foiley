@@ -214,7 +214,7 @@ impl<'a> VlmSystem<'a> {
         });
         prog.check()?;
         prog.stage(format!("Factorising ({n} unknowns)"));
-        let lu = Lu::factor(a)?;
+        let lu = Lu::factor_with(a, prog)?;
         prog.set(0.9);
         prog.check()?;
         let mut rhs = DenseMatrix::zeros(n, 6);
@@ -419,7 +419,7 @@ impl<'a> VlmSystem<'a> {
                     *v = vel.dot(p.normal);
                 }
             });
-            let lu = Lu::factor(a)?;
+            let lu = Lu::factor_with(a, prog)?;
             let mut rhs: Vec<f64> = mesh.panels.iter().map(|p| -vinf.dot(p.normal)).collect();
             lu.solve(&mut rhs);
             gamma = rhs;

@@ -332,7 +332,7 @@ impl<'a> PanelSystem<'a> {
         prog.set(0.7);
         prog.check()?;
         prog.stage(format!("Factorising ({n} unknowns)"));
-        let lu = Lu::factor(a)?;
+        let lu = Lu::factor_with(a, prog)?;
         prog.set(0.95);
         let mut rhs = DenseMatrix::zeros(n, 6);
         for (i, r) in rhs_rows.iter().enumerate() {
