@@ -10,9 +10,15 @@
 //! to the upper trailing edge for thick meshes.  Node order is
 //! [LA, TA, TB, LB] (leading/trailing, side A/B); the normal is
 //! (TB-LA) x (LB-TA) and points outwards (or up for thin surfaces).
+//!
+//! Every body in `Plane::fuses` is meshed (its panels carry `body_id`).  A
+//! two-sided wing root is trimmed against the body it intersects (bounding-box
+//! prefilter, then the section intersection), which gives that wing-body pair
+//! its carry-through segment.  Bodies that interpenetrate each other are an
+//! error (BVH over the body triangles).
 
 use crate::foildb::{FoilDb, FoilShape};
-use crate::geom::{Plane, WingKind};
+use crate::geom::{Fuse, Plane, WingKind};
 use crate::PlaneError;
 use foiley_core::interp::distribution;
 use foiley_core::{Spacing, Vec3, DEG};
@@ -50,6 +56,9 @@ pub struct Panel {
     pub kind: PanelKind,
     /// wing index, or usize::MAX for fuselage panels
     pub wing: usize,
+    /// body (index into `Plane::fuses`) of a fuselage panel; None for wing panels
+    #[serde(default)]
+    pub body_id: Option<usize>,
     pub strip: Option<usize>,
     pub trailing: bool,
     pub leading: bool,
@@ -71,7 +80,7 @@ impl Panel {
         let va = la + (ta - la) * 0.25;
         let vb = lb + (tb - lb) * 0.25;
         let ctrl = ((la + (ta - la) * 0.75) + (lb + (tb - lb) * 0.75)) * 0.5;
-        Panel { nodes, normal, area, centre, l, m, size, ctrl, va, vb, kind, wing, strip, trailing: false, leading: false, flap: None }
+        Panel { nodes, normal, area, centre, l, m, size, ctrl, va, vb, kind, wing, body_id: None, strip, trailing: false, leading: false, flap: None }
     }
 
     /// A triangular panel (stored with the last node repeated).
@@ -84,7 +93,7 @@ impl Panel {
         m = (m - normal * normal.dot(m)).normalized();
         let l = m.cross(normal);
         let size = (b - a).norm().max((c - b).norm()).max((a - c).norm());
-        Panel { nodes: [a, b, c, c], normal, area, centre, l, m, size, ctrl: centre, va: a, vb: b, kind, wing, strip, trailing: false, leading: false, flap: None }
+        Panel { nodes: [a, b, c, c], normal, area, centre, l, m, size, ctrl: centre, va: a, vb: b, kind, wing, body_id: None, strip, trailing: false, leading: false, flap: None }
     }
 
     pub fn is_tri(&self) -> bool {
@@ -230,8 +239,9 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
             None => Err(PlaneError::MissingFoil(name.to_string())),
         }
     };
-    let fuse = if opt.thick && opt.include_fuse { plane.fuses.first() } else { None };
-    let fuse_display = if opt.include_fuse && (opt.thick || opt.fuse_in_thin) { plane.fuses.first() } else { None };
+    // bodies that trim wing roots (thick analysis meshes) and bodies that are meshed
+    let trim_bodies: Vec<(&Fuse, (Vec3, Vec3))> = if opt.thick && opt.include_fuse { plane.fuses.iter().map(|f| (f, body_bbox(f))).collect() } else { vec![] };
+    let mesh_bodies: &[Fuse] = if opt.include_fuse && (opt.thick || opt.fuse_in_thin) { &plane.fuses } else { &[] };
 
     for (iw, wing0) in plane.wings.iter().enumerate() {
         let mut wing = wing0.clone();
@@ -286,15 +296,24 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                     };
                     fi.point(x, ea).lerp(fo.point(x, eb), t)
                 };
-                // wing root trimmed on the fuselage surface, node by node
+                // wing root trimmed on the surface of the body it intersects, node by node
                 let mut troot = vec![0.0; xi.len()];
-                if let (Some(f), true, 0) = (fuse, wing.two_sided, is) {
-                    let inside = |p: Vec3| -> bool {
-                        match f.section_at(p.x) {
-                            Some((hw, hh, zc)) if hw > 0.0 && hh > 0.0 => (p.y / hw).powi(2) + ((p.z - zc) / hh).powi(2) < 1.0,
-                            _ => false,
-                        }
-                    };
+                let root_body = if wing.two_sided && is == 0 {
+                    // bounding-box prefilter, then the section test on the root nodes
+                    trim_bodies
+                        .iter()
+                        .find(|(f, bb)| {
+                            xi.iter().any(|&x| {
+                                let p = point(0.0, x, 0);
+                                in_box(p, *bb) && inside_body(f, p)
+                            })
+                        })
+                        .map(|(f, _)| *f)
+                } else {
+                    None
+                };
+                if let Some(f) = root_body {
+                    let inside = |p: Vec3| inside_body(f, p);
                     for (l, &x) in xi.iter().enumerate() {
                         if !inside(point(0.0, x, 0)) {
                             continue;
@@ -500,8 +519,10 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
     }
     mesh.n_wing_panels = mesh.panels.len();
 
-    // fuselage
-    if let Some(f) = fuse_display {
+    // fuselages: every body, panels tagged with its index
+    let mut body_ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(mesh_bodies.len());
+    for (ib, f) in mesh_bodies.iter().enumerate() {
+        let body_start = mesh.panels.len();
         f.validate().map_err(PlaneError::Geometry)?;
         match (f.grid(f.nx, f.nh, false), f.grid(f.nx, f.nh, true)) {
             (Some(gr), Some(gl)) => {
@@ -538,6 +559,13 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                 }
             }
         }
+        for p in &mut mesh.panels[body_start..] {
+            p.body_id = Some(ib);
+        }
+        body_ranges.push(body_start..mesh.panels.len());
+    }
+    if opt.thick && body_ranges.len() >= 2 {
+        check_bodies(&mesh.panels, &body_ranges, mesh_bodies)?;
     }
 
     if opt.triangulate {
@@ -578,6 +606,10 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
             }
         }
     }
+    // sorted, so that results do not depend on the HashMap's iteration order
+    for list in &mut nb {
+        list.sort_unstable();
+    }
     mesh.neighbours = nb;
     if mesh.panels.iter().any(|p| !p.area.is_finite() || !p.centre.is_finite()) {
         return Err(PlaneError::Geometry("mesh contains degenerate panels".into()));
@@ -610,6 +642,7 @@ fn triangulate(mesh: &mut Mesh) {
         for t in [&mut t1, &mut t2] {
             t.flap = p.flap;
             t.leading = p.leading;
+            t.body_id = p.body_id;
         }
         t1.trailing = p.trailing;
         let i1 = mesh.panels.len();
@@ -639,6 +672,196 @@ fn triangulate(mesh: &mut Mesh) {
         s.panels = np;
     }
     mesh.n_wing_panels = mesh.panels.iter().filter(|p| p.kind != PanelKind::Fuse).count();
+}
+
+/// Is `p` inside the cross section of body `f` at the plane x of `p`?
+fn inside_body(f: &Fuse, p: Vec3) -> bool {
+    match f.section_at(p.x) {
+        Some((hw, hh, zc)) if hw > 0.0 && hh > 0.0 => (p.y / hw).powi(2) + ((p.z - zc) / hh).powi(2) < 1.0,
+        _ => false,
+    }
+}
+
+/// Conservative bounding box of a body (sampled surface, inflated by 10% of
+/// its diagonal so that the spline / NURBS surface between samples is inside).
+fn body_bbox(f: &Fuse) -> (Vec3, Vec3) {
+    let (lo, hi) = pts_bbox(f.world_triangles(f.nx.max(2), f.nh.max(2)).iter().flatten());
+    let pad = 0.1 * (hi - lo).norm() + 1e-9;
+    (lo - Vec3::new(pad, pad, pad), hi + Vec3::new(pad, pad, pad))
+}
+
+fn pts_bbox<'a>(pts: impl Iterator<Item = &'a Vec3>) -> (Vec3, Vec3) {
+    let mut lo = Vec3::new(f64::MAX, f64::MAX, f64::MAX);
+    let mut hi = Vec3::new(f64::MIN, f64::MIN, f64::MIN);
+    for p in pts {
+        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    }
+    (lo, hi)
+}
+
+fn in_box(p: Vec3, (lo, hi): (Vec3, Vec3)) -> bool {
+    p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y && p.z >= lo.z && p.z <= hi.z
+}
+
+fn boxes_overlap(a: (Vec3, Vec3), b: (Vec3, Vec3)) -> bool {
+    a.0.x <= b.1.x && b.0.x <= a.1.x && a.0.y <= b.1.y && b.0.y <= a.1.y && a.0.z <= b.1.z && b.0.z <= a.1.z
+}
+
+/// Triangles of a panel range (quads split along LA-TB).
+fn panel_tris(panels: &[Panel]) -> Vec<[Vec3; 3]> {
+    let mut v = Vec::with_capacity(2 * panels.len());
+    for p in panels {
+        let [a, b, c, d] = p.nodes;
+        v.push([a, b, c]);
+        if !p.is_tri() {
+            v.push([a, c, d]);
+        }
+    }
+    v
+}
+
+/// Axis-aligned bounding-volume hierarchy over triangles.
+struct Bvh {
+    tris: Vec<[Vec3; 3]>,
+    /// (box, first, count): count 0 = inner node with children `first` and
+    /// `first + 1`, otherwise a leaf holding `tris[first..first + count]`
+    nodes: Vec<((Vec3, Vec3), usize, usize)>,
+}
+
+impl Bvh {
+    fn new(mut tris: Vec<[Vec3; 3]>) -> Bvh {
+        let mut nodes = Vec::with_capacity(tris.len() / 2 + 1);
+        nodes.push(((Vec3::ZERO, Vec3::ZERO), 0, 0));
+        let n = tris.len();
+        Self::build(&mut tris, &mut nodes, 0, 0, n);
+        Bvh { tris, nodes }
+    }
+
+    fn build(tris: &mut [[Vec3; 3]], nodes: &mut Vec<((Vec3, Vec3), usize, usize)>, node: usize, start: usize, end: usize) {
+        let bb = pts_bbox(tris[start..end].iter().flatten());
+        if end - start <= 8 {
+            nodes[node] = (bb, start, end - start);
+            return;
+        }
+        let ext = bb.1 - bb.0;
+        let axis = if ext.x >= ext.y && ext.x >= ext.z {
+            0
+        } else if ext.y >= ext.z {
+            1
+        } else {
+            2
+        };
+        let key = |t: &[Vec3; 3]| {
+            let c = t[0] + t[1] + t[2];
+            [c.x, c.y, c.z][axis]
+        };
+        let mid = (start + end) / 2;
+        tris[start..end].select_nth_unstable_by(mid - start, |a, b| key(a).total_cmp(&key(b)));
+        let left = nodes.len();
+        nodes.push(((Vec3::ZERO, Vec3::ZERO), 0, 0));
+        nodes.push(((Vec3::ZERO, Vec3::ZERO), 0, 0));
+        nodes[node] = (bb, left, 0);
+        Self::build(tris, nodes, left, start, mid);
+        Self::build(tris, nodes, left + 1, mid, end);
+    }
+
+    /// Does any triangle of the tree intersect `t` (box `tb`)?
+    fn intersects(&self, t: &[Vec3; 3], tb: (Vec3, Vec3), stack: &mut Vec<usize>) -> bool {
+        stack.clear();
+        stack.push(0);
+        while let Some(i) = stack.pop() {
+            let (bb, first, count) = self.nodes[i];
+            if !boxes_overlap(bb, tb) {
+                continue;
+            }
+            if count == 0 {
+                stack.push(first);
+                stack.push(first + 1);
+            } else if self.tris[first..first + count].iter().any(|u| tris_intersect(t, u)) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Segment p-q against triangle t (Moller-Trumbore); parallel segments do not hit.
+fn segment_hits(p: Vec3, q: Vec3, t: &[Vec3; 3]) -> bool {
+    let d = q - p;
+    let (e1, e2) = (t[1] - t[0], t[2] - t[0]);
+    let h = d.cross(e2);
+    let det = e1.dot(h);
+    if det.abs() <= 1e-14 * e1.norm() * e2.norm() * d.norm() {
+        return false;
+    }
+    let s = p - t[0];
+    let u = s.dot(h) / det;
+    if !(0.0..=1.0).contains(&u) {
+        return false;
+    }
+    let qv = s.cross(e1);
+    let v = d.dot(qv) / det;
+    if v < 0.0 || u + v > 1.0 {
+        return false;
+    }
+    let tt = e2.dot(qv) / det;
+    (0.0..=1.0).contains(&tt)
+}
+
+/// Two triangles intersect when an edge of one crosses the other (coplanar contact is ignored).
+fn tris_intersect(a: &[Vec3; 3], b: &[Vec3; 3]) -> bool {
+    (0..3).any(|k| segment_hits(a[k], a[(k + 1) % 3], b) || segment_hits(b[k], b[(k + 1) % 3], a))
+}
+
+/// Ray-parity test of a point against a (nearly) closed triangulated body.
+fn point_in_tris(p: Vec3, tris: &[[Vec3; 3]], reach: f64) -> bool {
+    // an oblique direction that does not run along mesh lines or out of an open nose / tail
+    let dir = Vec3::new(0.2113, 0.9318, 0.2951).normalized();
+    let q = p + dir * reach;
+    tris.iter().filter(|t| segment_hits(p, q, t)).count() % 2 == 1
+}
+
+/// Body-body proximity and intersection check.  Bodies whose boxes overlap
+/// are tested triangle against triangle through a BVH, and for containment
+/// by ray parity.  Interpenetrating bodies are an error naming both.
+fn check_bodies(panels: &[Panel], ranges: &[std::ops::Range<usize>], bodies: &[Fuse]) -> Result<(), PlaneError> {
+    let tris: Vec<Vec<[Vec3; 3]>> = ranges.iter().map(|r| panel_tris(&panels[r.clone()])).collect();
+    let boxes: Vec<(Vec3, Vec3)> = tris.iter().map(|t| pts_bbox(t.iter().flatten())).collect();
+    let label = |i: usize| format!("'{}' (body {})", bodies[i].name, i + 1);
+    let mut stack = Vec::new();
+    for j in 1..tris.len() {
+        let mut tree: Option<Bvh> = None;
+        for i in 0..j {
+            if tris[i].is_empty() || tris[j].is_empty() || !boxes_overlap(boxes[i], boxes[j]) {
+                continue;
+            }
+            let tree = tree.get_or_insert_with(|| Bvh::new(tris[j].clone()));
+            for t in &tris[i] {
+                let tb = pts_bbox(t.iter());
+                if boxes_overlap(tb, boxes[j]) && tree.intersects(t, tb, &mut stack) {
+                    let c = (t[0] + t[1] + t[2]) / 3.0;
+                    return Err(PlaneError::Geometry(format!(
+                        "bodies {} and {} interpenetrate: their surfaces intersect near ({:.4}, {:.4}, {:.4}) m; move or resize one of them",
+                        label(i),
+                        label(j),
+                        c.x,
+                        c.y,
+                        c.z
+                    )));
+                }
+            }
+            let reach = 2.0 * ((boxes[i].1 - boxes[i].0).norm() + (boxes[j].1 - boxes[j].0).norm());
+            for (inner, outer) in [(i, j), (j, i)] {
+                let (bi, bo) = (boxes[inner], boxes[outer]);
+                let nested = in_box(bi.0, bo) && in_box(bi.1, bo);
+                if nested && point_in_tris(tris[inner][0][0], &tris[outer], reach) {
+                    return Err(PlaneError::Geometry(format!("body {} lies inside body {}: bodies must not overlap", label(inner), label(outer))));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Mesh {
