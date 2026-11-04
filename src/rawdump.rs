@@ -181,6 +181,34 @@ impl Comparison {
     }
 }
 
+/// [`compare`] after pairing the points by angle of attack (the closest
+/// unused ALFA within 1e-6 rad), so that a point stored by only one side does
+/// not shift the rest; unpaired points are a structural difference.
+pub fn compare_aligned(a: &[Point], b: &[Point]) -> Comparison {
+    let alfa = |p: &Point| f64::from_bits(p.scalars[0]);
+    let mut used = vec![false; b.len()];
+    let (mut pa, mut pb) = (Vec::new(), Vec::new());
+    let mut lone_a = 0;
+    for p in a {
+        let best = b.iter().enumerate().filter(|(j, _)| !used[*j]).map(|(j, q)| (j, (alfa(p) - alfa(q)).abs())).filter(|(_, d)| *d < 1e-6).min_by(|x, y| x.1.total_cmp(&y.1));
+        match best {
+            Some((j, _)) => {
+                used[j] = true;
+                pa.push(p.clone());
+                pb.push(b[j].clone());
+            }
+            None => lone_a += 1,
+        }
+    }
+    let mut c = compare(&pa, &pb);
+    c.points = (a.len(), b.len());
+    let lone_b = used.iter().filter(|u| !**u).count();
+    if lone_a + lone_b > 0 {
+        c.structure.insert(0, format!("{lone_a} point(s) only in the first dump, {lone_b} only in the second"));
+    }
+    c
+}
+
 /// Compare two dumps point by point (in order) and station by station.
 pub fn compare(a: &[Point], b: &[Point]) -> Comparison {
     let mut max = [0u64; 11];
