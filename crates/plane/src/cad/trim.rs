@@ -931,6 +931,7 @@ impl Model {
 
     fn raw_loop(&self, face: &Face, b: &Bound, uses: &HashMap<usize, usize>, used_pc: &mut usize) -> Vec<LoopPt> {
         let s = &face.surface;
+        let per = s.periods();
         let mut pts = Vec::new();
         let mut prev: Option<[f64; 2]> = None;
         for (k, &(ei, fwd)) in b.edges.iter().enumerate() {
@@ -950,7 +951,18 @@ impl Model {
                         *used_pc += 1;
                     }
                 }
-                let uv = uv.unwrap_or_else(|| s.invert(p, prev));
+                let mut uv = uv.unwrap_or_else(|| s.invert(p, prev));
+                // points on the natural seam get exactly its value, so the two
+                // copies of a seam are exactly one period apart (no slivers)
+                for d in 0..2 {
+                    if let Some(pp) = per[d] {
+                        let o = s.seam_origin(d);
+                        let k = ((uv[d] - o) / pp).round();
+                        if (uv[d] - (o + k * pp)).abs() < 1e-12 * pp {
+                            uv[d] = o + k * pp;
+                        }
+                    }
+                }
                 pts.push(LoopPt { uv, id, use_k: k, sing: s.singular(uv[0], uv[1]) });
                 prev = Some(uv);
             }

@@ -399,6 +399,41 @@ def loft_fuselage(st):
     st.solid([st.face([[(seam, True), (seam, False)]], surf, same=False)])
 
 
+# ---------------------------------------------------------------- corpus (F022d)
+
+
+def cyl_fuselage(st, R=0.1, L=1.0):
+    """cylinder along +x with hemispherical nose and tail: each hemisphere is
+    bounded by one circle and closes through its pole"""
+    z, x = X, Y
+    v0, v1 = (0.0, R, 0.0), (L, R, 0.0)
+    c0 = st.edge(v0, v0, st.circle((0, 0, 0), z, x, R))
+    c1 = st.edge(v1, v1, st.circle((L, 0, 0), z, x, R))
+    es = st.edge(v0, v1, st.line(v0, (L, 0, 0)))
+    st.solid([
+        st.face([[(c0, True), (es, True), (c1, False), (es, False)]], st.cyl((0, 0, 0), z, x, R)),
+        st.face([[(c0, False)]], st.sphere((0, 0, 0), z, x, R)),
+        st.face([[(c1, True)]], st.sphere((L, 0, 0), z, x, R)),
+    ])
+
+
+def nacelle(st, d=0.3, a=0.25, b=0.05):
+    """annular nacelle: an ellipse (semi-axes a along z, b radial) at radius d
+    revolved about z; one doubly periodic face like a torus"""
+    zc = (0.0, -1.0, 0.0)  # ellipse plane xz; E(t) = (d,0,0) + a cos t z - b sin t x
+    ell = st.ellipse((d, 0.0, 0.0), zc, Z, a, b)
+    v = (d, 0.0, a)
+    ee = st.edge(v, v, st.circle((0, 0, a), Z, X, d))
+    em = st.edge(v, v, ell)
+    st.solid([st.face([[(ee, True), (em, True), (ee, False), (em, False)]], st.revolution(ell, (0, 0, 0), Z))])
+
+
+def multi_shell(st):
+    """two solids in one file: the box with a hole and a sphere beside it"""
+    box_hole(st)
+    sphere(st, R=0.3, c=(3.0, 0.5, 0.25))
+
+
 def one(name, build, scale=1.0, prefix="$", **kw):
     st = Step(scale)
     build(st, **kw)
@@ -419,3 +454,6 @@ if __name__ == "__main__":
     one("bspline_patch", bspline_patch)
     one("bspline_plate_hole", bspline_plate_hole)
     one("loft_fuselage", loft_fuselage)
+    one("cyl_fuselage", cyl_fuselage)
+    one("nacelle", nacelle)
+    one("multi_shell", multi_shell)

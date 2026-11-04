@@ -22,3 +22,6 @@ closed-form area and volume:
 | `bspline_patch.stp` | bicubic B-spline patch S = (u, v, u^2 v) split along a B-spline diagonal curve, no PCURVEs |
 | `bspline_plate_hole.stp` | bilinear B-spline plate with a rational B-spline circle hole |
 | `loft_fuselage.stp` | closed rational B-spline loft: cone, cylinder, cone, poles at nose and tail |
+| `cyl_fuselage.stp` | cylinder along x with hemispherical nose and tail, each hemisphere closing through its pole |
+| `nacelle.stp` | annular nacelle: an ellipse revolved at a radius, one doubly periodic face |
+| `multi_shell.stp` | two solids in one file: the box with a hole and a sphere beside it |
