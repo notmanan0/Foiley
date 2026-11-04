@@ -7,3 +7,9 @@
 /refsrc
 *.foiley.tmp
 /bench/*.log
+# Spitfire study: large generated outputs (keep the geometry and generator)
+/spitfire/Spitfire_MkI_6DoF.foiley
+/spitfire/results/
+/spitfire/run_log.txt
+/spitfire/run_err.txt
+/spitfire/spitfire_6dof_job.json
