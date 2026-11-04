@@ -301,8 +301,8 @@ pub fn face_mesh(model: &Model, fi: usize) -> Result<FaceMesh, String> {
                     worst = Some((score, uv));
                 }
             };
-            for k in 0..3 {
-                if edges[k].as_undirected().is_constraint_edge() {
+            for (k, e) in edges.iter().enumerate() {
+                if e.as_undirected().is_constraint_edge() {
                     continue;
                 }
                 let (a, b) = (k, (k + 1) % 3);

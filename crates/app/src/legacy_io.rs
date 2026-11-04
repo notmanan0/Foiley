@@ -144,7 +144,7 @@ impl<'a> Rd<'a> {
             return Ok(String::new());
         }
         let n = n as usize;
-        if n > MAX_LEN || n % 2 != 0 {
+        if n > MAX_LEN || !n.is_multiple_of(2) {
             return self.fail(at, what, format_args!("invalid string length {n}"));
         }
         let s = self.take(n, what)?;
@@ -434,7 +434,7 @@ fn finish_plane(mut plane: Plane, warnings: &mut Vec<String>) -> Option<Plane> {
 }
 
 fn empty_plane(name: String, description: String) -> Plane {
-    Plane { name, description, wings: vec![], fuses: vec![], point_masses: vec![], ..Plane::default_plane("", "") }
+    Plane { name, description, wings: vec![], fuses: vec![], point_masses: vec![] }
 }
 
 fn pm(tag: String, mass: f64, position: Vec3) -> PointMass {

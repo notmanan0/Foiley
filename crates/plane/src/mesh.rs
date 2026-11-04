@@ -525,7 +525,7 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
         }
         if root_trimmed && wing.two_sided {
             // left side strips run tip -> root, right side root -> tip
-            let ls = (first_strip..mesh.strips.len()).filter(|&i| mesh.strips[i].left && mesh.strips[i].surf == 0).last();
+            let ls = (first_strip..mesh.strips.len()).rfind(|&i| mesh.strips[i].left && mesh.strips[i].surf == 0);
             let rs = (first_strip..mesh.strips.len()).find(|&i| !mesh.strips[i].left && mesh.strips[i].surf == 0);
             if let (Some(l), Some(r)) = (ls, rs) {
                 mesh.carry.push((l, r));
@@ -596,7 +596,8 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
         let size = mesh.panels.iter().map(|p| p.size).fold(0.0, f64::max).max(1e-9);
         let tol = 1e-7 * size;
         let key = |p: Vec3| ((p.x / tol).round() as i64, (p.y / tol).round() as i64, (p.z / tol).round() as i64);
-        let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+        type Key = (i64, i64, i64);
+        let mut edges: HashMap<(Key, Key), Vec<usize>> = HashMap::new();
         for (i, p) in mesh.panels.iter().enumerate() {
             for k in 0..4 {
                 let (a, b) = (key(p.nodes[k]), key(p.nodes[(k + 1) % 4]));
