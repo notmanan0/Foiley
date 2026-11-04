@@ -168,6 +168,15 @@ pub struct FlapInfo {
     pub name: String,
     pub hinge_a: Vec3,
     pub hinge_b: Vec3,
+    /// side of the wing the flap is on
+    #[serde(default)]
+    pub left: bool,
+    /// wing surface (between sections `surf` and `surf + 1`)
+    #[serde(default)]
+    pub surf: usize,
+    /// hinge chord fraction used for the surface (mean of its two foils' hinges)
+    #[serde(default)]
+    pub xhinge: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -363,7 +372,7 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                     let idx = flap_counter;
                     flap_counter += 1;
                     let side = if left { "left" } else { "right" };
-                    mesh.flaps.push(FlapInfo { wing: iw, index: idx, name: format!("{} flap {} ({side})", wing.name, idx + 1), hinge_a: h_a, hinge_b: h_b });
+                    mesh.flaps.push(FlapInfo { wing: iw, index: idx, name: format!("{} flap {} ({side})", wing.name, idx + 1), hinge_a: h_a, hinge_b: h_b, left, surf: is, xhinge: xh });
                     flap_id = Some(id);
                     if let Some(d) = opt.flaps.get(&(iw, idx)) {
                         if d.abs() > 1e-9 && opt.flap_normals && !opt.thick {
