@@ -66,7 +66,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [ ] **F016** · Provenance and project format v2 — after F002
 - [ ] **F015a** · Raw-bit hooks and harness
 - [ ] **F021** · Coverage-aware auto-polars — after F003
-- [ ] **F004b** · GUI editing of every body — after F004a, F024
+- [x] **F004b** · GUI editing of every body — after F004a, F024
 - [ ] **F010b** · `.xfl`/`.fl5` import and conversion report
 - [ ] **F015b** · Raw-bit corpus and configuration matrix — after F015a
 - [ ] **F005b** · Coupled 8×8 stability and nonzero beta (+F006) — after F005a
