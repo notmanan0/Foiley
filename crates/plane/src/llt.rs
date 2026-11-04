@@ -281,6 +281,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             warnings,
             stability: None,
             wake: vec![],
+            balance_residual: None,
         };
         prog.count_ok();
         on_point(&opp);

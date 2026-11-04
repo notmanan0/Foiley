@@ -464,6 +464,9 @@ pub struct PlaneOpp {
     /// relaxed wake lines (free-wake VLM), for display
     #[serde(default)]
     pub wake: Vec<Vec<[f32; 3]>>,
+    /// T3 speed balance: |resultant - weight| / weight at the reported speed
+    #[serde(default)]
+    pub balance_residual: Option<f64>,
 }
 
 impl PlaneOpp {
@@ -752,6 +755,7 @@ impl<'a> Ctx<'a> {
             stability: None,
             root_bending,
             wake: vec![],
+            balance_residual: None,
         }
     }
 }
@@ -774,6 +778,11 @@ pub fn make_system<'a>(def: &PlanePolarDef, mesh: &'a Mesh, cog: Vec3, c_ref: f6
         Method::Llt => return Err(PlaneError::Input("LLT has no panel system".into())),
     })
 }
+
+/// Tolerance on |resultant - weight| / weight for the T3 speed balance.
+pub const GLIDE_TOL: f64 = 1e-4;
+/// Passes of the T3 speed balance before the point is declared unconverged.
+pub const GLIDE_MAX_ITER: usize = 50;
 
 /// Speed at which lift equals weight for the loads at unit speed.
 fn balance_speed(ctx: &Ctx, raw1: &RawLoads, alpha: f64, mass: f64) -> Option<f64> {
@@ -826,7 +835,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
             };
             let rest = prog.sub(0.5, 1.0);
             let n = ops.len();
-            let results: Vec<Result<Option<PlaneOpp>, PlaneError>> = {
+            let results: Vec<Result<Result<PlaneOpp, String>, PlaneError>> = {
                 use rayon::prelude::*;
                 ops.par_iter()
                     .enumerate()
@@ -838,12 +847,12 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
                             part.set(1.0);
                         }
                         match &r {
-                            Ok(Some(p)) => {
+                            Ok(Ok(p)) => {
                                 rest.count_ok();
                                 rest.debug(format!("alpha={:.2} beta={:.2} V={:.2}: CL={:.4} CD={:.5} Cm={:.4}", p.alpha, p.beta, p.velocity, p.cl, p.cd, p.cm));
                                 on_point(p);
                             }
-                            Ok(None) => rest.count_failed(),
+                            Ok(Err(_)) => rest.count_failed(),
                             Err(_) => {}
                         }
                         r
@@ -852,8 +861,8 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
             };
             for (k, r) in results.into_iter().enumerate() {
                 match r? {
-                    Some(p) => polar.points.push(p),
-                    None => polar.failed.push(format!("alpha={:.2} beta={:.2} V={:.2}: no positive lift for the speed balance", ops[k].0, ops[k].1, ops[k].2)),
+                    Ok(p) => polar.points.push(p),
+                    Err(why) => polar.failed.push(format!("alpha={:.2} beta={:.2} V={:.2}: {why}", ops[k].0, ops[k].1, ops[k].2)),
                 }
             }
         }
@@ -886,7 +895,9 @@ fn drop_strips(polar: &mut PlanePolar) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha: f64, beta: f64, v_spec: f64, prog: &Progress) -> Result<Option<PlaneOpp>, PlaneError> {
+/// Solve one operating point.  `Ok(Err(reason))` is a point that failed
+/// (it goes to the polar's `failed` list); `Err` aborts the whole polar.
+fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha: f64, beta: f64, v_spec: f64, prog: &Progress) -> Result<Result<PlaneOpp, String>, PlaneError> {
     let def = ctx.def;
     let wd = wind_dir(alpha, beta);
     let v = match def.kind {
@@ -894,7 +905,7 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
             let raw1 = sys.loads(wd, Vec3::ZERO);
             match balance_speed(ctx, &raw1, alpha, mass) {
                 Some(v) => v,
-                None => return Ok(None),
+                None => return Ok(Err("no positive lift for the speed balance".into())),
             }
         }
         _ => v_spec,
@@ -910,26 +921,30 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
     opp.wake = wake;
     if def.kind == PolarKind::Glide {
         // speed from the total aerodynamic force (viscous drag depends on Re)
-        let mut vv = v;
-        for _ in 0..30 {
+        let weight = mass * G;
+        let residual = |o: &PlaneOpp| ((o.cl * o.cl + o.cd * o.cd).sqrt() * 0.5 * def.fluid.rho * o.velocity * o.velocity * ctx.s_ref - weight).abs() / weight;
+        let mut res = residual(&opp);
+        let mut pass = 0;
+        while res >= GLIDE_TOL {
+            if pass == GLIDE_MAX_ITER {
+                return Ok(Err(format!("glide speed balance did not converge in {GLIDE_MAX_ITER} passes (|resultant - weight|/weight = {res:.2e})")));
+            }
+            pass += 1;
             let ca = (opp.cl * opp.cl + opp.cd * opp.cd).sqrt();
             if ca <= 1e-9 {
-                return Ok(None);
+                return Ok(Err("no aerodynamic force for the glide speed balance".into()));
             }
-            let vn = (2.0 * mass * G / (def.fluid.rho * ctx.s_ref * ca)).sqrt();
-            let done = (vn - vv).abs() < 0.005;
-            vv = vn;
-            let raw = sys.loads(wd * vv, Vec3::ZERO);
-            opp = ctx.reduce(mesh, &raw, cog, alpha, beta, vv, mass);
-            if done {
-                break;
-            }
+            let vn = (2.0 * weight / (def.fluid.rho * ctx.s_ref * ca)).sqrt();
+            let raw = sys.loads(wd * vn, Vec3::ZERO);
+            opp = ctx.reduce(mesh, &raw, cog, alpha, beta, vn, mass);
+            res = residual(&opp);
         }
+        opp.balance_residual = Some(res);
     }
     if def.derivatives && mass > 0.0 {
         opp.stability = stability::analyse(ctx, sys, cog, alpha, opp.velocity).ok();
     }
-    Ok(Some(opp))
+    Ok(Ok(opp))
 }
 
 fn control_value(def: &PlanePolarDef, t: f64, target: ControlTarget) -> Option<f64> {
