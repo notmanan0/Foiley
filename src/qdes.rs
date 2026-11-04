@@ -143,11 +143,11 @@ impl QdesState {
         self.clqsp[kqsp] = 0.0;
         self.cmqsp[kqsp] = 0.0;
         let sspmid = 0.5 * (self.sspec[nsp] - self.sspec[1]);
-        for i in 1..=(nsp + 1) / 2 {
+        for i in 1..=nsp.div_ceil(2) {
             self.sspec[i] = sspmid + 0.5 * (self.sspec[i] - self.sspec[nsp - i + 1]);
             self.qspec[kqsp][i] = 0.5 * (self.qspec[kqsp][i] - self.qspec[kqsp][nsp - i + 1]);
         }
-        for i in (nsp + 1) / 2 + 1..=nsp {
+        for i in nsp.div_ceil(2) + 1..=nsp {
             self.sspec[i] = -self.sspec[nsp - i + 1] + 2.0 * sspmid;
             self.qspec[kqsp][i] = -self.qspec[kqsp][nsp - i + 1];
         }
@@ -520,7 +520,7 @@ fn respline_current(xf: &mut XFoil) {
 /// gfortran list-directed REAL(8) item (field incl. separator blank, 26 chars).
 pub fn ld_real(v: f64) -> String {
     let a = v.abs();
-    if v == 0.0 || (a >= 0.1 && a < 1.0e17) {
+    if v == 0.0 || (0.1..1.0e17).contains(&a) {
         let k = if v == 0.0 { 1 } else { a.log10().floor() as i32 + 1 };
         let mut dec = (17 - k).max(0) as usize;
         let mut s = format!("{:.*}", dec, v);
