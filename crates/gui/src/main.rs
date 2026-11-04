@@ -10,6 +10,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod body_list;
 mod foil_ui;
 mod plane_ui;
 mod view3d;
