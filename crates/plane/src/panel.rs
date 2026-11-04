@@ -17,7 +17,7 @@
 
 use crate::mesh::{Mesh, Panel, PanelKind};
 use crate::PlaneError;
-use foiley_core::linalg::{DenseMatrix, Lu};
+use foiley_core::linalg::{diagnose, DenseMatrix, Diagnostics, FnRows, Lu, SolveReport};
 use foiley_core::{Progress, Vec3};
 use rayon::prelude::*;
 use std::f64::consts::PI;
@@ -215,11 +215,18 @@ pub struct PanelSystem<'a> {
     /// unit doublet solutions: u, v, w, p, q, r (one value per panel)
     pub unit_mu: [Vec<f64>; 6],
     pub ground: Option<f64>,
+    /// linear-solve diagnostics (empty when off)
+    pub report: SolveReport,
 }
 
 
 impl<'a> PanelSystem<'a> {
     pub fn build(mesh: &'a Mesh, cog: Vec3, wake_length: f64, wake_panels: usize, wake_ratio: f64, ground: Option<f64>, prog: &Progress) -> Result<Self, PlaneError> {
+        Self::build_with(mesh, cog, wake_length, wake_panels, wake_ratio, ground, prog, Diagnostics::Off)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with(mesh: &'a Mesh, cog: Vec3, wake_length: f64, wake_panels: usize, wake_ratio: f64, ground: Option<f64>, prog: &Progress, diag: Diagnostics) -> Result<Self, PlaneError> {
         if !mesh.thick {
             return Err(PlaneError::Input("the panel method needs a thick mesh".into()));
         }
@@ -333,10 +340,49 @@ impl<'a> PanelSystem<'a> {
                 rhs.set(i, k, r[k]);
             }
         }
+        let b0 = if diag != Diagnostics::Off { rhs.clone() } else { DenseMatrix::default() };
         lu.solve_many(&mut rhs);
+        let report = if diag != Diagnostics::Off {
+            prog.stage("Checking the solve");
+            // rows re-assembled in f64 with the same operations, in the same
+            // order, as the column fill and wake pass above
+            let op = FnRows {
+                n,
+                block: 1,
+                fill: |i: usize, out: &mut [f64]| {
+                    let ci = mesh.panels[i].centre;
+                    for (j, o) in out.iter_mut().enumerate() {
+                        let pj = &mesh.panels[j];
+                        *o = if i == j {
+                            let (_, d2) = match ground {
+                                Some(h) => quad_potentials(pj, Vec3::new(ci.x, ci.y, -ci.z - 2.0 * h), false),
+                                None => (0.0, 0.0),
+                            };
+                            -0.5 + d2
+                        } else {
+                            pot(pj, ci, false).1
+                        };
+                    }
+                    for w in &wake {
+                        let v: f64 = w.panels.iter().map(|wp| pot(wp, ci, false).1).sum();
+                        let (ku, kl) = (1.0 / w.upper_te.len() as f64, 1.0 / w.lower_te.len() as f64);
+                        for &u in &w.upper_te {
+                            out[u] += v * ku;
+                        }
+                        for &l in &w.lower_te {
+                            out[l] += -v * kl;
+                        }
+                    }
+                },
+            };
+            let te: Vec<usize> = wake.iter().flat_map(|w| w.upper_te.iter().chain(&w.lower_te).copied()).collect();
+            diagnose(diag, &lu, &op, &b0, &mut rhs, &te, 64)
+        } else {
+            SolveReport::default()
+        };
         let unit_mu = std::array::from_fn(|k| rhs.col(k).to_vec());
         prog.set(1.0);
-        Ok(PanelSystem { mesh, cog, wake, unit_mu, ground })
+        Ok(PanelSystem { mesh, cog, wake, unit_mu, ground, report })
     }
 
     pub fn solve(&self, vinf: Vec3, omega: Vec3) -> Vec<f64> {
@@ -413,6 +459,7 @@ impl<'a> PanelSystem<'a> {
         let _ = force;
         let tre: Vec<Vec3> = mesh.strips.par_iter().map(|s| crate::vlm::trefftz_velocity(mesh, &sg, (s.te_a + s.te_b) * 0.5, wdir, self.ground)).collect();
         let mut r = crate::analysis::RawLoads::from_parts(mesh, panel_force, Vec3::ZERO, moment, sg.clone(), tre, vinf);
+        r.pressure_force = force;
         // Forces from the far field (Kutta-Joukowski on the shed circulation,
         // as flow5 does): they converge much faster with chordwise panel
         // count than integrated pressures.  Moments keep the pressures.
@@ -424,6 +471,7 @@ impl<'a> PanelSystem<'a> {
             total += f;
         }
         r.force = total;
+        r.wake_force = total;
         r.cp = cp;
         r.mu = mu;
         r

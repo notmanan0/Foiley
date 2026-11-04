@@ -10,6 +10,7 @@ use crate::stability::{self, StabilityResult};
 use crate::vlm::VlmSystem;
 use crate::PlaneError;
 use foiley_core::atmosphere::Fluid;
+use foiley_core::linalg::{Diagnostics, SolveReport};
 use foiley_core::{Progress, Vec3, DEG};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -317,6 +318,8 @@ pub struct PlanePolarDef {
     pub keep_strips: bool,
     /// VLM free-wake relaxation iterations (0 = rigid wake along x)
     pub free_wake: usize,
+    /// linear-solve and force-balance checks (off by default)
+    pub diagnostics: Diagnostics,
     /// treat foils without loaded geometry as flat plates
     pub allow_missing_foils: bool,
 }
@@ -353,6 +356,7 @@ impl Default for PlanePolarDef {
             keep_strips: true,
             allow_missing_foils: false,
             free_wake: 0,
+            diagnostics: Diagnostics::Off,
         }
     }
 }
@@ -553,6 +557,11 @@ pub struct RawLoads {
     pub induced_force: Vec3,
     pub cp: Vec<f64>,
     pub mu: Vec<f64>,
+    /// total force from the near field (integrated pressures, or
+    /// Kutta-Joukowski on the bound vortices for VLM), per unit density
+    pub pressure_force: Vec3,
+    /// total force from Kutta-Joukowski on the shed (wake) circulation, per unit density
+    pub wake_force: Vec3,
 }
 
 impl RawLoads {
@@ -567,7 +576,9 @@ impl RawLoads {
         let ind = trefftz_force(mesh, &sg, &tre, wdir, &crate::vlm::carry_segments(mesh, &sg), |m| crate::vlm::trefftz_velocity(mesh, &sg, m, wdir, None));
         let v2 = vinf.norm2().max(1e-30);
         let cp = mesh.panels.iter().zip(&panel_force).map(|(p, f)| -f.dot(p.normal) / (0.5 * v2 * p.area.max(1e-30))).collect();
-        RawLoads { panel_force, force, moment, strip_gamma: sg, strip_wi: tre, strip_force, induced_force: ind, cp, mu: vec![] }
+        let pressure_force = panel_force.iter().fold(Vec3::ZERO, |a, f| a + *f);
+        let wake_force = mesh.strips.iter().zip(&sg).fold(Vec3::ZERO, |a, (s, g)| a + vinf.cross(s.te_b - s.te_a) * *g);
+        RawLoads { panel_force, force, moment, strip_gamma: sg, strip_wi: tre, strip_force, induced_force: ind, cp, mu: vec![], pressure_force, wake_force }
     }
 }
 
@@ -655,6 +666,34 @@ pub struct PlaneOpp {
     /// T3 speed balance: |resultant - weight| / weight at the reported speed
     #[serde(default)]
     pub balance_residual: Option<f64>,
+    /// numerical diagnostics (when the definition asks for them)
+    #[serde(default)]
+    pub diagnostics: Option<PointDiagnostics>,
+}
+
+/// Numerical checks of one operating point (`PlanePolarDef.diagnostics`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PointDiagnostics {
+    /// min|u_ii| / max|u_ii| of the LU factors (a crude warning sign)
+    #[serde(alias = "pivot_ratio")]
+    pub diag_ratio: f64,
+    /// Hager-Higham estimate of the 1-norm condition number
+    pub cond1_estimate: Option<f64>,
+    /// ||b - Ax||_inf / (||A||_inf ||x||_inf + ||b||_inf) on the checked rows
+    /// (operator re-assembled in f64); None for a relaxed-wake solve, which
+    /// re-factors per step and is not checked
+    pub backward_error: Option<f64>,
+    pub residual_inf: Option<f64>,
+    /// rows checked (all of them for `Full`)
+    pub rows_checked: usize,
+    pub unknowns: usize,
+    /// `Full`: iterative refinement kept for at least one unit solution
+    pub refined: bool,
+    /// near-field minus Trefftz-plane drag coefficient
+    pub cd_near_minus_trefftz: f64,
+    /// pressure (near-field) minus wake (Kutta-Joukowski on the shed
+    /// circulation) lift coefficient
+    pub cl_pressure_minus_wake: f64,
 }
 
 impl PlaneOpp {
@@ -746,6 +785,45 @@ impl<'a> System<'a> {
             System::Vlm(s) => s.lat.mesh,
             System::Panel(s) => s.mesh,
             System::TriLinear(s) => s.mesh,
+        }
+    }
+    /// Linear-solve diagnostics of the factored system.
+    pub fn report(&self) -> &SolveReport {
+        match self {
+            System::Vlm(s) => &s.report,
+            System::Panel(s) => &s.report,
+            System::TriLinear(s) => &s.report,
+        }
+    }
+    /// The six unit solutions (u, v, w, p, q, r).
+    pub fn unit(&self) -> &[Vec<f64>; 6] {
+        match self {
+            System::Vlm(s) => &s.unit,
+            System::Panel(s) => &s.unit_mu,
+            System::TriLinear(s) => &s.unit_mu,
+        }
+    }
+    /// Diagnostics of a point solved with `vinf`, `omega` (`relaxed`: the
+    /// circulation came from a relaxed-wake re-solve, not the unit solutions).
+    pub fn point_diagnostics(&self, raw: &RawLoads, vinf: Vec3, omega: Vec3, s_ref: f64, relaxed: bool) -> PointDiagnostics {
+        let rep = self.report();
+        let c = [vinf.x, vinf.y, vinf.z, omega.x, omega.y, omega.z];
+        let x_inf = (0..self.unit()[0].len()).map(|i| c.iter().zip(self.unit()).map(|(c, u)| c * u[i]).sum::<f64>().abs()).fold(0.0, f64::max);
+        let qs = 0.5 * vinf.norm2() * s_ref;
+        let a = vinf.normalized();
+        let alpha = a.z.atan2(a.x) / DEG;
+        let (wd, wn) = (a, wind_normal(alpha));
+        let dp = raw.pressure_force - raw.wake_force;
+        PointDiagnostics {
+            diag_ratio: rep.diag_ratio,
+            cond1_estimate: rep.cond1_estimate,
+            backward_error: if relaxed { None } else { rep.backward_error(&c, x_inf) },
+            residual_inf: if relaxed { None } else { rep.residual_inf(&c) },
+            rows_checked: rep.residuals.rows.len(),
+            unknowns: rep.n,
+            refined: rep.refined.iter().any(|r| *r),
+            cd_near_minus_trefftz: (raw.pressure_force - raw.induced_force).dot(wd) / qs,
+            cl_pressure_minus_wake: dp.dot(wn) / qs,
         }
     }
     pub fn cog(&self) -> Vec3 {
@@ -945,6 +1023,7 @@ impl<'a> Ctx<'a> {
             root_bending,
             wake: vec![],
             balance_residual: None,
+            diagnostics: None,
         }
     }
 }
@@ -961,9 +1040,9 @@ pub fn mesh_options(def: &PlanePolarDef, extra_flaps: &HashMap<(usize, usize), f
 /// Build and factor the solver for a mesh.
 pub fn make_system<'a>(def: &PlanePolarDef, mesh: &'a Mesh, cog: Vec3, c_ref: f64, prog: &Progress) -> Result<System<'a>, PlaneError> {
     Ok(match def.method {
-        Method::Vlm1 | Method::Vlm2 => System::Vlm(VlmSystem::build(mesh, def.method == Method::Vlm2, cog, def.ground_height, prog)?),
-        Method::Panel | Method::TriPanel => System::Panel(PanelSystem::build(mesh, cog, def.wake_length * c_ref, def.wake_panels, def.wake_ratio, def.ground_height, prog)?),
-        Method::TriLinear => System::TriLinear(LinearPanelSystem::build(mesh, cog, def.wake_length * c_ref, def.wake_panels, def.wake_ratio, def.ground_height, prog)?),
+        Method::Vlm1 | Method::Vlm2 => System::Vlm(VlmSystem::build_with(mesh, def.method == Method::Vlm2, cog, def.ground_height, prog, def.diagnostics)?),
+        Method::Panel | Method::TriPanel => System::Panel(PanelSystem::build_with(mesh, cog, def.wake_length * c_ref, def.wake_panels, def.wake_ratio, def.ground_height, prog, def.diagnostics)?),
+        Method::TriLinear => System::TriLinear(LinearPanelSystem::build_with(mesh, cog, def.wake_length * c_ref, def.wake_panels, def.wake_ratio, def.ground_height, prog, def.diagnostics)?),
         Method::Llt => return Err(PlaneError::Input("LLT has no panel system".into())),
     })
 }
@@ -1137,7 +1216,11 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
         }
         _ => (sys.loads(wd * v, Vec3::ZERO), vec![]),
     };
+    let relaxed = !wake.is_empty();
     let mut opp = ctx.reduce(mesh, &raw, cog, alpha, beta, v, mass);
+    if def.diagnostics != Diagnostics::Off {
+        opp.diagnostics = Some(sys.point_diagnostics(&raw, wd * v, Vec3::ZERO, ctx.s_ref, relaxed));
+    }
     opp.wake = wake;
     if def.kind == PolarKind::Glide {
         // speed from the total aerodynamic force (viscous drag depends on Re)
@@ -1157,6 +1240,9 @@ fn solve_point(ctx: &Ctx, sys: &System, mesh: &Mesh, cog: Vec3, mass: f64, alpha
             let vn = (2.0 * weight / (def.fluid.rho * ctx.s_ref * ca)).sqrt();
             let raw = sys.loads(wd * vn, Vec3::ZERO);
             opp = ctx.reduce(mesh, &raw, cog, alpha, beta, vn, mass);
+            if def.diagnostics != Diagnostics::Off {
+                opp.diagnostics = Some(sys.point_diagnostics(&raw, wd * vn, Vec3::ZERO, ctx.s_ref, false));
+            }
             res = residual(&opp);
         }
         opp.balance_residual = Some(res);
@@ -1219,6 +1305,9 @@ fn run_control(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &(d
         let sys = make_system(def, &mesh, inertia.cog, ctx.c_ref, &sub.sub(0.0, 0.9))?;
         let raw = sys.loads(wind_dir(a, b) * v, Vec3::ZERO);
         let mut opp = ctx.reduce(&mesh, &raw, inertia.cog, a, b, v, inertia.mass);
+        if def.diagnostics != Diagnostics::Off {
+            opp.diagnostics = Some(sys.point_diagnostics(&raw, wind_dir(a, b) * v, Vec3::ZERO, ctx.s_ref, false));
+        }
         opp.ctrl = t;
         if let Some(why) = nonfinite_reason(&opp) {
             sub.set(1.0);
@@ -1272,6 +1361,9 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
             Some((alpha, u0)) => {
                 let raw = sys.loads(wind_dir(alpha, def.beta) * u0, Vec3::ZERO);
                 let mut opp = ctx.reduce(&mesh, &raw, cog, alpha, def.beta, u0, mass);
+                if def.diagnostics != Diagnostics::Off {
+                    opp.diagnostics = Some(sys.point_diagnostics(&raw, wind_dir(alpha, def.beta) * u0, Vec3::ZERO, ctx.s_ref, false));
+                }
                 opp.ctrl = t;
                 if let Some(why) = nonfinite_reason(&opp) {
                     prog.count_failed();

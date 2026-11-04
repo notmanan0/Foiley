@@ -283,6 +283,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             stability_error: None,
             wake: vec![],
             balance_residual: None,
+            diagnostics: None,
         };
         if let Some(why) = crate::analysis::nonfinite_reason(&opp) {
             prog.count_failed();

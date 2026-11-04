@@ -15,7 +15,7 @@ use crate::analysis::{trefftz_force, RawLoads};
 use crate::mesh::{Mesh, Panel, PanelKind};
 use crate::panel::{build_wake, combine_unit};
 use crate::PlaneError;
-use foiley_core::linalg::{DenseMatrix, Lu};
+use foiley_core::linalg::{diagnose, DenseMatrix, Diagnostics, FnRows, Lu, SolveReport};
 use foiley_core::{Progress, Vec3};
 use rayon::prelude::*;
 use std::f64::consts::PI;
@@ -206,6 +206,8 @@ pub struct LinearPanelSystem<'a> {
     /// Seven-point samples of each triangle, for loads.
     coarse: Vec<Vec<Sample>>,
     wake: Vec<LinearWake>,
+    /// linear-solve diagnostics (empty when off)
+    pub report: SolveReport,
 }
 
 impl<'a> LinearPanelSystem<'a> {
@@ -218,7 +220,12 @@ impl<'a> LinearPanelSystem<'a> {
         ground: Option<f64>,
         prog: &Progress,
     ) -> Result<Self, PlaneError> {
-        Self::build_order(mesh, cog, wake_length, wake_panels, wake_ratio, ground, prog, 2)
+        Self::build_order(mesh, cog, wake_length, wake_panels, wake_ratio, ground, prog, 2, Diagnostics::Off)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with(mesh: &'a Mesh, cog: Vec3, wake_length: f64, wake_panels: usize, wake_ratio: f64, ground: Option<f64>, prog: &Progress, diag: Diagnostics) -> Result<Self, PlaneError> {
+        Self::build_order(mesh, cog, wake_length, wake_panels, wake_ratio, ground, prog, 2, diag)
     }
 
     fn build_order(
@@ -230,6 +237,7 @@ impl<'a> LinearPanelSystem<'a> {
         ground: Option<f64>,
         prog: &Progress,
         depth: usize,
+        diag: Diagnostics,
     ) -> Result<Self, PlaneError> {
         prog.check()?;
         if !mesh.thick || mesh.panels.is_empty() {
@@ -376,19 +384,59 @@ impl<'a> LinearPanelSystem<'a> {
                     Ok(x)
                 },
             )?;
-        drop(wake_rows);
         prog.check()?;
         let mut rhs = DenseMatrix { rows: n, cols: 6, data };
         prog.stage(format!("Factorising Galerkin system ({n} unknowns)"));
         let lu = Lu::factor(a)?;
         prog.check()?;
+        let b0 = if diag != Diagnostics::Off { rhs.clone() } else { DenseMatrix::default() };
         lu.solve_many(&mut rhs);
+        let report = if diag != Diagnostics::Off {
+            prog.stage("Checking the solve");
+            // the three Galerkin rows of target triangle i, re-assembled with
+            // the same operations, per entry in the same order, as above
+            let op = FnRows {
+                n,
+                block: 3,
+                fill: |i: usize, out: &mut [f64]| {
+                    out.iter_mut().for_each(|v| *v = 0.0);
+                    for (j, source) in triangles.iter().enumerate() {
+                        for sample in tested(i, source) {
+                            let (_, d) = source.image_potentials(sample.p, ground, i == j);
+                            for r in 0..3 {
+                                let w = sample.weight * sample.basis[r];
+                                for k in 0..3 {
+                                    out[r * n + 3 * j + k] += w * d[k];
+                                }
+                            }
+                        }
+                        if i == j {
+                            for r in 0..3 {
+                                for k in 0..3 {
+                                    out[r * n + 3 * j + k] -= if r == k { 1.0 / 12.0 } else { 1.0 / 24.0 };
+                                }
+                            }
+                        }
+                        for &(k, iw, e, sign) in &trace[j] {
+                            for r in 0..3 {
+                                out[r * n + 3 * j + k] += sign * wake_rows[i][iw][r][e];
+                            }
+                        }
+                    }
+                },
+            };
+            let te: Vec<usize> = wake.iter().flat_map(|w| w.upper.iter().chain(&w.lower).copied()).collect();
+            diagnose(diag, &lu, &op, &b0, &mut rhs, &te, 64)
+        } else {
+            SolveReport::default()
+        };
+        drop(wake_rows);
         if rhs.data.iter().any(|v| !v.is_finite()) {
             return Err(PlaneError::Solver("non-finite linear-doublet solution".into()));
         }
         let unit_mu = std::array::from_fn(|k| rhs.col(k).to_vec());
         prog.set(1.0);
-        Ok(Self { mesh, cog, unit_mu, ground, triangles, coarse, wake })
+        Ok(Self { mesh, cog, unit_mu, ground, triangles, coarse, wake, report })
     }
 
     pub fn solve(&self, vinf: Vec3, omega: Vec3) -> Vec<f64> {
@@ -440,6 +488,7 @@ impl<'a> LinearPanelSystem<'a> {
             loads.strip_force[i] = f;
             loads.force += f;
         }
+        loads.wake_force = loads.force;
         loads.cp = cp;
         loads.mu = mu;
         loads
@@ -572,7 +621,7 @@ mod tests {
         let v = crate::analysis::wind_dir(5.0, 0.0);
         let mut results = Vec::new();
         for (depth, nw) in [(2, 5), (3, 5), (3, 10)] {
-            let sys = LinearPanelSystem::build_order(&m, Vec3::ZERO, 100.0, nw, 1.1, None, &Progress::none(), depth).unwrap();
+            let sys = LinearPanelSystem::build_order(&m, Vec3::ZERO, 100.0, nw, 1.1, None, &Progress::none(), depth, Diagnostics::Off).unwrap();
             let r = sys.loads(v, Vec3::ZERO);
             let mut te_jump: f64 = 0.0;
             for s in &m.strips {
