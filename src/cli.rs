@@ -672,8 +672,7 @@ impl Session {
                 "ASEQ" | "AS" | "CSEQ" | "CS" => {
                     let lalfa = com == "ASEQ" || com == "AS";
                     self.xf.lalfa = lalfa;
-                    let npoint;
-                    if lalfa {
+                    let npoint = if lalfa {
                         let (mut a1, mut a2, mut da) = (self.aa.0, self.aa.1, self.aa.2);
                         if ninput >= 3 {
                             a1 = r[0];
@@ -695,7 +694,7 @@ impl Session {
                         da = if a2 < a1 { -da.abs() } else { da.abs() };
                         self.aa = (a1, a2, da);
                         let (aa1, aa2, daa) = (a1 * DTOR, a2 * DTOR, da * DTOR);
-                        npoint = if daa != 0.0 { ((aa2 - aa1) / daa + 0.5) as i64 + 1 } else { 1 };
+                        if daa != 0.0 { ((aa2 - aa1) / daa + 0.5) as i64 + 1 } else { 1 }
                     } else {
                         let (mut c1, mut c2, mut dc) = self.clseq;
                         if ninput >= 3 {
@@ -717,8 +716,8 @@ impl Session {
                         }
                         dc = if c2 < c1 { -dc.abs() } else { dc.abs() };
                         self.clseq = (c1, c2, dc);
-                        npoint = if dc != 0.0 { ((c2 - c1) / dc + 0.5) as i64 + 1 } else { 1 };
-                    }
+                        if dc != 0.0 { ((c2 - c1) / dc + 0.5) as i64 + 1 } else { 1 }
+                    };
                     self.extra_state.lplot = true;
                     self.sequence(lalfa, npoint.max(0) as usize);
                     self.comold = com.clone();
