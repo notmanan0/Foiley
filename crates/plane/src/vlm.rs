@@ -12,7 +12,7 @@
 
 use crate::mesh::{Mesh, PanelKind};
 use crate::PlaneError;
-use foiley_core::linalg::{DenseMatrix, Lu};
+use foiley_core::linalg::{diagnose, DenseMatrix, Diagnostics, FnRows, Lu, SolveReport};
 use foiley_core::{Progress, Vec3};
 use rayon::prelude::*;
 use std::f64::consts::PI;
@@ -172,10 +172,16 @@ pub struct VlmSystem<'a> {
     pub cog: Vec3,
     /// unit solutions: u, v, w, p, q, r
     pub unit: [Vec<f64>; 6],
+    /// linear-solve diagnostics (empty when off)
+    pub report: SolveReport,
 }
 
 impl<'a> VlmSystem<'a> {
     pub fn build(mesh: &'a Mesh, rings: bool, cog: Vec3, ground: Option<f64>, prog: &Progress) -> Result<Self, PlaneError> {
+        Self::build_with(mesh, rings, cog, ground, prog, Diagnostics::Off)
+    }
+
+    pub fn build_with(mesh: &'a Mesh, rings: bool, cog: Vec3, ground: Option<f64>, prog: &Progress, diag: Diagnostics) -> Result<Self, PlaneError> {
         if mesh.thick {
             return Err(PlaneError::Input("VLM needs a thin mesh".into()));
         }
@@ -221,10 +227,29 @@ impl<'a> VlmSystem<'a> {
                 rhs.set(i, 3 + k, -r.cross(e[k]).dot(p.normal));
             }
         }
+        let b0 = if diag != Diagnostics::Off { rhs.clone() } else { DenseMatrix::default() };
         lu.solve_many(&mut rhs);
+        let report = if diag != Diagnostics::Off {
+            prog.stage("Checking the solve");
+            // rows re-assembled in f64 exactly as in the fill above
+            let op = FnRows {
+                n,
+                block: 1,
+                fill: |i: usize, out: &mut [f64]| {
+                    let pi = &mesh.panels[i];
+                    for (j, o) in out.iter_mut().enumerate() {
+                        *o = lat.element_velocity(j, pi.ctrl, false).dot(pi.normal);
+                    }
+                },
+            };
+            let te: Vec<usize> = mesh.strips.iter().filter_map(|s| s.panels.last().copied()).collect();
+            diagnose(diag, &lu, &op, &b0, &mut rhs, &te, 64)
+        } else {
+            SolveReport::default()
+        };
         let unit = std::array::from_fn(|k| rhs.col(k).to_vec());
         prog.set(1.0);
-        Ok(VlmSystem { lat, cog, unit })
+        Ok(VlmSystem { lat, cog, unit, report })
     }
 
     /// Circulations for freestream `vinf` (relative air velocity) and body rates `omega`.

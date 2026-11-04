@@ -107,8 +107,12 @@ pub struct Lu {
     lu: DenseMatrix,
     fwd: Vec<usize>,
     bwd: Vec<usize>,
-    /// estimated reciprocal "pivot growth" (min|u_ii| / max|u_ii|)
-    pub pivot_ratio: f64,
+    /// min|u_ii| / max|u_ii| over the diagonal of U.  This is only a crude
+    /// warning sign: it is neither a pivot-growth factor nor a condition
+    /// number (use `cond1_estimate`).  Formerly `pivot_ratio`.
+    pub diag_ratio: f64,
+    /// ||A||_1 of the matrix before factorisation (max column sum).
+    pub norm1: f64,
 }
 
 impl Lu {
@@ -116,9 +120,12 @@ impl Lu {
     pub fn factor(mut a: DenseMatrix) -> Result<Lu, LinalgError> {
         assert_eq!(a.rows, a.cols, "LU needs a square matrix");
         let n = a.rows;
-        if a.data.par_iter().any(|v| !v.is_finite()) {
-            return Err(LinalgError::NonFinite);
-        }
+        // one O(N^2) pass: finiteness and the 1-norm (max column sum)
+        let colsum = |c: &[f64]| c.iter().try_fold(0.0f64, |s, v| if v.is_finite() { Some(s + v.abs()) } else { None });
+        let norm1 = match a.data.par_chunks(n.max(1)).map(colsum).try_reduce(|| 0.0, |x, y| Some(x.max(y))) {
+            Some(v) => v,
+            None => return Err(LinalgError::NonFinite),
+        };
         let mut fwd = vec![0usize; n];
         let mut bwd = vec![0usize; n];
         {
@@ -145,7 +152,7 @@ impl Lu {
             let col = (0..n).find(|&i| a.at(i, i).abs() <= dmax * 1e-14).unwrap_or(0);
             return Err(LinalgError::Singular { col });
         }
-        Ok(Lu { lu: a, fwd, bwd, pivot_ratio: if dmax > 0.0 { dmin / dmax } else { 0.0 } })
+        Ok(Lu { lu: a, fwd, bwd, diag_ratio: if dmax > 0.0 { dmin / dmax } else { 0.0 }, norm1 })
     }
 
     pub fn n(&self) -> usize {
@@ -172,6 +179,69 @@ impl Lu {
         self.solve_mat(rhs);
     }
 
+    /// Solve `A^T x = b` in place for one right-hand side.
+    pub fn solve_transpose(&self, b: &mut [f64]) {
+        let n = self.lu.rows;
+        let rhs = MatMut::from_column_major_slice_mut(b, n, 1);
+        let p = par();
+        let mut mem = MemBuffer::new(solve::solve_transpose_in_place_scratch::<usize, f64>(n, 1, p));
+        let stack = MemStack::new(&mut mem);
+        let lu = self.lu.as_ref();
+        solve::solve_transpose_in_place(lu, lu, self.perm(), rhs, p, stack);
+    }
+
+    /// Hager-Higham estimate of ||A^-1||_1 (LAPACK xLACN2 iteration plus
+    /// Higham's alternative vector): at most 5 solves with A and 4 with A^T
+    /// using the existing factors, O(N^2).  A lower bound, usually within a
+    /// small factor of the exact value.
+    pub fn inv_norm1_estimate(&self) -> f64 {
+        let n = self.n();
+        if n == 0 {
+            return 0.0;
+        }
+        let norm1 = |v: &[f64]| v.iter().map(|x| x.abs()).sum::<f64>();
+        let sign = |v: &[f64]| v.iter().map(|x| if *x >= 0.0 { 1.0 } else { -1.0 }).collect::<Vec<f64>>();
+        let argmax = |v: &[f64]| (0..v.len()).max_by(|&a, &b| v[a].abs().total_cmp(&v[b].abs())).unwrap_or(0);
+        let mut x = vec![1.0 / n as f64; n];
+        self.solve(&mut x);
+        let mut est = norm1(&x);
+        if n > 1 {
+            let mut xi = sign(&x);
+            let mut z = xi.clone();
+            self.solve_transpose(&mut z);
+            let mut j = argmax(&z);
+            for _ in 0..4 {
+                let mut y = vec![0.0; n];
+                y[j] = 1.0;
+                self.solve(&mut y);
+                let old = est;
+                est = norm1(&y);
+                let s = sign(&y);
+                if s == xi || est <= old {
+                    est = est.max(old);
+                    break;
+                }
+                xi = s;
+                z.clone_from(&xi);
+                self.solve_transpose(&mut z);
+                let jl = j;
+                j = argmax(&z);
+                if z[jl].abs() == z[j].abs() {
+                    break;
+                }
+            }
+        }
+        // alternative estimate: x_i = (-1)^i (1 + i/(n-1))
+        let mut alt: Vec<f64> = (0..n).map(|i| (if i % 2 == 0 { 1.0 } else { -1.0 }) * (1.0 + i as f64 / (n.max(2) - 1) as f64)).collect();
+        self.solve(&mut alt);
+        est.max(2.0 * norm1(&alt) / (3.0 * n as f64))
+    }
+
+    /// Estimated 1-norm condition number ||A||_1 ||A^-1||_1.
+    pub fn cond1_estimate(&self) -> f64 {
+        self.norm1 * self.inv_norm1_estimate()
+    }
+
     fn solve_mat(&self, rhs: MatMut<'_, f64>) {
         let n = self.lu.rows;
         let p = par();
@@ -180,6 +250,206 @@ impl Lu {
         let lu = self.lu.as_ref();
         solve::solve_in_place(lu, lu, self.perm(), rhs, p, stack);
     }
+}
+
+/// A square matrix whose rows can be re-assembled on demand in f64, in
+/// blocks of `block_size()` consecutive rows.  Used for residuals that must
+/// not come from a rounded or factored copy of the operator.
+pub trait RowOperator: Sync {
+    fn dim(&self) -> usize;
+    fn block_size(&self) -> usize {
+        1
+    }
+    /// Fill block `b` (rows `b*bs .. b*bs+bs`) row-major: `out[r*n + j] = A[b*bs + r][j]`.
+    fn fill_block(&self, b: usize, out: &mut [f64]);
+}
+
+impl RowOperator for DenseMatrix {
+    fn dim(&self) -> usize {
+        self.rows
+    }
+    fn fill_block(&self, b: usize, out: &mut [f64]) {
+        for (j, o) in out.iter_mut().enumerate() {
+            *o = self.at(b, j);
+        }
+    }
+}
+
+/// A `RowOperator` from a closure.
+pub struct FnRows<F: Fn(usize, &mut [f64]) + Sync> {
+    pub n: usize,
+    pub block: usize,
+    pub fill: F,
+}
+
+impl<F: Fn(usize, &mut [f64]) + Sync> RowOperator for FnRows<F> {
+    fn dim(&self) -> usize {
+        self.n
+    }
+    fn block_size(&self) -> usize {
+        self.block
+    }
+    fn fill_block(&self, b: usize, out: &mut [f64]) {
+        (self.fill)(b, out)
+    }
+}
+
+/// How much checking of a linear solve to do (off by default).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Diagnostics {
+    #[default]
+    Off,
+    /// condition estimate plus a residual on sampled rows: O(N^2)
+    Cheap,
+    /// exact residual on every row (operator re-assembled in f64) and one
+    /// step of iterative refinement, kept only if it lowers the residual
+    Full,
+}
+
+/// Residuals of the solutions `x` (columns) on some rows of `op`.
+#[derive(Clone, Debug, Default)]
+pub struct RowResiduals {
+    /// rows checked, ascending
+    pub rows: Vec<usize>,
+    /// max abs row sum of `op` over those rows (||A||_inf when all rows)
+    pub a_inf: f64,
+    /// per right-hand side: b at those rows, and r = b - A x there
+    pub b: Vec<Vec<f64>>,
+    pub r: Vec<Vec<f64>>,
+}
+
+/// Re-assemble blocks `blocks` of `op` (in parallel) and evaluate the
+/// residual of every column of `x` against the same column of `b`.
+pub fn row_residuals(op: &dyn RowOperator, blocks: &[usize], x: &DenseMatrix, b: &DenseMatrix) -> RowResiduals {
+    let n = op.dim();
+    let bs = op.block_size();
+    let k = x.cols;
+    let per: Vec<(usize, f64, Vec<f64>)> = blocks
+        .par_iter()
+        .flat_map_iter(|&blk| {
+            let mut a = vec![0.0; bs * n];
+            op.fill_block(blk, &mut a);
+            (0..bs)
+                .filter(move |r| blk * bs + r < n)
+                .map(|r| {
+                    let i = blk * bs + r;
+                    let row = &a[r * n..(r + 1) * n];
+                    let asum: f64 = row.iter().map(|v| v.abs()).sum();
+                    let res: Vec<f64> = (0..k).map(|c| b.at(i, c) - row.iter().zip(x.col(c)).map(|(a, x)| a * x).sum::<f64>()).collect();
+                    (i, asum, res)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut per = per;
+    per.sort_by_key(|p| p.0);
+    let rows: Vec<usize> = per.iter().map(|p| p.0).collect();
+    RowResiduals {
+        a_inf: per.iter().map(|p| p.1).fold(0.0, f64::max),
+        b: (0..k).map(|c| rows.iter().map(|&i| b.at(i, c)).collect()).collect(),
+        r: (0..k).map(|c| per.iter().map(|p| p.2[c]).collect()).collect(),
+        rows,
+    }
+}
+
+/// Normwise backward error ||r||_inf / (||A||_inf ||x||_inf + ||b||_inf).
+pub fn backward_error(r_inf: f64, a_inf: f64, x_inf: f64, b_inf: f64) -> f64 {
+    let d = a_inf * x_inf + b_inf;
+    if d > 0.0 {
+        r_inf / d
+    } else {
+        0.0
+    }
+}
+
+fn inf_norm(v: &[f64]) -> f64 {
+    v.iter().fold(0.0, |m, x| m.max(x.abs()))
+}
+
+/// What the diagnostics found for a factored system and its solutions.
+#[derive(Clone, Debug, Default)]
+pub struct SolveReport {
+    pub level: Diagnostics,
+    pub n: usize,
+    pub diag_ratio: f64,
+    pub cond1_estimate: Option<f64>,
+    pub residuals: RowResiduals,
+    /// per right-hand side: refinement step kept
+    pub refined: Vec<bool>,
+}
+
+impl SolveReport {
+    /// Backward error of the combination x = sum c_k x_k (b = sum c_k b_k)
+    /// on the checked rows; `x_inf` is ||x||_inf of the combined solution.
+    pub fn backward_error(&self, c: &[f64], x_inf: f64) -> Option<f64> {
+        let res = &self.residuals;
+        if res.rows.is_empty() {
+            return None;
+        }
+        let comb = |v: &[Vec<f64>]| (0..res.rows.len()).map(|i| c.iter().zip(v).map(|(c, col)| c * col[i]).sum::<f64>()).collect::<Vec<f64>>();
+        let (r, b) = (comb(&res.r), comb(&res.b));
+        Some(backward_error(inf_norm(&r), res.a_inf, x_inf, inf_norm(&b)))
+    }
+    /// ||r||_inf of the combination on the checked rows.
+    pub fn residual_inf(&self, c: &[f64]) -> Option<f64> {
+        let res = &self.residuals;
+        if res.rows.is_empty() {
+            return None;
+        }
+        Some((0..res.rows.len()).map(|i| c.iter().zip(&res.r).map(|(c, col)| c * col[i]).sum::<f64>().abs()).fold(0.0, f64::max))
+    }
+}
+
+/// Run the requested diagnostics on `lu` (the factors of `op`), the
+/// right-hand sides `b` and their solutions `x` (refined in place for
+/// `Full` when that lowers a column's residual).  `must_rows` are rows that
+/// are always checked in `Cheap` mode (trailing-edge / Kutta rows).
+pub fn diagnose(level: Diagnostics, lu: &Lu, op: &dyn RowOperator, b: &DenseMatrix, x: &mut DenseMatrix, must_rows: &[usize], samples: usize) -> SolveReport {
+    let n = op.dim();
+    let bs = op.block_size().max(1);
+    let nb = n.div_ceil(bs);
+    let mut rep = SolveReport { level, n, diag_ratio: lu.diag_ratio, ..Default::default() };
+    if level == Diagnostics::Off || n == 0 {
+        return rep;
+    }
+    rep.cond1_estimate = Some(lu.cond1_estimate());
+    let blocks: Vec<usize> = match level {
+        Diagnostics::Full => (0..nb).collect(),
+        _ => {
+            let mut v: Vec<usize> = must_rows.iter().map(|r| r / bs).collect();
+            let rows = samples.min(n);
+            v.extend((0..rows).map(|k| (k * n / rows.max(1)) / bs));
+            v.sort_unstable();
+            v.dedup();
+            v
+        }
+    };
+    let mut res = row_residuals(op, &blocks, x, b);
+    rep.refined = vec![false; x.cols];
+    if level == Diagnostics::Full {
+        // one step of iterative refinement, in f64, against the re-assembled operator
+        let mut d = DenseMatrix::zeros(n, x.cols);
+        for c in 0..x.cols {
+            for (k, &i) in res.rows.iter().enumerate() {
+                d.set(i, c, res.r[c][k]);
+            }
+        }
+        lu.solve_many(&mut d);
+        let mut x2 = x.clone();
+        for (v, dv) in x2.data.iter_mut().zip(&d.data) {
+            *v += dv;
+        }
+        let res2 = row_residuals(op, &blocks, &x2, b);
+        for c in 0..x.cols {
+            if inf_norm(&res2.r[c]) < inf_norm(&res.r[c]) {
+                x.col_mut(c).copy_from_slice(x2.col(c));
+                res.r[c].clone_from(&res2.r[c]);
+                rep.refined[c] = true;
+            }
+        }
+    }
+    rep.residuals = res;
+    rep
 }
 
 /// Least-squares solution of an overdetermined system `A X = B` (QR).

@@ -50,7 +50,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [x] **F001** · 2D bench harness fixes
 - [x] **F009** · Input validation and finite output
 - [x] **F011** · No silent stability failures
-- [ ] **F013** · Numerical diagnostics
+- [x] **F013** · Numerical diagnostics
 - [ ] **F023** · LLT settings honesty — after F009
 - [ ] **F012** · Viscous envelope status
 - [ ] **F014** · Cancellable blocked LU
