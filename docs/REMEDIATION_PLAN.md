@@ -55,7 +55,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [x] **F012** · Viscous envelope status
 - [x] **F014** · Cancellable blocked LU
 - [ ] **F008** · LLT glide balance — after F020
-- [ ] **F018** · Node-preserving 2D input
+- [x] **F018** · Node-preserving 2D input
 - [ ] **F024** · GUI CAD import as a job
 - [ ] **F002** · Explicit polar families
 - [ ] **F007** · One wake-aware evaluator for every driver (+F019) — after F020

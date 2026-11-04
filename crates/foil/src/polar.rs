@@ -76,6 +76,12 @@ pub struct FoilPolar {
     /// operating points that could not be converged (alpha or CL or Re spec)
     #[serde(default)]
     pub failed: Vec<f64>,
+    /// panel nodes the points were solved on (0 = not recorded)
+    #[serde(default)]
+    pub nodes: usize,
+    /// `foil::node_hash` of those nodes (0 = not recorded)
+    #[serde(default)]
+    pub node_hash: u64,
 }
 
 impl FoilPolar {

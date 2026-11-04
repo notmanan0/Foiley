@@ -7,7 +7,7 @@ use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 use foiley_app::JobKind;
 use foiley_foil::analysis::{PointDetail, PolarType};
 use foiley_foil::batch::{re_list_geometric, BatchCase};
-use foiley_foil::foil::Paneling;
+use foiley_foil::foil::{NodeInput, Paneling};
 use foiley_foil::{AnalysisSettings, Foil, FoilPoint, Sweep};
 use foiley_foil::inverse::{modify, InverseMode, ModKind, Modification, SpeedDist};
 use foiley_foil::optim::{Algorithm, Goal, OptimResult, OptimSettings};
@@ -612,7 +612,13 @@ impl App {
                     let s = &mut self.fui.settings;
                     egui::Grid::new("solver").num_columns(2).show(ui, |ui| {
                         int(ui, "iterations", &mut s.max_iter, 10..=1000, "Newton iteration limit per point (XFoil ITER)");
-                        int(ui, "panel nodes", &mut s.paneling.panels, 40..=350, "airfoil panel nodes (XFoil PANE)");
+                        let mut keep = s.paneling == NodeInput::Preserve;
+                        if check(ui, "keep input nodes", &mut keep, "solve on the foil's own coordinates (XFoil LOAD + PCOP) instead of repaneling them (PANE)") {
+                            s.paneling = if keep { NodeInput::Preserve } else { NodeInput::default() };
+                        }
+                        if let NodeInput::Pangen(p) = &mut s.paneling {
+                            int(ui, "panel nodes", &mut p.panels, 40..=350, "airfoil panel nodes (XFoil PANE)");
+                        }
                         num(ui, "VACC", &mut s.vaccel, 0.001, 0.0..=0.1, "viscous acceleration parameter (XFoil VACC, default 0.01)");
                         check(ui, "recover unconverged points", &mut s.recover, "re-initialise the boundary layer and march in sub-steps from a converged neighbour when a point fails");
                         check(ui, "sweep outwards from zero lift", &mut s.from_zero, "every point warm-starts from an attached-flow neighbour (more robust near stall)");
