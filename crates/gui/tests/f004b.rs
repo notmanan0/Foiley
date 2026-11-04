@@ -2,7 +2,8 @@
 #[path = "../src/body_list.rs"]
 mod body_list;
 
-use body_list::{apply, selected, selected_mut, set_cad_surface, BodyAction};
+use body_list::{apply, selected, selected_mut, BodyAction};
+use foiley_app::CadImportResult;
 use foiley_core::Vec3;
 use foiley_plane::geom::Plane;
 
@@ -42,15 +43,18 @@ fn f004b_gui_state_edits_second_body() {
     assert_eq!(p.fuses[0], first);
     assert_eq!((p.fuses[1].position.x, p.fuses[1].frames[2].half_width, p.fuses[1].mass), (0.4, 0.08, 1.5));
 
-    // per-body CAD import goes into the selected body only, in metres, keeping its mass
+    // per-body CAD import (the CAD job's result, scaled to metres by the
+    // reader) goes into the selected body only, keeping its mass
     let target = selected(&p, &mut sel).unwrap();
-    set_cad_surface(&mut p, target, "pod_cad", octahedron_mm(), 1e-3).unwrap();
+    let metres: Vec<[Vec3; 3]> = octahedron_mm().into_iter().map(|t| t.map(|v| v * 1e-3)).collect();
+    let import = |body: usize, triangles: Vec<[Vec3; 3]>| CadImportResult { body, name: "pod_cad".into(), triangles, notes: vec![] };
+    import(target, metres).apply(&mut p).unwrap();
     assert_eq!(p.fuses[0], first);
     assert_eq!(p.fuses[1].name, "pod_cad");
     assert_eq!(p.fuses[1].triangles.len(), 8);
     assert_eq!(p.fuses[1].mass, 1.5);
     assert!((p.fuses[1].length() - 2.0).abs() < 1e-12, "mm scaled to m: {}", p.fuses[1].length());
-    assert!(set_cad_surface(&mut p, 5, "x", octahedron_mm(), 1.0).unwrap_err().contains("no body 6"));
+    assert!(import(5, octahedron_mm()).apply(&mut p).unwrap_err().contains("body 6 does not exist"));
 
     // duplicate, select and remove
     apply(&mut p, &mut sel, BodyAction::Select(0));

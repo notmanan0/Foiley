@@ -250,6 +250,8 @@ impl XFoil {
     }
 
     /// Direct-mode BL march with Ue, inverse at separation (MRCHUE).
+    // MAX(MIN(..)) as in the Fortran; f64::clamp differs for NaN
+    #[allow(clippy::manual_clamp)]
     pub fn mrchue(&mut self) {
         let hlmax = 3.8;
         let htmax = 2.5;
@@ -435,6 +437,8 @@ impl XFoil {
     }
 
     /// Mixed-mode BL march with Ue-Hk relation (MRCHDU).
+    // MAX(MIN(..)) as in the Fortran; f64::clamp differs for NaN
+    #[allow(clippy::manual_clamp)]
     pub fn mrchdu(&mut self) {
         const DEPS: f64 = 5.0e-6;
         let senswt = 1000.0;

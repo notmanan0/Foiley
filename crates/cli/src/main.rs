@@ -45,6 +45,8 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// parsed once per run: the variant sizes do not matter
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// XFoil-compatible menu mode (reads XFoil commands from stdin)
     Xfoil {
@@ -354,6 +356,8 @@ struct PlaneSrc {
 }
 
 #[derive(Subcommand)]
+// parsed once per run: the variant sizes do not matter
+#[allow(clippy::large_enum_variant)]
 enum PlaneCmd {
     /// Geometry, reference dimensions and mass properties
     Info {
@@ -495,7 +499,7 @@ enum PlaneCmd {
 }
 
 fn parse_list(s: &str) -> Result<Vec<f64>, String> {
-    s.split(|c| c == ',' || c == ';')
+    s.split([',', ';'])
         .map(|t| t.trim())
         .filter(|t| !t.is_empty())
         .map(|t| t.parse::<f64>().map_err(|_| format!("'{t}' is not a number")))
@@ -927,18 +931,20 @@ fn real_main() -> Result<(), String> {
                 use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
-                let mut st = OptimSettings::default();
-                st.algorithm = match algorithm.to_lowercase().as_str() {
-                    "ga" | "genetic" => Algorithm::Genetic,
-                    _ => Algorithm::Mopso,
+                let mut st = OptimSettings {
+                    algorithm: match algorithm.to_lowercase().as_str() {
+                        "ga" | "genetic" => Algorithm::Genetic,
+                        _ => Algorithm::Mopso,
+                    },
+                    analysis: x.settings()?,
+                    alpha,
+                    population,
+                    iterations,
+                    bumps_per_side: bumps,
+                    max_amplitude: amplitude,
+                    seed,
+                    ..OptimSettings::default()
                 };
-                st.analysis = x.settings()?;
-                st.alpha = alpha;
-                st.population = population;
-                st.iterations = iterations;
-                st.bumps_per_side = bumps;
-                st.max_amplitude = amplitude;
-                st.seed = seed;
                 if let Some(f) = flap {
                     let v = parse_list(&f)?;
                     if v.len() != 2 {
@@ -1018,8 +1024,8 @@ fn real_main() -> Result<(), String> {
                     eprintln!("  new foil: t/c {:.2}% at {:.3}, camber {:.2}% at {:.3}, CL {:.4} at {alpha} deg", p.thickness * 100.0, p.x_thickness, p.camber * 100.0, p.x_camber, d1.cl);
                     if let Some(path) = speed_csv {
                         let mut s = String::from("x,s,q_initial,q_target\n");
-                        for i in 0..d0.q.len() {
-                            s.push_str(&format!("{:.6},{:.6},{:.6},{:.6}\n", d0.x[i], d0.s[i], d0.q[i], t[i]));
+                        for (i, q) in d0.q.iter().enumerate() {
+                            s.push_str(&format!("{:.6},{:.6},{:.6},{:.6}\n", d0.x[i], d0.s[i], q, t[i]));
                         }
                         std::fs::write(path, s).map_err(|e| e.to_string())?;
                     }

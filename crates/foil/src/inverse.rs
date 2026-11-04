@@ -155,9 +155,7 @@ pub fn solve(foil: &Foil, alpha: f64, mode: InverseMode, pan: &Paneling, target:
     if target.iter().any(|v| !v.is_finite()) {
         return Err(FoilError::Geometry("target speed contains NaN".into()));
     }
-    for i in 1..=n {
-        s.qdes_state.qspec[1][i] = target[i - 1];
-    }
+    s.qdes_state.qspec[1][1..=n].copy_from_slice(&target[..n]);
     let script = match mode {
         InverseMode::Mixed => {
             let (i1, i2) = seg.ok_or_else(|| FoilError::Geometry("mixed inverse needs a modified segment".into()))?;

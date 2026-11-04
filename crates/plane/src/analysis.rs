@@ -483,6 +483,8 @@ impl PlanePolarDef {
     }
 
     /// Check the definition, including every operating point it expands to.
+    // `!(x > 0.0)` deliberately also rejects NaN
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn validate(&self) -> Result<(), String> {
         let fin = |name: &str, v: f64| if v.is_finite() { Ok(()) } else { Err(format!("{name} must be a finite number (got {v})")) };
         fin("speed", self.velocity)?;
@@ -1140,13 +1142,13 @@ impl<'a> Ctx<'a> {
         for w in &mesh.wings {
             let r = w.strips.clone();
             let idx: Vec<usize> = r.collect();
-            for (k, &i) in idx.iter().enumerate() {
+            for &i in &idx {
                 let si = &mesh.strips[i];
                 let side_left = si.left;
                 let mut bm = 0.0;
                 for &j in &idx[..] {
                     let sj = &mesh.strips[j];
-                    let outboard = if side_left { j < idx[k] || (j == i) } else { j > i || j == i };
+                    let outboard = if side_left { j <= i } else { j >= i };
                     if sj.left == side_left && outboard && j != i {
                         let arm = (sj.c4 - si.c4).dot(Vec3::Y).abs().max((sj.c4 - si.c4).dot(Vec3::Z).abs());
                         bm += strips[j].lift_per_span * sj.width * arm;

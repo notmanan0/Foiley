@@ -129,7 +129,7 @@ fn parse_args(comarg: &str) -> Args {
         r[k + 1] = *v;
     }
     // GETINT: list-directed integer read; any non-integer token is an error
-    let toks: Vec<&str> = a.split(|c: char| c == ' ' || c == ',' || c == '\t').filter(|t| !t.is_empty()).take(20).collect();
+    let toks: Vec<&str> = a.split([' ', ',', '\t']).filter(|t| !t.is_empty()).take(20).collect();
     // (items before the first bad one are assigned, as in a gfortran list-directed READ)
     for (k, t) in toks.iter().enumerate() {
         match t.parse::<i64>() {
@@ -169,7 +169,7 @@ fn readi(input: &mut Input, var: &mut [i64]) -> bool {
     if input.eof {
         return false;
     }
-    let toks: Vec<&str> = line.split(|c: char| c == ' ' || c == ',' || c == '\t').filter(|t| !t.is_empty()).collect();
+    let toks: Vec<&str> = line.split([' ', ',', '\t']).filter(|t| !t.is_empty()).collect();
     let mut tmp = Vec::new();
     for t in toks {
         match t.parse::<i64>() {
@@ -865,6 +865,8 @@ fn over(s: &mut Session, fname1: &str) {
 // TGAP, LERAD (xgdes.f)
 // ---------------------------------------------------------------------------
 
+// MIN(MAX(..)) as in the Fortran; f64::clamp differs for NaN
+#[allow(clippy::manual_clamp)]
 fn tgap(s: &mut Session, rinput: &[f64], ninput: usize) {
     let (sble, xble, yble, xbte, ybte, chbsq, gap, dxu, dyu);
     {
@@ -906,13 +908,12 @@ fn tgap(s: &mut Session, rinput: &[f64], ninput: usize) {
     let nb = xf.nb;
     for i in 1..=nb {
         let xoc = ((xf.xb[i] - xble) * (xbte - xble) + (xf.yb[i] - yble) * (ybte - yble)) / chbsq;
-        let tfac;
-        if doc == 0.0 {
-            tfac = if i == 1 || i == nb { 1.0 } else { 0.0 };
+        let tfac = if doc == 0.0 {
+            if i == 1 || i == nb { 1.0 } else { 0.0 }
         } else {
             let arg = ((1.0 - xoc) * (1.0 / doc - 1.0)).min(15.0);
-            tfac = (-arg).exp();
-        }
+            (-arg).exp()
+        };
         if xf.sb[i] <= sble {
             xf.xb[i] += 0.5 * dgap * xoc * tfac * dxu;
             xf.yb[i] += 0.5 * dgap * xoc * tfac * dyu;
@@ -1701,6 +1702,8 @@ fn print_clcm(clx: f64, cmx: f64) {
 
 /// Read x/c,value pairs from the keyboard until a blank line.
 /// Returns the clamped pairs.
+// explicit IF chain as in the Fortran; f64::clamp keeps -0.0 instead of 0.0
+#[allow(clippy::manual_clamp)]
 fn read_pairs(input: &mut Input) -> Vec<(f64, f64)> {
     let mut out = Vec::new();
     for _ in 0..2 * IQX {

@@ -268,10 +268,13 @@ impl AutoPlan {
     }
 }
 
+/// (mach, ncrit, xtr_top, xtr_bot) of a polar family.
+type FamilyParams = (f64, f64, f64, f64);
+
 /// (mach, ncrit, xtr_top, xtr_bot) of the family the plan fills for a
 /// foil, and that family if it exists already.  The selection's values
 /// (defaults where it leaves them open) when it matches nothing yet.
-fn family_params(db: &FoilDb, foil: &str, def: &PlanePolarDef) -> Result<((f64, f64, f64, f64), Option<FamilyId>), String> {
+fn family_params(db: &FoilDb, foil: &str, def: &PlanePolarDef) -> Result<(FamilyParams, Option<FamilyId>), String> {
     let sel = &def.family;
     let d = AnalysisSettings::default();
     let fresh = (sel.mach.unwrap_or(d.mach), sel.ncrit.unwrap_or(d.ncrit), sel.xtr_top.unwrap_or(d.xtr_top), sel.xtr_bot.unwrap_or(d.xtr_bot));
@@ -304,8 +307,8 @@ pub fn plan(plane: &Plane, foils: &[Foil], db: &FoilDb, def: &PlanePolarDef, cou
     let (a0, a1) = cov.alpha;
     let sweep = Sweep::Alpha { from: (a0 - 3.0).floor().clamp(-15.0, -2.0), to: (a1 + 3.0).ceil().clamp(6.0, 22.0), step: 0.5 };
     // (family params, stations) -> foils
-    let mut groups: Vec<((f64, f64, f64, f64), Vec<f64>, Vec<Foil>)> = Vec::new();
-    let mut add = |params: (f64, f64, f64, f64), re: Vec<f64>, f: Foil| {
+    let mut groups: Vec<(FamilyParams, Vec<f64>, Vec<Foil>)> = Vec::new();
+    let mut add = |params: FamilyParams, re: Vec<f64>, f: Foil| {
         if re.is_empty() {
             return;
         }

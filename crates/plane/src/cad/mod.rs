@@ -57,10 +57,10 @@ pub fn bspline_basis(knots: &[f64], p: usize, u: f64, out: &mut Vec<f64>) {
         }
         nb[j] = saved;
     }
-    for j in 0..=p {
+    for (j, &b) in nb.iter().enumerate() {
         let i = k - p + j;
         if i < n {
-            out[i] = nb[j];
+            out[i] = b;
         }
     }
 }
@@ -299,7 +299,8 @@ pub fn orient(tris: &mut [Tri]) {
     let tol = 1e-7 * bbox_diag(tris).max(1e-12);
     let key = |p: Vec3| ((p.x / tol).round() as i64, (p.y / tol).round() as i64, (p.z / tol).round() as i64);
     let n = tris.len();
-    let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+    type Key = (i64, i64, i64);
+    let mut edges: HashMap<(Key, Key), Vec<usize>> = HashMap::new();
     for (i, t) in tris.iter().enumerate() {
         for k in 0..3 {
             let (a, b) = (key(t[k]), key(t[(k + 1) % 3]));
@@ -352,7 +353,7 @@ pub fn read_stl(bytes: &[u8]) -> Result<Vec<Tri>, String> {
     let is_ascii = bytes.len() >= 5 && bytes[..5].eq_ignore_ascii_case(b"solid") && {
         // binary files may also start with "solid": check the size rule
         let n = if bytes.len() >= 84 { u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize } else { usize::MAX };
-        !(bytes.len() == 84 + 50 * n)
+        bytes.len() != 84 + 50 * n
     };
     let tris = if is_ascii {
         let text = String::from_utf8_lossy(bytes);
@@ -367,7 +368,7 @@ pub fn read_stl(bytes: &[u8]) -> Result<Vec<Tri>, String> {
                 v.push(Vec3::new(p[0], p[1], p[2]));
             }
         }
-        if v.len() % 3 != 0 {
+        if !v.len().is_multiple_of(3) {
             return Err("vertex count is not a multiple of 3".into());
         }
         v.chunks(3).map(|c| [c[0], c[1], c[2]]).collect::<Vec<_>>()

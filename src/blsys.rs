@@ -309,6 +309,8 @@ pub fn hst(hk: f64, rt: f64, msq: f64) -> (f64, f64, f64, f64) {
 
 /// Turbulent skin friction (Coles). Returns (cf, cf_hk, cf_rt, cf_msq).
 #[inline]
+// 2.3026 is the Fortran literal; LN_10 would change the result bits
+#[allow(clippy::approx_constant)]
 pub fn cft(hk: f64, rt: f64, msq: f64, cffac: f64) -> (f64, f64, f64, f64) {
     const GAM: f64 = 1.4;
     let gm1 = GAM - 1.0;
@@ -336,6 +338,8 @@ pub fn hct(hk: f64, msq: f64) -> (f64, f64, f64) {
 
 /// Envelope e^n amplification rate. Returns (ax, ax_hk, ax_th, ax_rt).
 #[inline]
+// 2.3025851 is the Fortran literal; LN_10 would change the result bits
+#[allow(clippy::approx_constant)]
 pub fn dampl(hk: f64, th: f64, rt: f64) -> (f64, f64, f64, f64) {
     const DGR: f64 = 0.08;
     let hmi = 1.0 / (hk - 1.0);
@@ -379,6 +383,8 @@ pub fn dampl(hk: f64, th: f64, rt: f64) -> (f64, f64, f64, f64) {
 
 /// Modified envelope e^n amplification rate (with separated-profile correction).
 #[inline]
+// 2.3025851 is the Fortran literal; LN_10 would change the result bits
+#[allow(clippy::approx_constant)]
 pub fn dampl2(hk: f64, th: f64, rt: f64) -> (f64, f64, f64, f64) {
     const DGR: f64 = 0.08;
     const HK1: f64 = 3.5;
@@ -1047,10 +1053,8 @@ impl BlSys {
             }
             self.c2.ampl = ampl2;
         }
-        if !converged {
-            if crate::verbose() {
-                crate::outln!(" TRCHEK2: N2 convergence failed.");
-            }
+        if !converged && crate::verbose() {
+            crate::outln!(" TRCHEK2: N2 convergence failed.");
         }
         self.c2.ampl = ampl2;
         self.xt = xt;
