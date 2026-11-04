@@ -61,7 +61,7 @@ most O(N²). Nothing adds an O(N³) step to the default path.
 - [ ] **F007** · One wake-aware evaluator for every driver (+F019) — after F020
 - [ ] **F004a** · Multi-body meshing
 - [ ] **F010a** · AVL export fidelity and importer
-- [ ] **F003** · Flap-deflected polars — after F002, F004a
+- [x] **F003** · Flap-deflected polars — after F002, F004a
 - [ ] **F005a** · `FullLoad` stability model — after F007
 - [ ] **F016** · Provenance and project format v2 — after F002
 - [ ] **F015a** · Raw-bit hooks and harness

@@ -76,6 +76,11 @@ pub struct FoilPolar {
     /// operating points that could not be converged (alpha or CL or Re spec)
     #[serde(default)]
     pub failed: Vec<f64>,
+    /// trailing-edge flap deflection of the geometry the polar was computed
+    /// on, degrees (+ down), relative to the foil `foil` as stored (whose
+    /// hinge it uses).  0 for the undeflected foil.
+    #[serde(default)]
+    pub flap_deg: f64,
 }
 
 impl FoilPolar {
