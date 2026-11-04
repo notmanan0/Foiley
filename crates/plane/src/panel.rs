@@ -200,6 +200,7 @@ fn mesh_panel(nodes: [Vec3; 4], strip: usize) -> Panel {
         vb: lb,
         kind: PanelKind::Mid,
         wing: usize::MAX,
+        body_id: None,
         strip: Some(strip),
         trailing: false,
         leading: false,

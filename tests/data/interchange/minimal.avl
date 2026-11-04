@@ -1,0 +1,62 @@
+Minimal AVL glider
+#Mach
+0.0
+#IYsym IZsym Zsym
+0 0 0.0
+#Sref Cref Bref
+0.5 0.25 2.0
+#Xref Yref Zref
+0.08 0.0 0.0
+#CDp
+0.012
+#
+#==============================================================
+SURFACE
+Wing
+!Nchord  Cspace  Nspan  Sspace
+8        1.0     12     -2.0
+YDUPLICATE
+0.0
+ANGLE
+1.0
+SECTION
+#Xle  Yle  Zle  Chord  Ainc
+0.0   0.0  0.0  0.3    0.0
+AFILE
+mini_foil.dat
+CONTROL
+#name  gain  Xhinge  XYZhvec  SgnDup
+aileron  1.0  0.75  0 0 0  -1
+SECTION
+0.05  1.0  0.05  0.2  -2.0
+AFILE
+mini_foil.dat
+CONTROL
+aileron  1.0  0.75  0 0 0  -1
+NOWAKE
+CLAF
+1.05
+#==============================================================
+SURFACE
+Stab
+6 1.0 6 0.0
+YDUPLICATE
+0.0
+TRANSLATE
+0.9 0.0 0.05
+SECTION
+0.0  0.0  0.0  0.14  0.0
+NACA
+0009
+SECTION
+0.02  0.3  0.0  0.1  0.0
+NACA
+0009
+#==============================================================
+BODY
+Fuse pod
+12 1.0
+TRANSLATE
+-0.2 0.0 0.0
+BFILE
+pod.dat

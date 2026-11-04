@@ -122,6 +122,9 @@ struct XfoilOpts {
     /// number of panel nodes (XFoil PANGEN, max 354)
     #[arg(long, default_value_t = 160)]
     panels: usize,
+    /// solve on the foil's own coordinates (XFoil LOAD + PCOP) instead of PANGEN
+    #[arg(long)]
+    keep_nodes: bool,
     /// do not try to recover unconverged points
     #[arg(long)]
     no_recover: bool,
@@ -147,7 +150,7 @@ impl XfoilOpts {
             xtr_bot: x[1],
             viscous: !self.inviscid,
             max_iter: self.iter,
-            paneling: Paneling { panels: self.panels, ..Default::default() },
+            paneling: if self.keep_nodes { foiley_foil::foil::NodeInput::Preserve } else { foiley_foil::foil::NodeInput::Pangen(Paneling { panels: self.panels, ..Default::default() }) },
             recover: !self.no_recover,
             from_zero: !self.no_from_zero,
             parallel: !self.sequential,
@@ -649,6 +652,18 @@ fn strips_csv(p: &PlanePolar) -> String {
     s
 }
 
+/// Import a file into a project.  xflr5 / flow5 projects, .plr polars and
+/// AVL geometry print their conversion report (mapped, approximated, skipped).
+fn import_file(p: &mut Project, file: &std::path::Path) -> Result<String, String> {
+    if foiley_app::legacy_io::is_interchange(file) {
+        let r = foiley_app::legacy_io::import_into(p, file)?;
+        eprint!("{}", r.text());
+        Ok(format!("{} ({} mapped, {} approximated, {} skipped)", r.source, r.mapped.len(), r.approximated.len(), r.skipped.len()))
+    } else {
+        p.import(file)
+    }
+}
+
 /// Load a plane (xml or project) and the foils it needs.
 fn load_plane(src: &PlaneSrc) -> Result<(Project, Plane), String> {
     let ext = src.plane.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -733,7 +748,7 @@ fn real_main() -> Result<(), String> {
                 Project::load(&file)?
             } else {
                 let mut p = Project::new(&file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default());
-                let msg = p.import(&file)?;
+                let msg = import_file(&mut p, &file)?;
                 eprintln!("  imported {msg}");
                 p
             };
@@ -1378,7 +1393,7 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
     for (k, step) in sc.steps.into_iter().enumerate() {
         eprintln!("step {}/{n}", k + 1);
         match step {
-            Step::Import(p) => eprintln!("  imported {}", proj.import(&rel(&p))?),
+            Step::Import(p) => eprintln!("  imported {}", import_file(&mut proj, &rel(&p))?),
             Step::Naca(c) => {
                 let f = Foil::naca(&c).map_err(|e| e.to_string())?;
                 eprintln!("  added {}", f.name);

@@ -1,5 +1,6 @@
 //! Plane design, 3D analysis and stability modules.
 
+use crate::body_list::{self, BodyAction};
 use crate::view3d::{self, Camera, ColorField, Overlay};
 use crate::widgets::{self, check, heading, hint, int, num, num_u, section, series_color};
 use crate::{App, Pending};
@@ -9,7 +10,7 @@ use foiley_app::{auto, JobId, JobKind};
 use foiley_core::atmosphere::{isa, Fluid};
 use foiley_core::{Spacing, Vec3};
 use foiley_plane::analysis::{ControlRange, ControlTarget, ExtraDrag, Method, PlaneOpp, PolarKind, RefDims, Setting};
-use foiley_plane::geom::{Fuse, FuseFrame, PointMass, Wing, WingKind, WingSection};
+use foiley_plane::geom::{FuseFrame, PointMass, Wing, WingKind, WingSection};
 use foiley_plane::mesh::{Mesh, MeshOptions};
 use foiley_plane::stability::{modal_initial_state, time_response};
 use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
@@ -18,6 +19,8 @@ use std::hash::{Hash, Hasher};
 
 pub struct PlaneUi {
     pub sel_wing: usize,
+    /// selected body (index into `Plane::fuses`) in the fuselage tab
+    pub sel_body: usize,
     pub design_tab: usize,
     pub def: PlanePolarDef,
     pub altitude: f64,
@@ -49,6 +52,7 @@ impl Default for PlaneUi {
     fn default() -> Self {
         PlaneUi {
             sel_wing: 0,
+            sel_body: 0,
             design_tab: 0,
             def: PlanePolarDef::default(),
             altitude: 0.0,
@@ -175,7 +179,7 @@ impl App {
                 ui.separator();
                 match self.pui.design_tab {
                     0 => wings_editor(ui, p, &mut self.pui.sel_wing, &foil_names),
-                    1 => fuse_editor(ui, p),
+                    1 => fuse_editor(ui, p, &mut self.pui.sel_body),
                     2 => masses_editor(ui, p),
                     _ => summary(ui, p, &db),
                 }
@@ -1225,46 +1229,69 @@ fn wings_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize, foils: &[Stri
     }
 }
 
-fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane) {
-    if p.fuses.is_empty() {
-        hint(ui, "No fuselage. VLM ignores fuselages; the 3D panel method models them.");
-        if ui.button("+ add a default pod").clicked() {
-            p.fuses.push(Fuse::default_pod());
+// ---- F024 merge point ----------------------------------------------------
+/// Import an STL / STEP file into body `body` (`p.fuses[body]`), keeping its
+/// mass.  This is today's path: it reads and tessellates on the UI thread.
+/// F024 moves CAD import into the job manager; that job takes the same target
+/// body index, and its result should be applied with
+/// `body_list::set_cad_surface(p, body, ...)`, replacing this function.
+fn import_cad_into_body(p: &mut Plane, body: usize, path: &std::path::Path, unit: usize) -> Result<(), String> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let tris = if ext == "stl" {
+        std::fs::read(path).map_err(|e| e.to_string()).and_then(|b| foiley_plane::cad::read_stl(&b))?
+    } else {
+        std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| foiley_plane::cad::read_step_target(&t, 3000).map(|r| r.0))?
+    };
+    let scale = [1.0, 1e-3, 1e-2, 0.0254, 0.3048][unit.min(4)];
+    let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    body_list::set_cad_surface(p, body, &name, tris, scale)
+}
+// ---------------------------------------------------------------------------
+
+/// Body list (every entry of `p.fuses`) and the editor of the selected body.
+fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) {
+    let mut action = None;
+    ui.horizontal_wrapped(|ui| {
+        for i in 0..p.fuses.len() {
+            if ui.selectable_label(*sel == i, body_list::label(p, i)).on_hover_text(p.fuses[i].kind_label()).clicked() {
+                action = Some(BodyAction::Select(i));
+            }
         }
-        return;
+    });
+    ui.horizontal(|ui| {
+        if ui.button("+ pod").on_hover_text("add a default pod beside the last body").clicked() {
+            action = Some(BodyAction::AddPod);
+        }
+        if !p.fuses.is_empty() && ui.button("duplicate").clicked() {
+            action = Some(BodyAction::Duplicate);
+        }
+        if !p.fuses.is_empty() && ui.button("remove").on_hover_text("remove the selected body").clicked() {
+            action = Some(BodyAction::Remove);
+        }
+    });
+    if let Some(a) = action {
+        body_list::apply(p, sel, a);
     }
-    let mut remove = false;
-    let f = &mut p.fuses[0];
-    ui.label(RichText::new(format!("type: {}", f.kind_label())).strong());
+    let Some(ib) = body_list::selected(p, sel) else {
+        hint(ui, "No fuselage. VLM ignores fuselages; the 3D panel method models every body (bodies must not overlap).");
+        return;
+    };
+    ui.separator();
+    ui.label(RichText::new(format!("type: {}", p.fuses[ib].kind_label())).strong());
+    let err_id = egui::Id::new(("body_import_error", ib));
+    let mut import = None;
     ui.horizontal(|ui| {
         static UNITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let mut u = UNITS.load(std::sync::atomic::Ordering::Relaxed);
         if widgets::pick(ui, "fuseunits", &mut u, &["units: auto (STEP) / m", "mm", "cm", "inch", "foot"]) {
             UNITS.store(u, std::sync::atomic::Ordering::Relaxed);
         }
-        if ui.button("Import STL / STEP...").on_hover_text("replace this fuselage by a CAD surface; use the triangle panel method to analyse it").clicked() {
+        if ui.button("Import STL / STEP...").on_hover_text("replace this body by a CAD surface; use the triangle panel method to analyse it").clicked() {
             if let Some(path) = rfd::FileDialog::new().add_filter("CAD surface", &["stl", "step", "stp"]).pick_file() {
-                let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-                let res = if ext == "stl" {
-                    std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| foiley_plane::cad::read_stl(&b))
-                } else {
-                    std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| foiley_plane::cad::read_step_target(&t, 3000).map(|r| r.0))
-                };
-                if let Ok(mut tris) = res {
-                    let s = [1.0, 1e-3, 1e-2, 0.0254, 0.3048][u];
-                    if s != 1.0 {
-                        for t in &mut tris {
-                            for v in t.iter_mut() {
-                                *v = *v * s;
-                            }
-                        }
-                    }
-                    let mass = f.mass;
-                    let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    *f = Fuse::from_triangles(&name, tris, mass);
-                }
+                import = Some((path, u));
             }
         }
+        let f = &mut p.fuses[ib];
         if f.triangles.is_empty() && f.nurbs.is_none() && ui.button("Convert to NURBS").on_hover_text("edit control points like xflr5 / flow5").clicked() {
             f.nurbs = f.to_nurbs();
         }
@@ -1272,9 +1299,23 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane) {
             f.nurbs = None;
         }
     });
+    if let Some((path, u)) = import {
+        let res = import_cad_into_body(p, ib, &path, u).map_err(|e| format!("{}: {e}", path.display()));
+        ui.data_mut(|d| match res {
+            Ok(()) => d.remove::<String>(err_id),
+            Err(e) => d.insert_temp(err_id, e),
+        });
+    }
+    if let Some(e) = ui.data(|d| d.get_temp::<String>(err_id)) {
+        ui.label(RichText::new(format!("import failed: {e}")).color(Color32::from_rgb(230, 80, 70)));
+    }
+    let Some(f) = body_list::selected_mut(p, sel) else { return };
     if !f.triangles.is_empty() {
         ui.label(format!("{} triangles, length {:.3} m, wetted area {:.4} m2", f.triangles.len(), f.length(), f.wetted_area()));
         egui::Grid::new("fusetri").num_columns(2).show(ui, |ui| {
+            ui.label("name");
+            ui.text_edit_singleline(&mut f.name);
+            ui.end_row();
             ui.label("position x, y, z (m)");
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut f.position.x).speed(0.005));
@@ -1284,9 +1325,6 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane) {
             ui.end_row();
             num_u(ui, "structural mass", &mut f.mass, 0.01, 0.0..=1e6, " kg", "distributed over the skin");
         });
-        if ui.button("remove fuselage").clicked() {
-            p.fuses.clear();
-        }
         return;
     }
     if let Some(n) = &mut f.nurbs {
@@ -1336,12 +1374,6 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane) {
             }
         }
         let _ = np;
-        if ui.button("remove fuselage").clicked() {
-            remove = true;
-        }
-        if remove {
-            p.fuses.clear();
-        }
         return;
     }
     egui::Grid::new("fuse").num_columns(2).show(ui, |ui| {
@@ -1389,15 +1421,9 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane) {
             let last = *f.frames.last().unwrap();
             f.frames.push(FuseFrame { x: last.x + 0.1, ..last });
         }
-        if ui.button("remove fuselage").clicked() {
-            remove = true;
-        }
     });
     if f.validate().is_err() {
         ui.label(RichText::new("frame x positions must increase").color(Color32::from_rgb(230, 80, 70)));
-    }
-    if remove {
-        p.fuses.clear();
     }
 }
 
