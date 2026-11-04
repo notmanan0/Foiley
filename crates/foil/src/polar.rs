@@ -28,9 +28,25 @@ pub struct FoilPoint {
     pub iterations: u32,
     /// solved after a recovery step (re-initialised BL or sub-stepping)
     pub recovered: bool,
+    /// which recovery strategy converged the point, if any
+    #[serde(default)]
+    pub recovery: Recovery,
     /// trailing-edge flap deflection, degrees (type 6 polars)
     #[serde(default)]
     pub flap: f64,
+}
+
+/// How a point that failed its first solve was recovered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Recovery {
+    /// converged on the first attempt
+    #[default]
+    None,
+    /// re-initialised the boundary layer from the inviscid solution
+    ReinitBl,
+    /// marched from a converged start in `substeps` steps; `attempts` counts
+    /// the (start, substeps) combinations tried, this one included
+    March { substeps: u32, attempts: u32 },
 }
 
 impl FoilPoint {
@@ -293,6 +309,7 @@ pub fn lerp_point(a: &FoilPoint, b: &FoilPoint, t: f64) -> FoilPoint {
         mach: l(a.mach, b.mach),
         iterations: a.iterations.max(b.iterations),
         recovered: a.recovered || b.recovered,
+        recovery: if a.recovery != Recovery::None { a.recovery } else { b.recovery },
         flap: l(a.flap, b.flap),
     }
 }

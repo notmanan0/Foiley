@@ -18,7 +18,7 @@ pub mod polar;
 
 pub use analysis::{analyze, AnalysisSettings, PointDetail, PolarType, Sweep};
 pub use foil::{Foil, FoilProps};
-pub use polar::{FoilPoint, FoilPolar};
+pub use polar::{FoilPoint, FoilPolar, Recovery};
 
 /// Error type for the 2D layer.
 #[derive(Debug, Clone, PartialEq)]
