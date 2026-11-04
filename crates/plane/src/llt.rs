@@ -148,6 +148,8 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             v = (2.0 * mass * G / (rho * s_w * 0.5)).sqrt();
         }
         let mut converged = false;
+        // T3: |resultant - W| / W at the speed the section data were read at
+        let mut balance = f64::INFINITY;
         let mut cl = vec![0.0; m];
         let mut extra = vec![(0.0, 0.0, 1.0, 1.0, Envelope::Inside); m];
         let mut ok = true;
@@ -184,9 +186,18 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
                     ok = false;
                     break;
                 }
-                v = (2.0 * mass * G / (rho * s_w * clw)).sqrt();
+                if def.kind == PolarKind::Glide {
+                    // the total aerodynamic force balances the weight: CD
+                    // (induced, viscous at the current Re, extra) as reported
+                    let cdw = (0..m).map(|k| (-cl[k] * ai[k].to_radians() + if def.viscous { extra[k].0 } else { 0.0 }) * st[k].chord * st[k].width).sum::<f64>() / s_w + def.extra_drag.iter().map(|e| e.area * e.cd).sum::<f64>() / s_w;
+                    let cr = clw.hypot(cdw);
+                    balance = (0.5 * rho * v * v * s_w * cr - mass * G).abs() / (mass * G);
+                    v = (2.0 * mass * G / (rho * s_w * cr)).sqrt();
+                } else {
+                    v = (2.0 * mass * G / (rho * s_w * clw)).sqrt();
+                }
             }
-            if maxd < def.llt.tolerance && _it > 2 {
+            if maxd < def.llt.tolerance && _it > 2 && (def.kind != PolarKind::Glide || balance < crate::analysis::GLIDE_TOL) {
                 converged = true;
                 break;
             }
@@ -194,7 +205,14 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
         prog.set((ip + 1) as f64 / total as f64);
         if !ok || !converged {
             prog.count_failed();
-            failed.push(format!("alpha={alpha:.2} V={v:.2}: LLT {}", if ok { "did not converge (stall?)" } else { "left the 2D polar range" }));
+            let why = if !ok {
+                "left the 2D polar range".to_string()
+            } else if def.kind == PolarKind::Glide && balance >= crate::analysis::GLIDE_TOL {
+                format!("glide speed balance did not converge (|resultant - W|/W = {balance:.2e})")
+            } else {
+                "did not converge (stall?)".to_string()
+            };
+            failed.push(format!("alpha={alpha:.2} V={v:.2}: LLT {why}"));
             ai.iter_mut().for_each(|a| *a = 0.0);
             continue;
         }
@@ -290,7 +308,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             stability: None,
             stability_error: None,
             wake: vec![],
-            balance_residual: None,
+            balance_residual: (def.kind == PolarKind::Glide).then_some(balance),
             diagnostics: None,
         };
         if let Some(why) = crate::analysis::nonfinite_reason(&opp).or_else(|| crate::analysis::envelope_failure(def, &opp)) {
