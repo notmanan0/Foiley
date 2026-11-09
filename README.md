@@ -89,6 +89,9 @@ foiley < script.xfoil                            # XFoil-compatible menu mode
 * Missing 2D polars for viscous or LLT 3D runs are computed automatically
   over the Reynolds range the analysis needs (`--auto-polars N`).
 * NACA foils referenced by an imported plane are generated automatically.
+* Batch and scripted 2D CSV filenames include a hash of the foil and run
+  settings, so runs at nearby Reynolds numbers produce separate files.
+  An explicit `-o` path keeps the filename you supply.
 * Ctrl-C cancels the running job; a second press quits.
 * `--json-progress` emits progress and log events as JSON lines on stderr.
 
@@ -186,6 +189,26 @@ in xflr5 and flow5; use VLM or panels for swept or dihedral wings.
   analytic velocity matches the finite-difference gradient.
 
 **3D aerodynamics** (`crates/plane/tests/validation.rs`)
+
+The [wind-tunnel regression](crates/plane/tests/wind_tunnel.rs) compares three
+inviscid methods with the 6 ft chord, 36 ft span NACA 23012 wing tested at
+Langley (85.5 ft/s, zero-lift Reynolds number 3.362 million). It uses five
+finite-wing angles from −2.6° to 8.4° and the report's aerodynamic center as
+the moment reference. The table gives the largest absolute coefficient error
+at those five angles on a mesh with 12 chordwise and 18 spanwise divisions
+per half-wing. [NACA Report 530, Figure 4 and Table VI](https://ntrs.nasa.gov/citations/19930091603)
+
+| Method | Max. absolute CL error | Max. absolute Cm error |
+|---|---:|---:|
+| VLM2 | 0.0158 | 0.0115 |
+| Quad panels | 0.0307 | 0.0074 |
+| Linear-doublet triangles | 0.0594 | 0.0177 |
+
+The measured Cm values in this sample range from −0.008 to −0.005, with a
+reported precision of ±0.003. All three methods predict nose-down moments,
+but each exceeds that precision at some angles. This comparison covers
+attached flow on one wing. Run it with
+`cargo test --release -p foiley-plane --test wind_tunnel -- --nocapture`.
 
 * An aspect-ratio-8 rectangular wing gives CLα ≈ 4.6/rad and span
   efficiency 0.98, consistent with lifting-surface theory. VLM1 and VLM2 agree.

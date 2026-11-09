@@ -112,6 +112,18 @@ struct XfoilOpts {
     /// e^N transition criterion (9 = wind tunnel, 11-12 = quiet free air, 4-6 = turbulent)
     #[arg(long, default_value_t = 9.0)]
     ncrit: f64,
+    #[command(flatten)]
+    solver: SolverOpts,
+}
+
+impl XfoilOpts {
+    fn settings(&self) -> Result<AnalysisSettings, String> {
+        Ok(AnalysisSettings { re: self.re, mach: self.mach, ncrit: self.ncrit, ..self.solver.settings()? })
+    }
+}
+
+#[derive(Args, Clone)]
+struct SolverOpts {
     /// forced transition x/c "top,bottom" (1 = free transition)
     #[arg(long, default_value = "1,1")]
     xtr: String,
@@ -138,16 +150,13 @@ struct XfoilOpts {
     sequential: bool,
 }
 
-impl XfoilOpts {
+impl SolverOpts {
     fn settings(&self) -> Result<AnalysisSettings, String> {
         let x = parse_list(&self.xtr)?;
         if x.len() != 2 {
             return Err("--xtr needs two values: top,bottom".into());
         }
         Ok(AnalysisSettings {
-            re: self.re,
-            mach: self.mach,
-            ncrit: self.ncrit,
             xtr_top: x[0],
             xtr_bot: x[1],
             viscous: !self.inviscid,
@@ -228,7 +237,7 @@ enum FoilCmd {
         #[arg(long, default_value = "-6:16:0.5", allow_hyphen_values = true)]
         alpha: String,
         #[command(flatten)]
-        x: XfoilOpts,
+        x: SolverOpts,
         /// directory for one CSV per polar
         #[arg(long)]
         out_dir: Option<PathBuf>,
@@ -557,11 +566,11 @@ fn write_out(out: &Out, text: &str) -> Result<(), String> {
 }
 
 fn foil_polar_table(p: &FoilPolar) -> String {
-    let mut s = format!("# {} | {} | Re {:.0} M {:.2} Ncrit {:.1} xtr {:.2}/{:.2}\n", p.foil, p.name, p.re, p.mach, p.ncrit, p.xtr_top, p.xtr_bot);
+    let mut s = format!("# {} | {} | Re {} M {:.2} Ncrit {:.1} xtr {:.2}/{:.2}\n", p.foil, p.name, p.re, p.mach, p.ncrit, p.xtr_top, p.xtr_bot);
     s.push_str("  alpha      CL        CD       CDp       Cm    Xtr_top  Xtr_bot    L/D       Re   flag\n");
     for q in &p.points {
         s.push_str(&format!(
-            "{:7.2} {:8.4} {:9.5} {:9.5} {:8.4} {:8.4} {:8.4} {:7.2} {:9.0} {}\n",
+            "{:7.2} {:8.4} {:9.5} {:9.5} {:8.4} {:8.4} {:8.4} {:7.2} {:9} {}\n",
             if p.polar_type == 6 { q.flap } else { q.alpha },
             q.cl,
             q.cd,
@@ -907,7 +916,7 @@ fn real_main() -> Result<(), String> {
                     }
                     for p in &pols {
                         if let Some(d) = &out_dir {
-                            let fname = format!("{}_{}.csv", p.foil.replace([' ', '/', '\\'], "_"), p.name);
+                            let fname = format!("{}.csv", p.export_stem());
                             std::fs::write(d.join(&fname), p.to_csv()).map_err(|e| e.to_string())?;
                         } else {
                             print!("{}", foil_polar_table(p));
@@ -1409,7 +1418,7 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
                 let f = resolve_foil(&foil, &proj)?;
                 if let JobOutput::FoilPolar { polar, .. } = run_job(mgr, ui, &format!("{} polar", f.name), JobKind::FoilPolar { foil: f, settings, sweep })? {
                     if let Some(d) = &outdir {
-                        std::fs::write(d.join(format!("{}_{}.csv", polar.foil.replace(' ', "_"), polar.name)), polar.to_csv()).map_err(|e| e.to_string())?;
+                        std::fs::write(d.join(format!("{}.csv", polar.export_stem())), polar.to_csv()).map_err(|e| e.to_string())?;
                     }
                     proj.add_foil_polar(polar);
                 }
@@ -1429,7 +1438,7 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
                 if let JobOutput::Batch(pols) = run_job(mgr, ui, "batch", JobKind::Batch { foils: fs, cases, settings, sweep })? {
                     for p in pols {
                         if let Some(d) = &outdir {
-                            std::fs::write(d.join(format!("{}_{}.csv", p.foil.replace(' ', "_"), p.name)), p.to_csv()).map_err(|e| e.to_string())?;
+                            std::fs::write(d.join(format!("{}.csv", p.export_stem())), p.to_csv()).map_err(|e| e.to_string())?;
                         }
                         proj.add_foil_polar(p);
                     }

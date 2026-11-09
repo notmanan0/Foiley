@@ -70,6 +70,7 @@ impl Project {
     /// Give every 2D polar without a geometry hash the hash of its foil
     /// (legacy and imported polars), so later geometry edits are detected.
     fn fill_polar_hashes(&mut self) {
+        if self.foil_polars.iter().all(|q| q.foil_hash.is_some()) { return; }
         let hashes: Vec<(String, foiley_core::hash::Hash32)> = self.foils.iter().map(|f| (f.name.clone(), f.geom_hash())).collect();
         for q in &mut self.foil_polars {
             if q.foil_hash.is_none() {
@@ -136,15 +137,18 @@ impl Project {
         self.foil_polars.retain(|p| p.foil != name);
     }
 
-    /// Add or merge a 2D polar (same foil + name: points are merged).  A
+    /// Add or merge a 2D polar (same geometry and analysis settings). A
     /// polar without a geometry hash gets its foil's.
-    pub fn add_foil_polar(&mut self, p: FoilPolar) {
+    pub fn add_foil_polar(&mut self, p: FoilPolar) -> (String, String) {
         // a deflected copy from an automatic batch goes under its base foil
         let mut p = crate::auto::adopt(p, |base| self.foil(base).map(|f| f.geom_hash()));
         if p.foil_hash.is_none() {
             p.foil_hash = self.foil(&p.foil).map(|f| f.geom_hash());
         }
-        if let Some(q) = self.foil_polars.iter_mut().find(|q| q.foil == p.foil && q.name == p.name) {
+        self.fill_polar_hashes();
+        let key = p.key();
+        let identity = p.identity();
+        if let Some(q) = self.foil_polars.iter_mut().find(|q| q.foil == p.foil && q.re == p.re && q.identity() == identity) {
             for pt in p.points {
                 q.insert(pt);
             }
@@ -152,6 +156,7 @@ impl Project {
         } else {
             self.foil_polars.push(p);
         }
+        key
     }
 
     pub fn add_plane_polar(&mut self, p: PlanePolar) {
@@ -296,14 +301,36 @@ impl Project {
             "foiley" | "json" => {
                 let other = Project::load(path)?;
                 let msg = format!("{} foils, {} polars, {} planes, {} plane polars", other.foils.len(), other.foil_polars.len(), other.planes.len(), other.plane_polars.len());
+                let mut foil_names = std::collections::HashMap::new();
                 for f in other.foils {
                     let mut f = f;
-                    f.name = self.unique_foil_name(&f.name);
+                    let renamed = self.unique_foil_name(&f.name);
+                    foil_names.insert(f.name.clone(), renamed.clone());
+                    f.name = renamed;
                     self.foils.push(f);
                 }
-                self.foil_polars.extend(other.foil_polars);
-                self.planes.extend(other.planes);
-                self.plane_polars.extend(other.plane_polars);
+                for mut p in other.foil_polars {
+                    if let Some(name) = foil_names.get(&p.foil) { p.foil = name.clone(); }
+                    self.add_foil_polar(p);
+                }
+                let mut plane_names = std::collections::HashMap::new();
+                for mut plane in other.planes {
+                    for section in plane.wings.iter_mut().flat_map(|w| &mut w.sections) {
+                        for foil in [&mut section.foil_left, &mut section.foil_right] {
+                            if let Some(name) = foil_names.get(foil) { *foil = name.clone(); }
+                        }
+                    }
+                    let base = plane.name.clone();
+                    if self.planes.iter().any(|p| p.name == base) {
+                        plane.name = (2..).map(|i| format!("{base} ({i})")).find(|name| self.planes.iter().all(|p| p.name != *name)).unwrap();
+                    }
+                    plane_names.insert(base, plane.name.clone());
+                    self.planes.push(plane);
+                }
+                for mut p in other.plane_polars {
+                    if let Some(name) = plane_names.get(&p.plane) { p.plane = name.clone(); }
+                    self.add_plane_polar(p);
+                }
                 Ok(msg)
             }
             _ => {
