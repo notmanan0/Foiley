@@ -21,7 +21,7 @@ use foiley_app::{JobId, JobKind, JobManager, JobOutput, JobStatus, Project};
 use foiley_core::progress::LogLevel;
 use foiley_foil::analysis::PointDetail;
 use foiley_plane::{Plane, PlanePolarDef};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -59,9 +59,26 @@ pub enum Pending {
     CadImport { plane: String },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProjectRevision {
+    project: u64,
+    revision: u64,
+}
+
+pub struct PendingJob {
+    id: JobId,
+    generation: u64,
+    action: Pending,
+}
+
 enum IoMsg {
-    Loaded(Result<(Project, PathBuf), String>),
-    Saved(Result<PathBuf, String>),
+    Loaded { project: u64, result: Result<(Project, PathBuf), String> },
+    Saved { version: ProjectRevision, autosave: bool, result: Result<PathBuf, String> },
+}
+
+enum IoTask {
+    Load { owner: u64, path: PathBuf },
+    Save { version: ProjectRevision, project: Project, path: PathBuf, autosave: bool },
 }
 
 pub struct LogLine {
@@ -75,7 +92,7 @@ pub struct App {
     pub path: Option<PathBuf>,
     pub dirty: bool,
     pub jobs: JobManager,
-    pub pending: Vec<(JobId, Pending)>,
+    pub pending: Vec<PendingJob>,
     pub module: Module,
     pub sel_foil: Option<String>,
     pub sel_plane: usize,
@@ -90,6 +107,9 @@ pub struct App {
     io_tx: mpsc::Sender<IoMsg>,
     io_rx: mpsc::Receiver<IoMsg>,
     io_busy: bool,
+    version: ProjectRevision,
+    job_generation: u64,
+    queued_io: VecDeque<IoTask>,
     autosave_at: Instant,
     pub details: HashMap<(String, String), Vec<PointDetail>>,
     pub point_detail: Option<PointDetail>,
@@ -107,9 +127,7 @@ impl App {
             s.spacing.item_spacing = egui::vec2(8.0, 5.0);
             s.spacing.interact_size.y = 22.0;
         });
-        let (io_tx, io_rx) = mpsc::channel();
         let project = Project::starter();
-        let sel_foil = project.foils.first().map(|f| f.name.clone());
         // command line: foiley-studio [project.foiley | plane.xml | foil.dat ...] [--module foil|2d|plane|3d|stability]
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut start_module = Module::FoilDesign;
@@ -131,31 +149,7 @@ impl App {
                 files.push(PathBuf::from(a));
             }
         }
-        let mut app = App {
-            project,
-            path: None,
-            dirty: false,
-            jobs,
-            pending: vec![],
-            module: Module::FoilDesign,
-            sel_foil,
-            sel_plane: 0,
-            log: vec![],
-            log_min: LogLevel::Info,
-            undo: vec![],
-            redo: vec![],
-            toast: None,
-            fui: Default::default(),
-            pui: Default::default(),
-            dark,
-            io_tx,
-            io_rx,
-            io_busy: false,
-            autosave_at: Instant::now(),
-            details: HashMap::new(),
-            point_detail: None,
-            bottom_tab: 0,
-        };
+        let mut app = Self::from_project(project, jobs, dark);
         app.module = start_module;
         let _ = &mut run_now;
         for f in files {
@@ -168,7 +162,7 @@ impl App {
                         app.path = Some(f.clone());
                         app.sel_foil = app.project.foils.first().map(|f| f.name.clone());
                         for q in &app.project.foil_polars {
-                            app.fui.visible.insert((q.foil.clone(), q.name.clone()));
+                            app.fui.visible.insert(q.key());
                         }
                         for q in &app.project.plane_polars {
                             app.pui.visible.insert((q.plane.clone(), q.name.clone()));
@@ -201,6 +195,39 @@ impl App {
         app
     }
 
+    fn from_project(project: Project, jobs: JobManager, dark: bool) -> Self {
+        let (io_tx, io_rx) = mpsc::channel();
+        let sel_foil = project.foils.first().map(|f| f.name.clone());
+        App {
+            project,
+            path: None,
+            dirty: false,
+            jobs,
+            pending: vec![],
+            module: Module::FoilDesign,
+            sel_foil,
+            sel_plane: 0,
+            log: vec![],
+            log_min: LogLevel::Info,
+            undo: vec![],
+            redo: vec![],
+            toast: None,
+            fui: Default::default(),
+            pui: Default::default(),
+            dark,
+            io_tx,
+            io_rx,
+            io_busy: false,
+            version: ProjectRevision::default(),
+            job_generation: 0,
+            queued_io: VecDeque::new(),
+            autosave_at: Instant::now(),
+            details: HashMap::new(),
+            point_detail: None,
+            bottom_tab: 0,
+        }
+    }
+
     /// Record the project state before a modification (undo).
     pub fn snapshot(&mut self) {
         self.undo.push(self.project.clone());
@@ -208,11 +235,13 @@ impl App {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.version.revision += 1;
         self.dirty = true;
     }
     fn undo(&mut self) {
         if let Some(p) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.project, p));
+            self.version.revision += 1;
             self.dirty = true;
             self.notify("undone", false);
         }
@@ -220,6 +249,7 @@ impl App {
     fn redo(&mut self) {
         if let Some(p) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.project, p));
+            self.version.revision += 1;
             self.dirty = true;
         }
     }
@@ -232,8 +262,54 @@ impl App {
 
     pub fn submit(&mut self, title: String, kind: JobKind, then: Pending) {
         let j = self.jobs.submit(title, kind);
-        self.pending.push((j.id, then));
+        self.track_job(j.id, then);
         self.bottom_tab = 0;
+    }
+
+    fn track_job(&mut self, id: JobId, action: Pending) {
+        self.pending.push(PendingJob { id, generation: self.job_generation, action });
+    }
+
+    fn current_job(&self, id: JobId) -> bool {
+        self.pending.iter().any(|p| p.id == id && p.generation == self.job_generation)
+    }
+
+    fn invalidate_project_jobs(&mut self) {
+        self.job_generation += 1;
+        for pending in &self.pending {
+            if let Some(job) = self.jobs.get(pending.id) {
+                job.cancel();
+            }
+        }
+        // Keep their ownership records until completion so cancelled partial
+        // results are collected and discarded, never applied to the successor.
+        self.pui.mesh_job = None;
+        self.fui.opt_job = None;
+        self.details.clear();
+        self.point_detail = None;
+    }
+
+    fn replace_project(&mut self, project: Project, path: Option<PathBuf>, dirty: bool) {
+        self.invalidate_project_jobs();
+        self.version.project += 1;
+        self.version.revision = 0;
+        self.project = project;
+        self.path = path;
+        self.dirty = dirty;
+        self.undo.clear();
+        self.redo.clear();
+        self.sel_foil = self.project.foils.first().map(|f| f.name.clone());
+        self.sel_plane = 0;
+        self.fui = Default::default();
+        for p in &self.project.foil_polars {
+            self.fui.visible.insert(p.key());
+        }
+        self.pui = Default::default();
+        for p in &self.project.plane_polars {
+            let key = (p.plane.clone(), p.name.clone());
+            self.pui.visible.insert(key.clone());
+            self.pui.sel_polar = Some(key);
+        }
     }
 
     fn open_dialog(&mut self) {
@@ -243,12 +319,8 @@ impl App {
     }
 
     fn load_async(&mut self, p: PathBuf) {
-        let tx = self.io_tx.clone();
-        self.io_busy = true;
-        std::thread::spawn(move || {
-            let r = Project::load(&p).map(|pr| (pr, p));
-            let _ = tx.send(IoMsg::Loaded(r));
-        });
+        self.queued_io.push_back(IoTask::Load { owner: self.version.project, path: p });
+        self.start_next_io();
     }
 
     fn save(&mut self, as_new: bool) {
@@ -260,13 +332,61 @@ impl App {
         } else {
             self.path.clone().unwrap()
         };
-        let proj = self.project.clone();
-        let tx = self.io_tx.clone();
-        self.io_busy = true;
-        std::thread::spawn(move || {
-            let r = proj.save(&path).map(|_| path);
-            let _ = tx.send(IoMsg::Saved(r));
-        });
+        self.save_to(path, false);
+    }
+
+    fn save_to(&mut self, path: PathBuf, autosave: bool) {
+        self.queued_io.push_back(IoTask::Save { version: self.version, project: self.project.clone(), path, autosave });
+        self.start_next_io();
+    }
+
+    fn start_next_io(&mut self) {
+        // Requests retain their captured project/revision while writes run
+        // serially. Ctrl+S and Open remain effective during an autosave.
+        if self.io_busy { return; }
+        while let Some(task) = self.queued_io.pop_front() {
+            if matches!(&task, IoTask::Load { owner, .. } if *owner != self.version.project) { continue; }
+            self.io_busy = true;
+            let tx = self.io_tx.clone();
+            std::thread::spawn(move || {
+                let message = match task {
+                    IoTask::Load { owner, path } => {
+                        let result = Project::load(&path).map(|project| (project, path));
+                        IoMsg::Loaded { project: owner, result }
+                    }
+                    IoTask::Save { version, project, path, autosave } => {
+                        let result = project.save(&path).map(|_| path);
+                        IoMsg::Saved { version, autosave, result }
+                    }
+                };
+                let _ = tx.send(message);
+            });
+            break;
+        }
+    }
+
+    fn process_io(&mut self, message: IoMsg) {
+        self.io_busy = false;
+        match message {
+            IoMsg::Loaded { project, result } if project == self.version.project => match result {
+                Ok((project, path)) => {
+                    self.replace_project(project, Some(path.clone()), false);
+                    self.notify(format!("opened {}", path.display()), false);
+                }
+                Err(e) => self.notify(e, true),
+            },
+            IoMsg::Saved { version, autosave, result } if version.project == self.version.project => match result {
+                Ok(path) if !autosave => {
+                    self.path = Some(path.clone());
+                    if version == self.version { self.dirty = false; }
+                    self.notify(format!("saved {}", path.display()), false);
+                }
+                Err(e) => self.notify(format!("save failed: {e}"), true),
+                _ => {}
+            },
+            _ => {}
+        }
+        self.start_next_io();
     }
 
     fn import_dialog(&mut self) {
@@ -308,20 +428,21 @@ impl App {
             self.log.drain(0..1000);
         }
         let mut done = Vec::new();
-        for (i, (id, _)) in self.pending.iter().enumerate() {
-            if let Some(j) = self.jobs.get(*id) {
+        for (i, pending) in self.pending.iter().enumerate() {
+            if let Some(j) = self.jobs.get(pending.id) {
                 if j.status().is_finished() {
                     done.push(i);
                 }
             }
         }
         for i in done.into_iter().rev() {
-            let (id, what) = self.pending.remove(i);
+            let PendingJob { id, generation, action: what } = self.pending.remove(i);
             let Some(job) = self.jobs.get(id) else { continue };
             let st = job.status();
             let out = job.take_output();
+            if generation != self.job_generation { continue; }
             match (st, out) {
-                (JobStatus::Done, Some(out)) | (JobStatus::Cancelled, Some(out)) => self.apply_output(&job.title, what, out),
+                (JobStatus::Done, Some(out)) | (JobStatus::Cancelled, Some(out)) => self.apply_output(generation, &job.title, what, out),
                 (JobStatus::Failed(e), _) => self.notify(format!("{} failed: {e}", job.title), true),
                 (JobStatus::Cancelled, None) => self.notify(format!("{} cancelled", job.title), false),
                 _ => {}
@@ -329,17 +450,21 @@ impl App {
         }
     }
 
-    fn apply_output(&mut self, title: &str, what: Pending, out: JobOutput) {
+    fn apply_output(&mut self, generation: u64, title: &str, what: Pending, out: JobOutput) {
+        if generation != self.job_generation { return; }
         match (what, out) {
             (Pending::FoilPolar, JobOutput::FoilPolar { polar, details }) => {
-                let key = (polar.foil.clone(), polar.name.clone());
                 let msg = format!("{}: {} points{}", polar.name, polar.points.len(), if polar.failed.is_empty() { String::new() } else { format!(", {} not converged", polar.failed.len()) });
-                if !details.is_empty() {
-                    self.details.insert(key.clone(), details);
-                }
                 self.snapshot();
+                let key = self.project.add_foil_polar(polar);
+                if !details.is_empty() {
+                    let stored = self.details.entry(key.clone()).or_default();
+                    for detail in details {
+                        stored.retain(|d| d.point != detail.point);
+                        stored.push(detail);
+                    }
+                }
                 self.fui.visible.insert(key);
-                self.project.add_foil_polar(polar);
                 self.notify(msg, false);
             }
             (Pending::FoilPoint, JobOutput::FoilPoint(d)) => match d {
@@ -353,8 +478,8 @@ impl App {
                 self.snapshot();
                 let n = pols.len();
                 for p in pols {
-                    self.fui.visible.insert((p.foil.clone(), p.name.clone()));
-                    self.project.add_foil_polar(p);
+                    let key = self.project.add_foil_polar(p);
+                    self.fui.visible.insert(key);
                 }
                 self.notify(format!("{title}: {n} polars added"), false);
             }
@@ -409,7 +534,7 @@ impl App {
                 }
                 None => self.notify(format!("{title}: plane '{plane}' no longer exists"), true),
             },
-            (Pending::Mesh(key), JobOutput::Mesh(m)) => {
+            (Pending::Mesh(key), JobOutput::Mesh(m)) if self.pui.mesh_job.map(|(_, pending_key)| pending_key) == Some(key) => {
                 self.pui.mesh = Some((key, m));
                 self.pui.mesh_job = None;
             }
@@ -424,7 +549,13 @@ impl App {
                 ui.label(RichText::new("modified").small().italics());
             }
         });
-        ui.add(egui::TextEdit::singleline(&mut self.project.name).hint_text("project name"));
+        let mut name = self.project.name.clone();
+        if ui.add(egui::TextEdit::singleline(&mut name).hint_text("project name")).changed() {
+            // A rename is not worth an undo snapshot per keystroke.
+            self.version.revision += 1;
+            self.dirty = true;
+            self.project.name = name;
+        }
         ui.separator();
         egui::ScrollArea::vertical().id_salt("explorer").show(ui, |ui| {
             egui::CollapsingHeader::new(RichText::new(format!("Foils ({})", self.project.foils.len())).strong()).default_open(true).show(ui, |ui| {
@@ -596,42 +727,16 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // background IO
-        while let Ok(m) = self.io_rx.try_recv() {
-            self.io_busy = false;
-            match m {
-                IoMsg::Loaded(Ok((p, path))) => {
-                    self.snapshot();
-                    self.project = p;
-                    self.path = Some(path.clone());
-                    self.dirty = false;
-                    self.sel_foil = self.project.foils.first().map(|f| f.name.clone());
-                    self.sel_plane = 0;
-                    self.details.clear();
-                    self.pui = Default::default();
-                    self.notify(format!("opened {}", path.display()), false);
-                }
-                IoMsg::Loaded(Err(e)) => self.notify(e, true),
-                IoMsg::Saved(Ok(p)) => {
-                    if p.extension().map(|e| e == "foiley").unwrap_or(false) && !p.to_string_lossy().contains("autosave") {
-                        self.path = Some(p.clone());
-                        self.dirty = false;
-                        self.notify(format!("saved {}", p.display()), false);
-                    }
-                }
-                IoMsg::Saved(Err(e)) => self.notify(format!("save failed: {e}"), true),
-            }
+        // Background completions carry the exact project/revision captured
+        // when the operation started.
+        while let Ok(message) = self.io_rx.try_recv() {
+            self.process_io(message);
         }
         self.process_jobs();
         // crash safety: autosave every 3 minutes when modified
         if self.dirty && self.autosave_at.elapsed() > Duration::from_secs(180) && !self.io_busy {
             self.autosave_at = Instant::now();
-            let p = self.project.clone();
-            let tx = self.io_tx.clone();
-            let path = std::env::temp_dir().join("foiley_autosave.foiley");
-            std::thread::spawn(move || {
-                let _ = tx.send(IoMsg::Saved(p.save(&path).map(|_| path)));
-            });
+            self.save_to(std::env::temp_dir().join("foiley_autosave.foiley"), true);
         }
         // keyboard shortcuts
         let (s, o, z, y) = ctx.input(|i| (i.modifiers.command && i.key_pressed(egui::Key::S), i.modifiers.command && i.key_pressed(egui::Key::O), i.modifiers.command && i.key_pressed(egui::Key::Z), i.modifiers.command && i.key_pressed(egui::Key::Y)));
@@ -654,11 +759,7 @@ impl eframe::App for App {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New project").clicked() {
-                        self.snapshot();
-                        self.project = Project::starter();
-                        self.path = None;
-                        self.sel_foil = self.project.foils.first().map(|f| f.name.clone());
-                        self.pui = Default::default();
+                        self.replace_project(Project::starter(), None, false);
                         ui.close();
                     }
                     if ui.button("Open...        Ctrl+O").clicked() {
@@ -773,3 +874,203 @@ fn import_file(p: &mut Project, f: &std::path::Path) -> Result<String, String> {
         p.import(f)
     }
 }
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+    use foiley_foil::{AnalysisSettings, FoilPoint, FoilPolar};
+
+    fn app() -> App {
+        App::from_project(Project::starter(), JobManager::new(1), true)
+    }
+
+    #[test]
+    fn save_completion_tracks_exact_project_revision_and_autosave_kind() {
+        let mut app = app();
+        app.snapshot();
+        let saved = app.version;
+        app.snapshot();
+        app.project.name = "edit made during save".into();
+        // A legitimate manual filename containing "autosave" still saves.
+        let path = PathBuf::from("my_autosave_research.json");
+        app.process_io(IoMsg::Saved { version: saved, autosave: false, result: Ok(path.clone()) });
+        assert_eq!(app.path, Some(path.clone()));
+        assert!(app.dirty, "the saved older revision must not clear new edits");
+        app.process_io(IoMsg::Saved { version: app.version, autosave: true, result: Ok(PathBuf::from("recovery.foiley")) });
+        assert!(app.dirty, "autosave is recovery, not a user save");
+        assert_eq!(app.path, Some(path.clone()));
+        app.process_io(IoMsg::Saved { version: app.version, autosave: false, result: Ok(path) });
+        assert!(!app.dirty);
+        app.snapshot();
+        app.process_io(IoMsg::Saved { version: app.version, autosave: false, result: Err("disk full".into()) });
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn replacement_ignores_old_save_and_old_load_completion() {
+        let mut app = app();
+        app.snapshot();
+        let old = app.version;
+        let successor_path = PathBuf::from("successor.foiley");
+        app.replace_project(Project::new("successor"), Some(successor_path.clone()), true);
+        app.process_io(IoMsg::Saved { version: old, autosave: false, result: Ok(PathBuf::from("old.foiley")) });
+        assert!(app.dirty);
+        assert_eq!(app.path, Some(successor_path.clone()));
+        app.process_io(IoMsg::Loaded { project: old.project, result: Ok((Project::new("old load"), PathBuf::from("old.foiley"))) });
+        assert_eq!(app.project.name, "successor");
+        assert_eq!(app.path, Some(successor_path));
+    }
+
+    #[test]
+    fn overlapping_io_is_serialized_and_new_edits_stay_dirty_on_disk() {
+        let mut app = app();
+        let path = std::env::temp_dir().join(format!("foiley_save_revision_{}.foiley", std::process::id()));
+        let second_path = path.with_extension("queued.foiley");
+        app.snapshot();
+        app.project.name = "written revision".into();
+        app.save_to(path.clone(), false);
+        app.snapshot();
+        app.project.name = "newer revision".into();
+        app.save_to(second_path.clone(), false);
+        assert!(app.io_busy);
+        assert_eq!(app.queued_io.len(), 1);
+        let completion = app.io_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        app.process_io(completion);
+        assert!(app.dirty);
+        assert_eq!(Project::load(&path).unwrap().name, "written revision");
+        assert!(app.io_busy, "the queued explicit save must start after the first completion");
+        let completion = app.io_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        app.process_io(completion);
+        assert!(!app.dirty);
+        assert_eq!(Project::load(&second_path).unwrap().name, "newer revision");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(second_path).unwrap();
+    }
+
+    #[test]
+    fn undo_during_save_as_preserves_document_identity_and_destination() {
+        let mut app = app();
+        app.snapshot();
+        app.project.name = "written".into();
+        let saved = app.version;
+        app.undo();
+        assert_eq!(saved.project, app.version.project);
+        assert_ne!(saved.revision, app.version.revision);
+        let path = PathBuf::from("save_as.foiley");
+        app.process_io(IoMsg::Saved { version: saved, autosave: false, result: Ok(path.clone()) });
+        assert_eq!(app.path, Some(path));
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn queued_manual_save_writes_its_snapshot_after_new_project() {
+        let mut app = app();
+        let dir = std::env::temp_dir().join(format!("foiley_queued_save_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let autosave = dir.join("recovery.foiley");
+        let manual = dir.join("explicit.foiley");
+        app.snapshot();
+        app.project.name = "original snapshot".into();
+        app.save_to(autosave.clone(), true);
+        app.save_to(manual.clone(), false);
+        app.replace_project(Project::new("new document"), None, true);
+        for _ in 0..2 {
+            let completion = app.io_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            app.process_io(completion);
+        }
+        assert_eq!(Project::load(&manual).unwrap().name, "original snapshot");
+        assert_eq!(app.project.name, "new document");
+        assert!(app.path.is_none());
+        assert!(app.dirty);
+        assert!(!app.io_busy);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn open_requested_during_autosave_runs_after_the_write() {
+        let mut app = app();
+        let dir = std::env::temp_dir().join(format!("foiley_queued_open_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let incoming = dir.join("incoming.foiley");
+        Project::new("opened after autosave").save(&incoming).unwrap();
+        app.snapshot();
+        app.save_to(dir.join("recovery.foiley"), true);
+        app.load_async(incoming.clone());
+        assert_eq!(app.queued_io.len(), 1);
+        for _ in 0..2 {
+            let completion = app.io_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            app.process_io(completion);
+        }
+        assert_eq!(app.project.name, "opened after autosave");
+        assert_eq!(app.path, Some(incoming));
+        assert!(!app.dirty);
+        assert!(!app.io_busy);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replaced_project_rejects_old_results_and_chained_jobs() {
+        let mut app = app();
+        let old = app.job_generation;
+        let plane = app.project.planes[0].clone();
+        app.track_job(123, Pending::AutoPolarsThen(Box::new((plane.clone(), PlanePolarDef::default()))));
+        assert_eq!(app.pending[0].generation, old);
+        assert!(app.current_job(123));
+        app.replace_project(Project::new("successor"), None, false);
+        assert!(!app.current_job(123), "partial previews must belong to the current project too");
+        let polar = FoilPolar { foil: "old foil".into(), ..Default::default() };
+        app.apply_output(old, "old 2D", Pending::FoilPolar, JobOutput::FoilPolar { polar: polar.clone(), details: vec![PointDetail::default()] });
+        app.apply_output(old, "old batch", Pending::Batch, JobOutput::Batch(vec![polar.clone()]));
+        app.apply_output(old, "old chain", Pending::AutoPolarsThen(Box::new((plane, PlanePolarDef::default()))), JobOutput::Batch(vec![polar]));
+        app.apply_output(old, "old point", Pending::FoilPoint, JobOutput::FoilPoint(Some(PointDetail::default())));
+        app.apply_output(old, "old CAD", Pending::CadImport { plane: "successor".into() }, JobOutput::CadImport(foiley_app::CadImportResult { body: 0, name: "stale".into(), triangles: vec![], notes: vec![] }));
+        assert!(app.project.foil_polars.is_empty());
+        assert!(app.jobs.jobs().is_empty(), "an old automatic batch must not launch a 3D successor job");
+        assert!(app.details.is_empty());
+        assert!(app.point_detail.is_none());
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn completed_pending_job_is_collected_without_applying_to_loaded_project() {
+        let mut app = app();
+        let plane = app.project.planes[0].clone();
+        app.submit("automatic batch".into(), JobKind::Batch { foils: vec![], cases: vec![], settings: AnalysisSettings::default(), sweep: foiley_foil::Sweep::AlphaList(vec![]) }, Pending::AutoPolarsThen(Box::new((plane, PlanePolarDef::default()))));
+        let id = app.pending[0].id;
+        app.jobs.wait(id, |_| {});
+        assert!(app.jobs.get(id).unwrap().has_output());
+        app.process_io(IoMsg::Loaded { project: app.version.project, result: Ok((Project::new("loaded"), PathBuf::from("loaded.foiley"))) });
+        app.process_jobs();
+        assert!(app.pending.is_empty());
+        assert!(!app.jobs.get(id).unwrap().has_output());
+        assert_eq!(app.jobs.jobs().len(), 1, "no chained 3D job may be created");
+        assert_eq!(app.project.name, "loaded");
+        assert!(app.project.foil_polars.is_empty());
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn near_re_details_and_visibility_are_independent() {
+        let mut app = app();
+        let foil = app.project.foils[0].clone();
+        for re in [300_000.0, 300_100.0] {
+            let settings = AnalysisSettings { re, ..Default::default() };
+            let point = FoilPoint { alpha: 2.0, re, cl: re / 1e6, ..Default::default() };
+            let polar = FoilPolar { name: settings.polar_name(), foil: foil.name.clone(), foil_hash: Some(foil.geom_hash()), re,
+                settings: Some(settings), points: vec![point], ..Default::default() };
+            app.apply_output(app.job_generation, "polar", Pending::FoilPolar, JobOutput::FoilPolar { polar, details: vec![PointDetail { point, ..Default::default() }] });
+        }
+        assert_eq!(app.project.foil_polars.len(), 2);
+        assert_eq!(app.fui.visible.len(), 2);
+        assert_eq!(app.details.len(), 2);
+        let a = app.project.foil_polars[0].clone();
+        let b = app.project.foil_polars[1].clone();
+        app.show_point(&foil.name, &a.identity().hex(), a.points[0]);
+        assert_eq!(app.point_detail.as_ref().unwrap().point.re, 300_000.0);
+        app.show_point(&foil.name, &b.identity().hex(), b.points[0]);
+        assert_eq!(app.point_detail.as_ref().unwrap().point.re, 300_100.0);
+        app.fui.visible.remove(&a.key());
+        assert!(app.fui.visible.contains(&b.key()));
+    }
+}
+

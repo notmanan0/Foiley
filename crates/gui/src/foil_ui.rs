@@ -8,11 +8,30 @@ use foiley_app::JobKind;
 use foiley_foil::analysis::{PointDetail, PolarType};
 use foiley_foil::batch::{re_list_geometric, BatchCase};
 use foiley_foil::foil::{NodeInput, Paneling};
-use foiley_foil::{AnalysisSettings, Foil, FoilPoint, Sweep};
+use foiley_foil::{AnalysisSettings, Foil, FoilPoint, FoilPolar, Sweep};
 use foiley_foil::inverse::{modify, InverseMode, ModKind, Modification, SpeedDist};
 use foiley_foil::optim::{Algorithm, Goal, OptimResult, OptimSettings};
 use foiley_app::JobId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+struct PolarLabel {
+    key: (String, String),
+    name: String,
+}
+
+/// Compute identities once per frame and reuse them across selectors and all
+/// four plots. Only settings collisions need a short hash in their label.
+fn polar_labels(polars: &[FoilPolar]) -> Vec<PolarLabel> {
+    let mut labels: Vec<_> = polars.iter().map(|p| PolarLabel { key: p.key(), name: p.display_name() }).collect();
+    let mut counts = HashMap::new();
+    for label in &labels { *counts.entry((label.key.0.clone(), label.name.clone())).or_insert(0) += 1; }
+    for label in &mut labels {
+        if counts[&(label.key.0.clone(), label.name.clone())] > 1 {
+            label.name.push_str(&format!(" / {}", &label.key.1[..12]));
+        }
+    }
+    labels
+}
 
 pub struct FoilUi {
     pub visible: HashSet<(String, String)>,
@@ -394,7 +413,7 @@ impl App {
                             let j = self.jobs.submit(format!("optimise {}", foil.name), k);
                             self.fui.opt_job = Some(j.id);
                             self.fui.opt_result = None;
-                            self.pending.push((j.id, Pending::Optimise));
+                            self.track_job(j.id, Pending::Optimise);
                         }
                     });
                     let live = self.fui.opt_job.and_then(|id| self.jobs.get(id)).and_then(|j| j.partial.lock().unwrap().optim.clone()).or_else(|| self.fui.opt_result.clone());
@@ -541,6 +560,7 @@ impl App {
     }
 
     pub fn foil_analysis(&mut self, ui: &mut egui::Ui) {
+        let mut labels = polar_labels(&self.project.foil_polars);
         egui::SidePanel::left("foil_an_left").resizable(true).default_width(330.0).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 heading(ui, "Foil");
@@ -712,8 +732,8 @@ impl App {
             heading(ui, "Polars");
             ui.horizontal(|ui| {
                 if ui.small_button("show all").clicked() {
-                    for p in &self.project.foil_polars {
-                        self.fui.visible.insert((p.foil.clone(), p.name.clone()));
+                    for label in &labels {
+                        self.fui.visible.insert(label.key.clone());
                     }
                 }
                 if ui.small_button("hide all").clicked() {
@@ -721,9 +741,9 @@ impl App {
                 }
                 if ui.small_button("only this foil").clicked() {
                     self.fui.visible.clear();
-                    for p in &self.project.foil_polars {
+                    for (p, label) in self.project.foil_polars.iter().zip(&labels) {
                         if Some(&p.foil) == self.sel_foil.as_ref() {
-                            self.fui.visible.insert((p.foil.clone(), p.name.clone()));
+                            self.fui.visible.insert(label.key.clone());
                         }
                     }
                 }
@@ -733,7 +753,7 @@ impl App {
                 let mut del = None;
                 let mut vis_idx = 0;
                 for (i, p) in self.project.foil_polars.iter().enumerate() {
-                    let key = (p.foil.clone(), p.name.clone());
+                    let key = labels[i].key.clone();
                     let mut on = self.fui.visible.contains(&key);
                     let swatch = if on {
                         vis_idx += 1;
@@ -753,17 +773,17 @@ impl App {
                                 self.fui.visible.remove(&key);
                             }
                         }
-                        let r = ui.label(RichText::new(format!("{}\n{}", p.foil, p.name)).small());
+                        let r = ui.label(RichText::new(format!("{}\n{}", p.foil, labels[i].name)).small());
                         r.on_hover_text(format!("{} points, {} not converged\n{}", p.points.len(), p.failed.len(), if p.failed.is_empty() { String::new() } else { format!("not converged at {:?}", p.failed) }));
                         ui.menu_button("...", |ui| {
                             if ui.button("Export CSV").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}_{}.csv", p.foil, p.name)).save_file() {
+                                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.csv", p.export_stem())).save_file() {
                                     let _ = std::fs::write(path, p.to_csv());
                                 }
                                 ui.close();
                             }
                             if ui.button("Export XFoil text").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}_{}.txt", p.foil, p.name)).save_file() {
+                                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.txt", p.export_stem())).save_file() {
                                     let _ = std::fs::write(path, p.to_xfoil_text());
                                 }
                                 ui.close();
@@ -778,6 +798,7 @@ impl App {
                 if let Some(i) = del {
                     self.snapshot();
                     self.project.foil_polars.remove(i);
+                    labels.remove(i);
                 }
             });
         });
@@ -786,8 +807,8 @@ impl App {
             let h = ui.available_height();
             let ph = if has_detail { h * 0.58 } else { h };
             let w = ui.available_width();
-            let polars: Vec<_> = self.project.foil_polars.iter().filter(|p| self.fui.visible.contains(&(p.foil.clone(), p.name.clone()))).cloned().collect();
-            let mut clicked: Option<(String, String, f64)> = None;
+            let polars: Vec<_> = self.project.foil_polars.iter().zip(&labels).filter(|(_, label)| self.fui.visible.contains(&label.key)).map(|(p, label)| (p.clone(), label)).collect();
+            let mut clicked: Option<(String, String, FoilPoint)> = None;
             egui::Grid::new("polarplots").num_columns(2).spacing([6.0, 6.0]).show(ui, |ui| {
                 for k in 0..4 {
                     ui.vertical(|ui| {
@@ -805,9 +826,9 @@ impl App {
                             plot = plot.legend(Legend::default().position(egui_plot::Corner::RightBottom));
                         }
                         let r = plot.x_axis_label(VARS[xv]).y_axis_label(VARS[yv]).show(ui, |pu| {
-                            for (i, p) in polars.iter().enumerate() {
+                            for (i, (p, label)) in polars.iter().enumerate() {
                                 let pts: Vec<[f64; 2]> = p.points.iter().map(|q| [var(q, xv), var(q, yv)]).collect();
-                                let name = format!("{} {}", p.foil, p.name);
+                                let name = format!("{} {}", p.foil, label.name);
                                 pu.line(Line::new(name.clone(), PlotPoints::from(pts.clone())).color(series_color(i)));
                                 pu.points(Points::new(name.clone(), PlotPoints::from(pts)).radius(2.0_f32).color(series_color(i)));
                                 if self.fui.show_failed && xv == 0 && !p.failed.is_empty() && p.polar_type <= 3 {
@@ -822,11 +843,11 @@ impl App {
                                     let b = pu.plot_bounds();
                                     let (sx, sy) = (b.width().max(1e-12), b.height().max(1e-12));
                                     let mut best = (f64::MAX, None);
-                                    for p in &polars {
+                                    for (p, label) in &polars {
                                         for q in &p.points {
                                             let d = ((var(q, xv) - c.x) / sx).powi(2) + ((var(q, yv) - c.y) / sy).powi(2);
                                             if d < best.0 {
-                                                best = (d, Some((p.foil.clone(), p.name.clone(), q.alpha)));
+                                                best = (d, Some((label.key.0.clone(), label.key.1.clone(), *q)));
                                             }
                                         }
                                     }
@@ -843,8 +864,8 @@ impl App {
                     }
                 }
             });
-            if let Some((foil, pol, alpha)) = clicked {
-                self.show_point(&foil, &pol, alpha);
+            if let Some((foil, pol, point)) = clicked {
+                self.show_point(&foil, &pol, point);
             }
             if let Some(d) = self.point_detail.clone() {
                 ui.separator();
@@ -854,30 +875,33 @@ impl App {
     }
 
     /// Show the distributions of a polar point (stored, or recomputed in the background).
-    fn show_point(&mut self, foil: &str, polar: &str, alpha: f64) {
-        if let Some(ds) = self.details.get(&(foil.to_string(), polar.to_string())) {
-            if let Some(d) = ds.iter().min_by(|a, b| (a.point.alpha - alpha).abs().total_cmp(&(b.point.alpha - alpha).abs())) {
+    pub(crate) fn show_point(&mut self, foil: &str, identity: &str, point: FoilPoint) {
+        if let Some(ds) = self.details.get(&(foil.to_string(), identity.to_string())) {
+            if let Some(d) = ds.iter().find(|d| d.point == point) {
                 self.point_detail = Some(d.clone());
                 return;
             }
         }
-        let Some(p) = self.project.foil_polars.iter().find(|p| p.foil == foil && p.name == polar).cloned() else { return };
-        let Some(f) = self.project.foil(foil).cloned() else { return };
-        let st = AnalysisSettings {
-            polar_type: match p.polar_type {
-                2 => PolarType::FixedLift,
-                3 => PolarType::RubberChord,
-                _ => PolarType::FixedSpeed,
-            },
-            re: p.re,
-            mach: p.mach,
-            ncrit: p.ncrit,
-            xtr_top: p.xtr_top,
-            xtr_bot: p.xtr_bot,
-            viscous: p.viscous,
-            ..self.fui.settings.clone()
-        };
-        self.submit(format!("{foil} alpha = {alpha:.2} ({polar})"), JobKind::FoilPoint { foil: f, settings: st, value: alpha, is_alpha: true }, Pending::FoilPoint);
+        let Some(p) = self.project.foil_polars.iter().find(|p| p.key() == (foil.to_string(), identity.to_string())).cloned() else { return };
+        let Some(mut f) = self.project.foil(foil).cloned() else { return };
+        let mut st = p.settings.clone().unwrap_or_else(|| AnalysisSettings {
+            re: p.re, mach: p.mach, ncrit: p.ncrit, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, viscous: p.viscous,
+            ..Default::default()
+        });
+        // Recompute this operating point, including its exact Re/Mach and
+        // deflected geometry, rather than the current editor's settings.
+        let flap = if p.polar_type == 6 { point.flap } else { p.flap_deg };
+        if flap != 0.0 {
+            let hinge = if p.polar_type == 6 { st.flap_hinge } else { f.hinge.unwrap_or(st.flap_hinge) };
+            match f.with_flap(hinge.0, hinge.1, flap) {
+                Ok(deflected) => f = deflected,
+                Err(e) => { self.notify(e.to_string(), true); return; }
+            }
+        }
+        st.polar_type = PolarType::FixedSpeed;
+        st.re = point.re;
+        st.mach = point.mach;
+        self.submit(format!("{foil} alpha = {:.2} ({})", point.alpha, p.display_name()), JobKind::FoilPoint { foil: f, settings: st, value: point.alpha, is_alpha: true }, Pending::FoilPoint);
     }
 
     fn detail_plots(&mut self, ui: &mut egui::Ui, d: &PointDetail, w: f32) {
@@ -925,3 +949,27 @@ impl App {
         });
     }
 }
+
+#[cfg(test)]
+mod polar_label_regressions {
+    use super::*;
+
+    #[test]
+    fn labels_show_exact_re_and_only_disambiguate_settings_collisions() {
+        let a = AnalysisSettings { re: 300_000.0, ..Default::default() };
+        let b = AnalysisSettings { re: 300_100.0, ..a.clone() };
+        let c = AnalysisSettings { cm_ref: (0.5, 0.0), ..a.clone() };
+        let polars: Vec<_> = [a, b, c].into_iter().map(|settings| FoilPolar {
+            name: settings.polar_name(), foil: "NACA 0012".into(), re: settings.re, settings: Some(settings), ..Default::default()
+        }).collect();
+        let labels = polar_labels(&polars);
+        assert!(labels[0].name.contains(" / "));
+        assert!(!labels[1].name.contains(" / "));
+        assert!(labels[2].name.contains(" / "));
+        assert!(labels[0].name.contains("Re=300000"));
+        assert!(labels[1].name.contains("Re=300100"));
+        assert_ne!(labels[0].name, labels[2].name);
+        assert_ne!(labels[0].key, labels[2].key);
+    }
+}
+

@@ -275,17 +275,19 @@ impl FoilDb {
     pub fn foil_hash(&self, name: &str) -> Option<Hash32> {
         self.foils.get(name).map(|f| f.1)
     }
-    /// Add a polar.  A polar with the same name for the same foil replaces
-    /// the old one (in whatever family it was).  Polars with fewer than two
+    /// Add a polar. A polar with the same content identity replaces the old
+    /// one. Rounded display names may be shared by distinct Re stations.
+    /// Polars with fewer than two
     /// points and inviscid polars are not kept.
     pub fn add_polar(&mut self, p: &FoilPolar) {
         if p.points.len() < 2 || !p.viscous {
             return;
         }
+        let identity = p.identity();
         for fam in self.families.iter_mut().filter(|f| f.foil == p.foil) {
-            fam.polars.retain(|q| q.name != p.name);
+            fam.polars.retain(|q| q.re != p.re || q.identity() != identity);
         }
-        self.stale.retain(|q| q.foil != p.foil || q.name != p.name);
+        self.stale.retain(|q| q.foil != p.foil || q.re != p.re || q.identity() != identity);
         self.insert(p);
     }
     /// Polars left out because their geometry hash does not match the

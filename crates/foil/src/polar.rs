@@ -107,6 +107,41 @@ pub struct FoilPolar {
 }
 
 impl FoilPolar {
+    /// Content identity for storage, selection and exports. Display names are
+    /// deliberately rounded and must never decide which runs can be merged.
+    /// Sweeps and run timestamps are excluded so extending a sweep merges it.
+    pub fn identity(&self) -> Hash32 {
+        let settings = self.settings.as_ref().map(|s| {
+            let mut s = s.clone();
+            // Retaining distributions does not change the solved polar.
+            s.keep_details = false;
+            s
+        });
+        foiley_core::provenance::hash_json(
+            "foiley.polar2d.identity.v1",
+            &(&self.foil, self.foil_hash, self.polar_type, self.re, self.mach, self.ncrit, self.xtr_top, self.xtr_bot, self.viscous, self.flap_deg,
+                // Legacy/imported polars have no complete settings snapshot;
+                // preserve their independently named definitions.
+                self.settings.is_none().then_some(&self.name), settings),
+        )
+    }
+
+    pub fn key(&self) -> (String, String) {
+        (self.foil.clone(), self.identity().hex())
+    }
+
+    /// A readable label that preserves the exact Reynolds number.
+    pub fn display_name(&self) -> String {
+        format!("{} [Re={}]", self.name, self.re)
+    }
+
+    /// A filesystem-safe, collision-resistant base name shared by every CSV
+    /// export path (including batch and script jobs).
+    pub fn export_stem(&self) -> String {
+        let safe = |s: &str| s.chars().map(|c| if c.is_control() || "<>:\"/\\|?* ".contains(c) { '_' } else { c }).collect::<String>();
+        format!("{}_{}_{}", safe(&self.foil), safe(&self.name), self.identity().hex())
+    }
+
     /// Insert or replace a point, keeping the list sorted by alpha
     /// (by Re for type 4).
     pub fn insert(&mut self, p: FoilPoint) {
@@ -227,7 +262,7 @@ impl FoilPolar {
         let mut s = String::from("alpha,CL,CD,CDp,CDf,Cm,Xtr_top,Xtr_bot,Cpmin,Re,Mach,CL/CD,iterations,recovered\n");
         for p in &self.points {
             s.push_str(&format!(
-                "{:.3},{:.5},{:.6},{:.6},{:.6},{:.5},{:.4},{:.4},{:.4},{:.0},{:.4},{:.3},{},{}\n",
+                "{:.3},{:.5},{:.6},{:.6},{:.6},{:.5},{:.4},{:.4},{:.4},{},{:.4},{:.3},{},{}\n",
                 p.alpha, p.cl, p.cd, p.cdp, p.cdf, p.cm, p.xtr_top, p.xtr_bot, p.cpmin, p.re, p.mach, p.ld(), p.iterations, p.recovered
             ));
         }

@@ -29,7 +29,8 @@ pub const FLAP_TAG: &str = " @flap";
 
 /// Name of the deflected copy of `base` (flap `deg` degrees, + down).
 pub fn deflected_name(base: &str, deg: f64) -> String {
-    format!("{base}{FLAP_TAG}{deg:+.2}")
+    // adopt() recovers the physical angle from this suffix.
+    format!("{base}{FLAP_TAG}{deg:+}")
 }
 
 /// (base foil, flap angle) of a deflected copy's name.

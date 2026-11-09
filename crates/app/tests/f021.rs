@@ -52,6 +52,20 @@ fn flapped_project() -> Project {
 }
 
 #[test]
+fn close_flap_angles_remain_distinct_after_adoption() {
+    let mut project = flapped_project();
+    let base = "elevator 0009";
+    for angle in [2.001, 2.004] {
+        let name = deflected_name(base, angle);
+        project.add_foil_polar(synth(&name, 300_000.0, 0.0, 9.0));
+    }
+    let angles: Vec<_> = project.foil_polars.iter().map(|p| p.flap_deg).collect();
+    assert_eq!(angles, [2.001, 2.004]);
+    assert_eq!(project.foil_db().families().len(), 2);
+    assert_eq!(auto::parse_deflected("elevator 0009 @flap+2.00"), Some((base, 2.0)));
+}
+
+#[test]
 fn g08_auto_covers_t8_envelope() {
     let mut p = Project::starter();
     let plane = p.planes[0].clone();
