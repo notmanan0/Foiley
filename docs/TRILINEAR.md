@@ -98,6 +98,11 @@ an exact reference. These are theory and internal consistency checks, not a
 claim of numerical identity with flow5 or validation against measured flight
 data. Local pressures and moments converge more slowly than wake lift.
 
+A separate [wind-tunnel comparison](../README.md#validation) covers lift and
+pitching moment on a cambered NACA 23012 wing at five attached-flow angles.
+The [test](../crates/plane/tests/wind_tunnel.rs) prints the measurement and
+prediction for each angle and solver.
+
 As with other flat-panel methods, refine the surface geometry as well as the
 solution. Extremely thin gaps, highly stretched panels, and nearly touching
 bodies can require additional integration/refinement beyond these benchmarks.
