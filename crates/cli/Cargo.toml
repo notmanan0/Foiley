@@ -1,6 +1,6 @@
 [package]
 name = "foiley-cli"
-description = "Foiley headless command-line interface (and XFoil-compatible script mode)"
+description = "The `foiley` binary: command-line interface, XFoil-compatible script mode and (feature `gui`) Foiley Studio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,14 @@ license.workspace = true
 name = "foiley"
 path = "src/main.rs"
 
+[features]
+default = ["gui"]
+# Foiley Studio built into the `foiley` binary (`foiley studio`).  Without it
+# (`--no-default-features`) the binary is headless and has no windowing code.
+gui = ["dep:foiley-gui"]
+
 [dependencies]
+foiley-gui = { workspace = true, optional = true }
 foiley.workspace = true
 foiley-core.workspace = true
 foiley-foil.workspace = true

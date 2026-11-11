@@ -1,5 +1,9 @@
 # Foiley
 
+[![CI](https://github.com/notmanan0/Foiley/actions/workflows/ci.yml/badge.svg)](https://github.com/notmanan0/Foiley/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/notmanan0/Foiley?include_prereleases&sort=semver)](https://github.com/notmanan0/Foiley/releases)
+[![License: GPL-2.0-or-later](https://img.shields.io/badge/license-GPL--2.0--or--later-blue)](LICENSE)
+
 Airfoil, wing and plane design and analysis in Rust. It covers the
 xflr5 / flow5 workflow:
 
@@ -7,20 +11,58 @@ xflr5 / flow5 workflow:
 * **3D:** LLT, VLM1/VLM2 and a 3D panel method.
 * **Flight dynamics:** stability analysis.
 
-There are two front ends:
+One binary, `foiley`, has two front ends:
 
-* **Foiley Studio** (`foiley-studio`): a desktop GUI that never blocks.
+* **Foiley Studio** (`foiley studio`): a desktop GUI that never blocks.
   Every analysis, mesh, save and load runs in the background, with live
   progress, stage text, point counts, ETA and a Cancel button.
-* **`foiley`**: a headless CLI for scripts and servers. It shows progress
-  bars or JSON progress events, writes tables, CSV or JSON, and runs JSON job
-  scripts. It also stays a drop-in XFoil: pipe an XFoil script on stdin.
+* **The command line** (`foiley <command>`): for scripts and servers. It
+  shows progress bars or JSON progress events, writes tables, CSV or JSON,
+  and runs JSON job scripts. It also stays a drop-in XFoil: pipe an XFoil
+  script on stdin.
+
+## Download
+
+Builds for Windows, Linux (x86-64 and aarch64) and macOS (Apple silicon) are
+on the [releases page](https://github.com/notmanan0/Foiley/releases). Each
+archive holds the one `foiley` binary. On Windows, double-click `foiley.exe`
+for Foiley Studio; anywhere, `foiley --help` lists the commands.
+
+To build from source (current stable Rust):
 
 ```
 cargo build --release
-target/release/foiley-studio            # GUI
+target/release/foiley studio            # GUI
 target/release/foiley --help            # CLI
 ```
+
+How a start is routed (`crates/cli/src/launch.rs`):
+
+| start | opens |
+|---|---|
+| `foiley studio [files] [--module 2d]` (alias `gui`) | Studio |
+| `foiley project.foiley`: an existing file that is not a command name | Studio, with that file |
+| Windows: double-click, a shortcut, "Open with", a file dropped on `foiley.exe` | Studio, with no console window |
+| `foiley <command> ...` | the command line |
+| `foiley < script.txt`: no command, script on stdin | XFoil |
+
+On Windows `foiley.exe` is a console program, so shells wait for it and
+print its output. Its embedded manifest (`crates/cli/foiley.manifest`) tells
+Windows 11 24H2 and later not to create a console window when it is started
+from Explorer; older Windows shows one briefly, which Studio closes.
+
+On Linux the GUI loads X11, Wayland and OpenGL at run time and file dialogs
+use the XDG portal, so the same binary runs on a headless server with none
+of them installed; only `foiley studio` needs a display. For a binary with
+no GUI code at all: `cargo build --release -p foiley-cli --no-default-features`.
+
+Pushing a tag `vX.Y.Z` (equal to the version in `Cargo.toml`) runs
+`.github/workflows/release.yml`. It builds `foiley` for Linux (x86-64,
+aarch64; glibc 2.28+), Windows (x86-64) and macOS (Apple silicon),
+smoke-tests each binary, and publishes a GitHub release with the archives
+and their checksums. A version with a hyphen (`0.1.0-dev.1`) is published as
+a pre-release. Notes in `.github/release-notes/vX.Y.Z.md`, if present, open
+the release text.
 
 `.cargo/config.toml` builds with `-C target-cpu=native`. Remove that line to
 build portable binaries; the SIMD kernels detect CPU features at run time.
@@ -35,8 +77,8 @@ Use `cargo build --profile dist` for a fully optimised (fat LTO) release.
 | `crates/foil` | `Foil` geometry and file I/O (Selig and Lednicer .dat), NACA 4/5 digit, every XFoil design operation as a function, inverse design (QDES/MDES), the optimiser (MOPSO/GA), the 2D analysis service with convergence recovery, polar types 1/2/3/4/6, batch polar meshes |
 | `crates/plane` | plane/wing/fuselage model (elliptic, NURBS, STL/STEP), reference dimensions, inertia, meshing (thin and thick, quads or triangles, flaps, tips, fuselage), LLT, VLM1, VLM2 with optional free wake, source/doublet panel methods, polar types T1 to T8, trim, stability and control derivatives, modes, time responses, XML/AVL/STL exchange |
 | `crates/app` | project file (`.foiley`, JSON), imports (including xflr5 `.xfl`, flow5 `.fl5`, `.plr`), automatic 2D polar meshes for 3D runs, the background **job manager** |
-| `crates/cli` | the `foiley` binary |
-| `crates/gui` | the `foiley-studio` binary (egui) |
+| `crates/cli` | the `foiley` binary: command line, XFoil mode, start-up routing; links `crates/gui` (feature `gui`, on by default) |
+| `crates/gui` | Foiley Studio (egui), a library opened by `foiley studio` |
 
 ## Why it does not freeze (and other design decisions)
 
@@ -137,7 +179,7 @@ the Jobs and Log panel is always visible at the bottom.
   Modal time responses, and forced responses to step, pulse, doublet or
   sine control inputs (T7 gains give the control derivatives).
 
-`foiley-studio project.foiley --module 3d` opens a project in a given
+`foiley studio project.foiley --module 3d` opens a project in a given
 workspace. File › Import also reads xflr5 `.xfl`, flow5 `.fl5`, `.plr` and
 AVL `.avl` files, and shows a conversion report (what was mapped,
 approximated and skipped, and why); `foiley project` prints the same report.

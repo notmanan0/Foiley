@@ -1,4 +1,5 @@
-//! `foiley` - headless command-line interface.
+//! `foiley` - the one Foiley binary: command-line interface, XFoil script
+//! mode and Foiley Studio (`foiley studio`, see `launch.rs`).
 //!
 //! Run `foiley --help` or `foiley <command> --help` for every option.
 //! Without a command and with a script piped on stdin, Foiley behaves
@@ -7,6 +8,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "gui")]
+mod launch;
 mod legacy;
 mod progress_ui;
 
@@ -22,6 +25,7 @@ use foiley_plane::analysis::{Method, PolarKind, Range, RefDims};
 use foiley_plane::geom::Inertia;
 use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
 use progress_ui::Ui;
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +75,49 @@ enum Cmd {
         #[arg(long)]
         save: Option<PathBuf>,
     },
+    /// Open Foiley Studio, the graphical interface (also `foiley <file>`, or start foiley from the desktop)
+    #[cfg(feature = "gui")]
+    #[command(visible_alias = "gui")]
+    Studio {
+        /// files to open: .foiley project, xflr5 .xfl / flow5 .fl5 project, .plr polars, plane XML, AVL geometry, foil .dat
+        files: Vec<PathBuf>,
+        /// module to start in
+        #[arg(long, value_enum)]
+        module: Option<StudioModule>,
+        /// start a 3D panel analysis of the first plane right away
+        #[arg(long)]
+        run: bool,
+    },
+}
+
+#[cfg(feature = "gui")]
+#[derive(Clone, Copy, ValueEnum)]
+enum StudioModule {
+    /// foil design
+    Foil,
+    /// 2D analysis
+    #[value(name = "2d")]
+    Analysis2d,
+    /// plane design
+    Plane,
+    /// 3D analysis
+    #[value(name = "3d")]
+    Analysis3d,
+    /// stability
+    Stability,
+}
+
+#[cfg(feature = "gui")]
+impl From<StudioModule> for foiley_gui::Module {
+    fn from(m: StudioModule) -> Self {
+        match m {
+            StudioModule::Foil => Self::FoilDesign,
+            StudioModule::Analysis2d => Self::FoilAnalysis,
+            StudioModule::Plane => Self::PlaneDesign,
+            StudioModule::Analysis3d => Self::PlaneAnalysis,
+            StudioModule::Stability => Self::Stability,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -742,14 +789,34 @@ fn ensure_polars(mgr: &mut JobManager, ui: &mut Ui, proj: &mut Project, plane: &
     Ok(())
 }
 
+/// Subcommand names and aliases, for telling a command from a file name.
+#[cfg(feature = "gui")]
+fn command_names() -> Vec<String> {
+    let cmd = <Cli as clap::CommandFactory>::command();
+    let mut names: Vec<String> = cmd.get_subcommands().flat_map(|c| std::iter::once(c.get_name()).chain(c.get_all_aliases())).map(String::from).collect();
+    names.push("help".into());
+    names
+}
+
 fn real_main() -> Result<(), String> {
-    let cli = Cli::parse();
+    #[cfg_attr(not(feature = "gui"), allow(unused_mut))]
+    let mut args: Vec<OsString> = std::env::args_os().collect();
+    #[cfg(feature = "gui")]
+    launch::route(&mut args, &command_names());
+    let cli = Cli::parse_from(args);
     let Some(cmd) = cli.cmd else {
         if !std::io::stdin().is_terminal() {
             legacy::run(None, cli.verbose);
             return Ok(());
         }
-        return Err("no command given. Try `foiley --help`, or pipe an XFoil script on stdin (or use `foiley xfoil`).".into());
+        let gui = if cfg!(feature = "gui") { " `foiley studio` opens the graphical interface." } else { "" };
+        return Err(format!("no command given. Try `foiley --help`, or pipe an XFoil script on stdin (or use `foiley xfoil`).{gui}"));
+    };
+    // Studio runs its own job manager
+    #[cfg(feature = "gui")]
+    let cmd = match cmd {
+        Cmd::Studio { files, module, run } => return launch::studio(foiley_gui::Launch { files, module: module.map(Into::into), run, threads: cli.threads }),
+        cmd => cmd,
     };
     let mut mgr = JobManager::new(cli.threads);
     let mut ui = Ui::new(cli.quiet, cli.verbose, cli.json_progress);
@@ -1323,6 +1390,8 @@ fn real_main() -> Result<(), String> {
             }
         },
         Cmd::Run { script } => run_script(&mut mgr, &mut ui, &script)?,
+        #[cfg(feature = "gui")]
+        Cmd::Studio { .. } => unreachable!("Studio returned above"),
     }
     Ok(())
 }
