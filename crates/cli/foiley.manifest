@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Embedded in foiley.exe by build.rs (MSVC).  foiley.exe is a console
+     program, so shells wait for it and print its output.  "detached" asks
+     Windows 11 24H2+ not to create a console window when it is started from
+     Explorer, where it opens Foiley Studio instead (src/launch.rs).
+     https://learn.microsoft.com/windows/console/console-allocation-policy -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <consoleAllocationPolicy xmlns="http://schemas.microsoft.com/SMI/2024/WindowsSettings">detached</consoleAllocationPolicy>
+    </windowsSettings>
+  </application>
+</assembly>

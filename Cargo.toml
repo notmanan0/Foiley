@@ -14,6 +14,7 @@ foiley-core = { path = "crates/core" }
 foiley-foil = { path = "crates/foil" }
 foiley-plane = { path = "crates/plane" }
 foiley-app = { path = "crates/app" }
+foiley-gui = { path = "crates/gui" }
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
