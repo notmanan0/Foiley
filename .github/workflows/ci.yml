@@ -66,3 +66,21 @@ jobs:
         with:
           key: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy, headless foiley (no GUI)
+        run: cargo clippy -p foiley-cli --no-default-features --all-targets -- -D warnings
+
+  windows:
+    # foiley.exe's console handling and embedded manifest (crates/cli/src/launch.rs, build.rs)
+    name: Windows (foiley.exe)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+      - run: cargo clippy -p foiley-cli -p foiley-gui --all-targets -- -D warnings
+      - run: cargo test -p foiley-cli -p foiley-gui

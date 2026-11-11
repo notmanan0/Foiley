@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "foiley"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "foiley",
  "mimalloc",
@@ -1286,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-app"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "foiley-core",
  "foiley-foil",
@@ -1298,13 +1298,14 @@ dependencies = [
 
 [[package]]
 name = "foiley-cli"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "clap",
  "foiley",
  "foiley-app",
  "foiley-core",
  "foiley-foil",
+ "foiley-gui",
  "foiley-plane",
  "mimalloc",
  "serde",
@@ -1313,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-core"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "blake3",
  "faer",
@@ -1324,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-foil"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "foiley",
  "foiley-core",
@@ -1335,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-gui"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "eframe",
  "egui_plot",
@@ -1343,7 +1344,6 @@ dependencies = [
  "foiley-core",
  "foiley-foil",
  "foiley-plane",
- "mimalloc",
  "rfd",
  "serde",
  "serde_json",
@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-plane"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 dependencies = [
  "foiley-core",
  "foiley-foil",
