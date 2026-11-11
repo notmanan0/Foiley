@@ -252,6 +252,9 @@ enum FoilCmd {
         /// flap hinge "x/c,y/t" for type 6
         #[arg(long, default_value = "0.75,0.5")]
         hinge: String,
+        /// also write every polar point's Cp and boundary layer to DIR/point_a+005.00.json (`foil point -f json` format)
+        #[arg(long, value_name = "DIR")]
+        details: Option<PathBuf>,
         #[command(flatten)]
         out: Out,
     },
@@ -789,6 +792,29 @@ fn ensure_polars(mgr: &mut JobManager, ui: &mut Ui, proj: &mut Project, plane: &
     Ok(())
 }
 
+/// `foil polar --details DIR`: one file per polar point, exactly what
+/// `foil point -f json` writes, named by alpha.
+fn write_point_details(dir: &Path, polar: &FoilPolar, details: &[foiley_foil::analysis::PointDetail]) -> Result<usize, String> {
+    // A point solved by two marching chunks (the start of the up and down
+    // marches) has two details; take the one whose point the polar kept.
+    let files = polar
+        .points
+        .iter()
+        .map(|p| details.iter().rfind(|d| d.point == *p).map(|d| (format!("point_a{:+07.2}.json", p.alpha), d)).ok_or_else(|| format!("no distributions kept for the point at alpha {}", p.alpha)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort_unstable();
+    if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+        return Err(format!("two polar points would both be written to {} (--details names files by alpha to 0.01 degree)", w[0]));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for (name, d) in &files {
+        let path = dir.join(name);
+        std::fs::write(&path, serde_json::to_string_pretty(d).unwrap()).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(files.len())
+}
+
 /// Subcommand names and aliases, for telling a command from a file name.
 #[cfg(feature = "gui")]
 fn command_names() -> Vec<String> {
@@ -871,7 +897,7 @@ fn real_main() -> Result<(), String> {
                     );
                 }
             }
-            FoilCmd::Polar { src, x, ptype, alpha, cl, re_sweep, flap_sweep, at_alpha, hinge, out } => {
+            FoilCmd::Polar { src, x, ptype, alpha, cl, re_sweep, flap_sweep, at_alpha, hinge, details: details_dir, out } => {
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let mut st = x.settings()?;
@@ -910,7 +936,14 @@ fn real_main() -> Result<(), String> {
                     }
                     _ => Sweep::Alpha { from: -5.0, to: 15.0, step: 0.5 },
                 };
-                if let JobOutput::FoilPolar { polar, .. } = run_job(&mut mgr, &mut ui, &format!("{} polar", foil.name), JobKind::FoilPolar { foil, settings: st, sweep })? {
+                if details_dir.is_some() {
+                    if matches!(st.polar_type, PolarType::FixedAlpha | PolarType::FlapSweep) {
+                        return Err("--details names its files by alpha, which a type 4 or 6 polar holds fixed".into());
+                    }
+                    // retaining distributions does not change the solved polar (FoilPolar::identity)
+                    st.keep_details = true;
+                }
+                if let JobOutput::FoilPolar { polar, details } = run_job(&mut mgr, &mut ui, &format!("{} polar", foil.name), JobKind::FoilPolar { foil, settings: st, sweep })? {
                     let text = match out.format {
                         Format::Table => foil_polar_table(&polar),
                         Format::Csv => polar.to_csv(),
@@ -918,6 +951,10 @@ fn real_main() -> Result<(), String> {
                         Format::Xfoil => polar.to_xfoil_text(),
                     };
                     write_out(&out, &text)?;
+                    if let Some(dir) = &details_dir {
+                        let n = write_point_details(dir, &polar, &details)?;
+                        eprintln!("  wrote {n} point files to {}", dir.display());
+                    }
                 }
             }
             FoilCmd::Point { src, x, alpha, cl, out } => {
