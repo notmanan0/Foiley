@@ -4,7 +4,7 @@ default-members = [".", "crates/core", "crates/foil", "crates/plane", "crates/ap
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.1.0-dev.1"
 edition = "2021"
 license = "GPL-2.0-or-later"
 
@@ -14,6 +14,7 @@ foiley-core = { path = "crates/core" }
 foiley-foil = { path = "crates/foil" }
 foiley-plane = { path = "crates/plane" }
 foiley-app = { path = "crates/app" }
+foiley-gui = { path = "crates/gui" }
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -26,7 +27,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 
 [package]
 name = "foiley"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 edition = "2021"
 description = "Rust port of XFoil 6.97 with multithreading and SIMD (2D engine of Foiley)"
 license = "GPL-2.0-or-later"

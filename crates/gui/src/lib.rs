@@ -1,14 +1,10 @@
-//! Foiley Studio - graphical interface.
+//! Foiley Studio - graphical interface, started by `foiley studio` (or by
+//! launching `foiley` from the desktop; see the CLI crate's `launch.rs`).
 //!
 //! The user interface thread never runs a solver: every analysis (and
 //! meshing, saving, loading) is a background job.  The bottom panel shows
 //! every job with a live progress bar, stage, point counts, elapsed time,
 //! ETA and a Cancel button, so the window stays responsive at all times.
-
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod body_list;
 mod foil_ui;
@@ -117,8 +113,9 @@ pub struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext) -> Self {
-        let mut jobs = JobManager::new(0);
+    fn new(cc: &eframe::CreationContext, launch: Launch) -> Self {
+        let Launch { files, module, run: run_now, threads } = launch;
+        let mut jobs = JobManager::new(threads);
         let ctx = cc.egui_ctx.clone();
         jobs.set_notify(move || ctx.request_repaint());
         let dark = cc.storage.and_then(|s| s.get_string("dark")).map(|v| v == "1").unwrap_or(true);
@@ -128,30 +125,8 @@ impl App {
             s.spacing.interact_size.y = 22.0;
         });
         let project = Project::starter();
-        // command line: foiley-studio [project.foiley | plane.xml | foil.dat ...] [--module foil|2d|plane|3d|stability]
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let mut start_module = Module::FoilDesign;
-        let mut run_now = false;
-        let mut files = Vec::new();
-        let mut it = args.iter();
-        while let Some(a) = it.next() {
-            if a == "--run" {
-                run_now = true;
-            } else if a == "--module" {
-                start_module = match it.next().map(|s| s.as_str()) {
-                    Some("2d") => Module::FoilAnalysis,
-                    Some("plane") => Module::PlaneDesign,
-                    Some("3d") => Module::PlaneAnalysis,
-                    Some("stability") => Module::Stability,
-                    _ => Module::FoilDesign,
-                };
-            } else {
-                files.push(PathBuf::from(a));
-            }
-        }
         let mut app = Self::from_project(project, jobs, dark);
-        app.module = start_module;
-        let _ = &mut run_now;
+        app.module = module.unwrap_or(Module::FoilDesign);
         for f in files {
             let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             if ext == "foiley" || ext == "json" {
@@ -857,12 +832,34 @@ impl eframe::App for App {
     }
 }
 
-fn main() -> eframe::Result {
+/// What Foiley Studio opens at start-up (`foiley studio --help`).
+#[derive(Default)]
+pub struct Launch {
+    /// projects (.foiley), xflr5 / flow5 projects, .plr polars, plane XML,
+    /// AVL geometry or foil .dat files, opened in this order
+    pub files: Vec<PathBuf>,
+    /// module shown first (default: foil design)
+    pub module: Option<Module>,
+    /// start a 3D panel analysis of the first plane right away
+    pub run: bool,
+    /// compute threads (0 = all cores but one)
+    pub threads: usize,
+}
+
+/// Open the Foiley Studio window and block until it is closed.
+pub fn run(launch: Launch) -> Result<(), String> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 900.0]).with_min_inner_size([900.0, 600.0]).with_title("Foiley Studio"),
         ..Default::default()
     };
-    eframe::run_native("Foiley Studio", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    // the app id stays "Foiley Studio" so saved window state and settings carry over
+    eframe::run_native("Foiley Studio", opts, Box::new(|cc| Ok(Box::new(App::new(cc, launch))))).map_err(|e| format!("cannot open the Foiley Studio window: {e}"))
+}
+
+/// Show an error in a message box: for a start from the desktop, where
+/// there is no terminal to print it on.
+pub fn error_dialog(text: &str) {
+    rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Foiley").set_description(text).set_buttons(rfd::MessageButtons::Ok).show();
 }
 
 /// Import a file into the project.  xflr5 / flow5 projects, .plr polars and

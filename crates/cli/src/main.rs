@@ -1,4 +1,5 @@
-//! `foiley` - headless command-line interface.
+//! `foiley` - the one Foiley binary: command-line interface, XFoil script
+//! mode and Foiley Studio (`foiley studio`, see `launch.rs`).
 //!
 //! Run `foiley --help` or `foiley <command> --help` for every option.
 //! Without a command and with a script piped on stdin, Foiley behaves
@@ -7,6 +8,8 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "gui")]
+mod launch;
 mod legacy;
 mod progress_ui;
 
@@ -22,6 +25,7 @@ use foiley_plane::analysis::{Method, PolarKind, Range, RefDims};
 use foiley_plane::geom::Inertia;
 use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
 use progress_ui::Ui;
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +75,49 @@ enum Cmd {
         #[arg(long)]
         save: Option<PathBuf>,
     },
+    /// Open Foiley Studio, the graphical interface (also `foiley <file>`, or start foiley from the desktop)
+    #[cfg(feature = "gui")]
+    #[command(visible_alias = "gui")]
+    Studio {
+        /// files to open: .foiley project, xflr5 .xfl / flow5 .fl5 project, .plr polars, plane XML, AVL geometry, foil .dat
+        files: Vec<PathBuf>,
+        /// module to start in
+        #[arg(long, value_enum)]
+        module: Option<StudioModule>,
+        /// start a 3D panel analysis of the first plane right away
+        #[arg(long)]
+        run: bool,
+    },
+}
+
+#[cfg(feature = "gui")]
+#[derive(Clone, Copy, ValueEnum)]
+enum StudioModule {
+    /// foil design
+    Foil,
+    /// 2D analysis
+    #[value(name = "2d")]
+    Analysis2d,
+    /// plane design
+    Plane,
+    /// 3D analysis
+    #[value(name = "3d")]
+    Analysis3d,
+    /// stability
+    Stability,
+}
+
+#[cfg(feature = "gui")]
+impl From<StudioModule> for foiley_gui::Module {
+    fn from(m: StudioModule) -> Self {
+        match m {
+            StudioModule::Foil => Self::FoilDesign,
+            StudioModule::Analysis2d => Self::FoilAnalysis,
+            StudioModule::Plane => Self::PlaneDesign,
+            StudioModule::Analysis3d => Self::PlaneAnalysis,
+            StudioModule::Stability => Self::Stability,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -205,6 +252,9 @@ enum FoilCmd {
         /// flap hinge "x/c,y/t" for type 6
         #[arg(long, default_value = "0.75,0.5")]
         hinge: String,
+        /// also write every polar point's Cp and boundary layer to DIR/point_a+005.00.json (`foil point -f json` format)
+        #[arg(long, value_name = "DIR")]
+        details: Option<PathBuf>,
         #[command(flatten)]
         out: Out,
     },
@@ -742,14 +792,57 @@ fn ensure_polars(mgr: &mut JobManager, ui: &mut Ui, proj: &mut Project, plane: &
     Ok(())
 }
 
+/// `foil polar --details DIR`: one file per polar point, exactly what
+/// `foil point -f json` writes, named by alpha.
+fn write_point_details(dir: &Path, polar: &FoilPolar, details: &[foiley_foil::analysis::PointDetail]) -> Result<usize, String> {
+    // A point solved by two marching chunks (the start of the up and down
+    // marches) has two details; take the one whose point the polar kept.
+    let files = polar
+        .points
+        .iter()
+        .map(|p| details.iter().rfind(|d| d.point == *p).map(|d| (format!("point_a{:+07.2}.json", p.alpha), d)).ok_or_else(|| format!("no distributions kept for the point at alpha {}", p.alpha)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort_unstable();
+    if let Some(w) = names.windows(2).find(|w| w[0] == w[1]) {
+        return Err(format!("two polar points would both be written to {} (--details names files by alpha to 0.01 degree)", w[0]));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for (name, d) in &files {
+        let path = dir.join(name);
+        std::fs::write(&path, serde_json::to_string_pretty(d).unwrap()).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(files.len())
+}
+
+/// Subcommand names and aliases, for telling a command from a file name.
+#[cfg(feature = "gui")]
+fn command_names() -> Vec<String> {
+    let cmd = <Cli as clap::CommandFactory>::command();
+    let mut names: Vec<String> = cmd.get_subcommands().flat_map(|c| std::iter::once(c.get_name()).chain(c.get_all_aliases())).map(String::from).collect();
+    names.push("help".into());
+    names
+}
+
 fn real_main() -> Result<(), String> {
-    let cli = Cli::parse();
+    #[cfg_attr(not(feature = "gui"), allow(unused_mut))]
+    let mut args: Vec<OsString> = std::env::args_os().collect();
+    #[cfg(feature = "gui")]
+    launch::route(&mut args, &command_names());
+    let cli = Cli::parse_from(args);
     let Some(cmd) = cli.cmd else {
         if !std::io::stdin().is_terminal() {
             legacy::run(None, cli.verbose);
             return Ok(());
         }
-        return Err("no command given. Try `foiley --help`, or pipe an XFoil script on stdin (or use `foiley xfoil`).".into());
+        let gui = if cfg!(feature = "gui") { " `foiley studio` opens the graphical interface." } else { "" };
+        return Err(format!("no command given. Try `foiley --help`, or pipe an XFoil script on stdin (or use `foiley xfoil`).{gui}"));
+    };
+    // Studio runs its own job manager
+    #[cfg(feature = "gui")]
+    let cmd = match cmd {
+        Cmd::Studio { files, module, run } => return launch::studio(foiley_gui::Launch { files, module: module.map(Into::into), run, threads: cli.threads }),
+        cmd => cmd,
     };
     let mut mgr = JobManager::new(cli.threads);
     let mut ui = Ui::new(cli.quiet, cli.verbose, cli.json_progress);
@@ -804,7 +897,7 @@ fn real_main() -> Result<(), String> {
                     );
                 }
             }
-            FoilCmd::Polar { src, x, ptype, alpha, cl, re_sweep, flap_sweep, at_alpha, hinge, out } => {
+            FoilCmd::Polar { src, x, ptype, alpha, cl, re_sweep, flap_sweep, at_alpha, hinge, details: details_dir, out } => {
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let mut st = x.settings()?;
@@ -843,7 +936,14 @@ fn real_main() -> Result<(), String> {
                     }
                     _ => Sweep::Alpha { from: -5.0, to: 15.0, step: 0.5 },
                 };
-                if let JobOutput::FoilPolar { polar, .. } = run_job(&mut mgr, &mut ui, &format!("{} polar", foil.name), JobKind::FoilPolar { foil, settings: st, sweep })? {
+                if details_dir.is_some() {
+                    if matches!(st.polar_type, PolarType::FixedAlpha | PolarType::FlapSweep) {
+                        return Err("--details names its files by alpha, which a type 4 or 6 polar holds fixed".into());
+                    }
+                    // retaining distributions does not change the solved polar (FoilPolar::identity)
+                    st.keep_details = true;
+                }
+                if let JobOutput::FoilPolar { polar, details } = run_job(&mut mgr, &mut ui, &format!("{} polar", foil.name), JobKind::FoilPolar { foil, settings: st, sweep })? {
                     let text = match out.format {
                         Format::Table => foil_polar_table(&polar),
                         Format::Csv => polar.to_csv(),
@@ -851,6 +951,10 @@ fn real_main() -> Result<(), String> {
                         Format::Xfoil => polar.to_xfoil_text(),
                     };
                     write_out(&out, &text)?;
+                    if let Some(dir) = &details_dir {
+                        let n = write_point_details(dir, &polar, &details)?;
+                        eprintln!("  wrote {n} point files to {}", dir.display());
+                    }
                 }
             }
             FoilCmd::Point { src, x, alpha, cl, out } => {
@@ -1323,6 +1427,8 @@ fn real_main() -> Result<(), String> {
             }
         },
         Cmd::Run { script } => run_script(&mut mgr, &mut ui, &script)?,
+        #[cfg(feature = "gui")]
+        Cmd::Studio { .. } => unreachable!("Studio returned above"),
     }
     Ok(())
 }
