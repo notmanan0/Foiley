@@ -4,7 +4,7 @@ default-members = [".", "crates/core", "crates/foil", "crates/plane", "crates/ap
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.1.0-dev.1"
 edition = "2021"
 license = "GPL-2.0-or-later"
 
@@ -27,7 +27,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 
 [package]
 name = "foiley"
-version = "0.2.0"
+version = "0.1.0-dev.1"
 edition = "2021"
 description = "Rust port of XFoil 6.97 with multithreading and SIMD (2D engine of Foiley)"
 license = "GPL-2.0-or-later"
