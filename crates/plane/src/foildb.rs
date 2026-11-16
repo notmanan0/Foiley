@@ -129,11 +129,9 @@ pub struct FamilyKey {
     pub polar_type: u8,
     pub mach: f64,
     pub ncrit: f64,
-    #[serde(default)]
+    /// bottom-surface Ncrit when it differs from `ncrit`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ncrit_bot: Option<f64>,
-    /// Distinguishes 6.99/wake calibration from the legacy family.
-    #[serde(default)]
-    pub solver_signature: Option<Hash32>,
     pub xtr_top: f64,
     pub xtr_bot: f64,
     /// trailing-edge flap deflection of the polar's geometry, degrees (+ down)
@@ -147,31 +145,33 @@ impl FamilyKey {
     pub const DEFAULT_MOM_REF_X: f64 = 0.25;
     pub fn of(p: &FoilPolar, foil_geom_hash: Hash32) -> FamilyKey {
         let mom_ref_x = p.settings.as_ref().map(|s| s.cm_ref.0).unwrap_or(FamilyKey::DEFAULT_MOM_REF_X);
-        let solver_signature = p.settings.as_ref().and_then(|s| {
-            let legacy = s.solver_version == foiley_foil::analysis::SolverVersion::Xfoil697 && s.wake_length == 1.0 && s.wake_dissipation == 0.9;
-            (!legacy).then(|| foiley_core::provenance::hash_json("foiley.family.solver.v1", &(s.solver_version, s.wake_length, s.wake_dissipation)))
-        });
-        FamilyKey { foil_geom_hash, polar_type: p.polar_type, mach: p.mach, ncrit: p.ncrit, ncrit_bot: p.ncrit_bot, solver_signature, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, flap_deg: p.flap_deg, mom_ref_x }
+        let ncrit_bot = p.ncrit_bot.filter(|&n| n != p.ncrit);
+        FamilyKey { foil_geom_hash, polar_type: p.polar_type, mach: p.mach, ncrit: p.ncrit, ncrit_bot, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, flap_deg: p.flap_deg, mom_ref_x }
     }
-    fn q(&self) -> (Hash32, u8, [i64; 7], Option<Hash32>) {
-        (self.foil_geom_hash, self.polar_type, [qv(self.mach), qv(self.ncrit), qv(self.xtr_top), qv(self.xtr_bot), qv(self.flap_deg), qv(self.mom_ref_x), qv(self.ncrit_bot.unwrap_or(self.ncrit))], self.solver_signature)
+    /// The bottom-surface Ncrit (the top one unless split).
+    pub fn ncrit_bottom(&self) -> f64 {
+        self.ncrit_bot.unwrap_or(self.ncrit)
+    }
+    fn q(&self) -> (Hash32, u8, [i64; 7]) {
+        (self.foil_geom_hash, self.polar_type, [qv(self.mach), qv(self.ncrit), qv(self.xtr_top), qv(self.xtr_bot), qv(self.flap_deg), qv(self.mom_ref_x), qv(self.ncrit_bottom())])
     }
     /// The same family apart from the flap angle.
     pub fn same_except_flap(&self, o: &FamilyKey) -> bool {
         let (a, b) = (self.q(), o.q());
-        a.0 == b.0 && a.1 == b.1 && a.2[0..4] == b.2[0..4] && a.2[5..] == b.2[5..] && a.3 == b.3
+        a.0 == b.0 && a.1 == b.1 && a.2[0..4] == b.2[0..4] && a.2[5..] == b.2[5..]
     }
     pub fn describe(&self) -> String {
         format!(
-            "type {} M={} Ncrit={} xtr=({}, {}){}{} geometry {} NcritB={} solver={}",
+            "type {} M={} Ncrit={}{} xtr=({}, {}){}{} geometry {}",
             self.polar_type,
             self.mach,
             self.ncrit,
+            if qv(self.ncrit_bottom()) != qv(self.ncrit) { format!(" NcritB={}", self.ncrit_bottom()) } else { String::new() },
             self.xtr_top,
             self.xtr_bot,
             if qv(self.flap_deg) != 0 { format!(" flap {:+} deg", self.flap_deg) } else { String::new() },
             if qv(self.mom_ref_x) != qv(FamilyKey::DEFAULT_MOM_REF_X) { format!(" Cm about x/c={}", self.mom_ref_x) } else { String::new() },
-            self.foil_geom_hash.short(), self.ncrit_bot.unwrap_or(self.ncrit), self.solver_signature.map(|s| s.short()).unwrap_or_else(|| "6.97".into())
+            self.foil_geom_hash.short()
         )
     }
     /// Stable hash of the key (for manifests).
@@ -181,8 +181,10 @@ impl FamilyKey {
         for v in [self.mach, self.ncrit, self.xtr_top, self.xtr_bot, self.flap_deg, self.mom_ref_x] {
             h.f64(v);
         }
-        h.f64(self.ncrit_bot.unwrap_or(self.ncrit));
-        if let Some(s) = self.solver_signature { h.bytes(&s.0); }
+        // (only a split Ncrit extends the hash, so unsplit keys keep theirs)
+        if qv(self.ncrit_bottom()) != qv(self.ncrit) {
+            h.f64(self.ncrit_bottom());
+        }
         h.finish()
     }
 }
@@ -230,8 +232,8 @@ impl Family {
 pub struct FamilySelector {
     pub mach: Option<f64>,
     pub ncrit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ncrit_bot: Option<f64>,
-    pub solver_signature: Option<Hash32>,
     pub xtr_top: Option<f64>,
     pub xtr_bot: Option<f64>,
 }
@@ -239,7 +241,7 @@ pub struct FamilySelector {
 impl FamilySelector {
     pub fn matches(&self, k: &FamilyKey) -> bool {
         let m = |s: Option<f64>, v: f64| s.is_none_or(|s| qv(s) == qv(v));
-        m(self.mach, k.mach) && m(self.ncrit, k.ncrit) && m(self.ncrit_bot, k.ncrit_bot.unwrap_or(k.ncrit)) && self.solver_signature.is_none_or(|s| Some(s) == k.solver_signature) && m(self.xtr_top, k.xtr_top) && m(self.xtr_bot, k.xtr_bot)
+        m(self.mach, k.mach) && m(self.ncrit, k.ncrit) && m(self.ncrit_bot, k.ncrit_bottom()) && m(self.xtr_top, k.xtr_top) && m(self.xtr_bot, k.xtr_bot)
     }
     pub fn describe(&self) -> String {
         let f = |n: &str, v: Option<f64>| v.map(|v| format!("{n}={v}"));
@@ -344,7 +346,7 @@ impl FoilDb {
         let mut v: Vec<FamilyId> = (0..self.families.len()).map(|i| FamilyId(i as u32)).filter(|&i| self.family(i).foil == foil && self.family(i).usable()).collect();
         v.sort_by_key(|&i| {
             let k = self.family(i).key;
-            (qv(k.flap_deg), qv(k.mach), qv(k.ncrit), qv(k.xtr_top), qv(k.xtr_bot), qv(k.mom_ref_x), qv(k.ncrit_bot.unwrap_or(k.ncrit)), k.solver_signature, k.foil_geom_hash)
+            (qv(k.flap_deg), qv(k.mach), qv(k.ncrit), qv(k.ncrit_bottom()), qv(k.xtr_top), qv(k.xtr_bot), qv(k.mom_ref_x), k.foil_geom_hash)
         });
         v
     }
@@ -365,7 +367,7 @@ impl FoilDb {
         match hit.len() {
             1 => Ok(Some(hit[0])),
             0 => Err(format!("no 2D polar family of foil '{foil}' matches the selection ({}); candidates:\n{}", sel.describe(), list(&all))),
-            _ => Err(format!("{} 2D polar families of foil '{foil}' match the selection ({}): set the family's Mach, Ncrit or trips to choose one; candidates:\n{}", hit.len(), sel.describe(), list(&hit))),
+            _ => Err(format!("{} 2D polar families of foil '{foil}' match the selection ({}): set the family's Mach, Ncrit, bottom Ncrit or trips to choose one; candidates:\n{}", hit.len(), sel.describe(), list(&hit))),
         }
     }
 

@@ -35,7 +35,6 @@ autobins = false
 
 [dependencies]
 rayon = "1.10"
-serde = { workspace = true }
 
 [features]
 # raw-bit dump of every stored point to $RAWDUMP (finding F015; src/rawdump.rs)

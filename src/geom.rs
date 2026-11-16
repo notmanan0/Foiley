@@ -624,7 +624,8 @@ impl XFoil {
         let ybte = 0.5 * (self.yb[1] + self.yb[nb]);
         crate::outln!("\n  LE  x,y  ={:10.5}{:10.5}  |   Chord ={:10.5}", xble, yble, self.chordb);
         crate::outln!("  TE  x,y  ={:10.5}{:10.5}  |", xbte, ybte);
-        if r.itype <= 2 {
+        // (6.99: only when no MSES domain string is set)
+        if r.itype <= 2 && self.ispars.trim().is_empty() {
             let ch = self.chordb;
             let rnd = |v: f64| ((20.0 * (v / ch).abs() + 0.5).trunc() / 20.0) * ch.abs() * v.signum();
             let xinl = rnd(xble - 2.0 * ch);

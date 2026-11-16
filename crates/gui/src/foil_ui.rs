@@ -19,27 +19,6 @@ struct PolarLabel {
     name: String,
 }
 
-/// Select a nearby handle once, then keep that handle for the whole drag.
-fn drag_plot_point(pu: &egui_plot::PlotUi, points: &mut [[f64; 2]], selected: &mut Option<usize>, move_x: bool) -> bool {
-    if pu.response().drag_stopped() { *selected = None; }
-    let Some(pointer) = pu.pointer_coordinate() else { return false; };
-    if pu.response().drag_started() {
-        let screen = pu.screen_from_plot(pointer);
-        *selected = points.iter().enumerate().filter_map(|(i, p)| {
-            let distance = pu.screen_from_plot(egui_plot::PlotPoint::new(p[0], p[1])).distance_sq(screen);
-            (distance < 144.0).then_some((i, distance))
-        }).min_by(|a,b| a.1.total_cmp(&b.1)).map(|p| p.0);
-    }
-    if pu.response().dragged() {
-        if let Some(point) = selected.and_then(|i| points.get_mut(i)) {
-            if move_x { point[0] = pointer.x; }
-            point[1] = pointer.y;
-            return true;
-        }
-    }
-    false
-}
-
 /// Compute identities once per frame and reuse them across selectors and all
 /// four plots. Only settings collisions need a short hash in their label.
 fn polar_labels(polars: &[FoilPolar]) -> Vec<PolarLabel> {
@@ -86,10 +65,6 @@ pub struct FoilUi {
     pub inv_alpha: f64,
     pub qdist: Option<SpeedDist>,
     pub inv_target: Option<foiley_app::InverseTarget>,
-    pub inv_edit: bool,
-    pub inv_drag: Option<usize>,
-    pub geometry_edit: bool,
-    pub geometry_drag: Option<usize>,
     pub inv_upper: bool,
     pub inv_x: [f64; 2],
     pub inv_kind: usize,
@@ -134,10 +109,6 @@ impl Default for FoilUi {
             inv_alpha: 2.0,
             qdist: None,
             inv_target: None,
-            inv_edit: false,
-            inv_drag: None,
-            geometry_edit: false,
-            geometry_drag: None,
             inv_upper: true,
             inv_x: [0.3, 0.7],
             inv_kind: 0,
@@ -380,14 +351,7 @@ impl App {
                             _ => ModKind::Smooth,
                         };
                         let m = Modification { x_from: self.fui.inv_x[0], x_to: self.fui.inv_x[1], upper: self.fui.inv_upper, kind };
-                        ui.checkbox(&mut self.fui.inv_edit, "Drag target points on the speed plot");
-                        if ui.button("Reset dragged target").clicked() { self.fui.inv_target = None; }
-                        let (mut t, seg) = modify(&d, &m);
-                        if self.fui.inv_edit {
-                            if let Some((old, old_seg)) = &self.fui.inv_target {
-                                if old.len() == t.len() && *old_seg == seg { t.clone_from(old); }
-                            }
-                        }
+                        let (t, seg) = modify(&d, &m);
                         self.fui.inv_target = Some((t.clone(), seg));
                         if seg.is_none() {
                             ui.label(RichText::new("the segment contains fewer than 2 points").color(Color32::from_rgb(230, 80, 70)));
@@ -544,8 +508,7 @@ impl App {
             let live = self.fui.opt_job.and_then(|id| self.jobs.get(id)).and_then(|j| j.partial.lock().unwrap().optim.clone()).or_else(|| self.fui.opt_result.clone());
             let extra = self.fui.qdist.is_some() || live.is_some();
             let h = ui.available_height();
-            ui.checkbox(&mut self.fui.geometry_edit, "Drag geometry nodes (preview)");
-            Plot::new("foilshape").allow_drag(!self.fui.geometry_edit).data_aspect(1.0).height(if extra { h * 0.55 } else { h }).legend(Legend::default()).show(ui, |pu| {
+            Plot::new("foilshape").data_aspect(1.0).height(if extra { h * 0.55 } else { h }).legend(Legend::default()).show(ui, |pu| {
                 if let Some(best) = live.as_ref().and_then(|r| r.best.as_ref()) {
                     pu.line(Line::new("optimiser best", PlotPoints::from(foil_lines(&best.foil))).color(Color32::from_rgb(90, 220, 120)).width(1.5_f32));
                 }
@@ -557,23 +520,6 @@ impl App {
                     if let Some((x, yr)) = f.hinge {
                         let (u, l) = f.surface_y(x);
                         pu.points(Points::new("hinge", PlotPoints::from(vec![[x, l + yr * (u - l)]])).radius(5.0_f32).color(Color32::YELLOW));
-                    }
-                }
-                if self.fui.geometry_edit {
-                    if let Some(f) = pv.as_ref().or(foil.as_ref()) {
-                        let mut points = foil_lines(f);
-                        if drag_plot_point(pu, &mut points, &mut self.fui.geometry_drag, true) {
-                            let mut changed = f.clone();
-                            for (i, [x,y]) in points.iter().copied().enumerate().take(changed.n()) {
-                                changed.x[i] = x;
-                                changed.y[i] = y;
-                            }
-                            if changed.validate().is_ok() {
-                                changed.note = "cursor-edited geometry".into();
-                                if self.fui.preview.is_none() { self.fui.new_name = self.project.unique_foil_name(&format!("{} edit", changed.name)); }
-                                self.fui.preview = Some(changed);
-                            }
-                        }
                     }
                 }
                 if let Some(p) = &pv {
@@ -588,24 +534,13 @@ impl App {
                         ui.vertical(|ui| {
                             ui.set_width(if live.is_some() { w * 0.5 } else { w });
                             ui.label(RichText::new(format!("Surface speed Q/Vinf at alpha {:.2} (CL {:.3})", d.alpha, d.cl)).strong());
-                            Plot::new("qdist").allow_drag(!self.fui.inv_edit).height(hh - 24.0).legend(Legend::default()).x_axis_label("x/c").show(ui, |pu| {
+                            Plot::new("qdist").height(hh - 24.0).legend(Legend::default()).x_axis_label("x/c").show(ui, |pu| {
                                 let side = |upper: bool, q: &[f64]| -> Vec<[f64; 2]> { (0..d.q.len()).filter(|&i| d.is_upper(i) == upper).map(|i| [d.x[i], q[i].abs()]).collect() };
                                 pu.line(Line::new("upper", PlotPoints::from(side(true, &d.q))).color(series_color(0)));
                                 pu.line(Line::new("lower", PlotPoints::from(side(false, &d.q))).color(series_color(1)));
-                                if let Some((t, seg)) = &mut self.fui.inv_target {
+                                if let Some((t, _)) = &self.fui.inv_target {
                                     if t.len() == d.q.len() {
                                         pu.line(Line::new("target", PlotPoints::from(side(self.fui.inv_upper, t))).color(Color32::from_rgb(255, 160, 60)).style(egui_plot::LineStyle::dashed_dense()));
-                                        if self.fui.inv_edit {
-                                            if let Some((first, last)) = *seg {
-                                                // Keep segment endpoints fixed to preserve its graft.
-                                                let ids: Vec<usize> = (first..last.saturating_sub(1)).filter(|&i| d.is_upper(i) == self.fui.inv_upper).collect();
-                                                let mut points: Vec<[f64;2]> = ids.iter().map(|&i| [d.x[i], t[i].abs()]).collect();
-                                                pu.points(Points::new("drag handles", PlotPoints::from(points.clone())).radius(3.0).color(Color32::from_rgb(255,160,60)));
-                                                if drag_plot_point(pu, &mut points, &mut self.fui.inv_drag, false) {
-                                                    for (&i, p) in ids.iter().zip(&points) { t[i] = p[1].clamp(0.001, 5.0).copysign(d.q[i]); }
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                             });
@@ -659,10 +594,12 @@ impl App {
                     num(ui, "Mach", &mut s.mach, 0.01, 0.0..=0.9, "freestream Mach number (Karman-Tsien compressibility correction)");
                     num(ui, "Ncrit", &mut s.ncrit, 0.1, 0.1..=20.0, "e^N transition criterion: 9 = average wind tunnel, 11-12 = quiet free flight, gliders, 4-7 = turbulent or rough conditions");
                     let mut separate = s.ncrit_bot.is_some();
-                    if ui.checkbox(&mut separate, "Separate bottom Ncrit").changed() {
+                    if ui.checkbox(&mut separate, "separate bottom Ncrit").changed() {
                         s.ncrit_bot = separate.then_some(s.ncrit);
                     }
-                    if let Some(n) = &mut s.ncrit_bot { num(ui, "Ncrit bottom", n, 0.1, 0.1..=20.0, "transition threshold on the lower surface"); }
+                    if let Some(n) = &mut s.ncrit_bot {
+                        num(ui, "Ncrit bottom", n, 0.1, 0.1..=20.0, "e^N transition criterion on the lower surface (XFoil 6.99 VPAR NB)");
+                    }
                     num(ui, "trip top x/c", &mut s.xtr_top, 0.01, 0.0..=1.0, "forced transition on the upper surface (1 = free transition)");
                     num(ui, "trip bottom x/c", &mut s.xtr_bot, 0.01, 0.0..=1.0, "forced transition on the lower surface (1 = free transition)");
                     if matches!(s.polar_type, PolarType::FixedAlpha | PolarType::FlapSweep) {
@@ -711,12 +648,8 @@ impl App {
                         if let NodeInput::Pangen(p) = &mut s.paneling {
                             int(ui, "panel nodes", &mut p.panels, 40..=350, "airfoil panel nodes (XFoil PANE)");
                         }
-                        egui::ComboBox::from_label("XFoil version").selected_text(format!("{:.2}", s.solver_version.number())).show_ui(ui, |ui| {
-                            ui.selectable_value(&mut s.solver_version, foiley_foil::analysis::SolverVersion::Xfoil699, "6.99");
-                            ui.selectable_value(&mut s.solver_version, foiley_foil::analysis::SolverVersion::Xfoil697, "6.97");
-                        });
-                        num(ui, "Wake length / chord", &mut s.wake_length, 0.1, 1.0..=20.0, "wake extent behind the trailing edge");
-                        num(ui, "Wake dissipation", &mut s.wake_dissipation, 0.01, 0.01..=10.0, "inverse dissipation-length factor; XFoil default 0.9");
+                        num(ui, "wake length / chord", &mut s.wake_length, 0.1, 1.0..=20.0, "wake extent behind the trailing edge (XFoil 6.99 VPAR WAKE, default 1); beyond about 4 chords the wake array limit spreads the same number of points further apart");
+                        num(ui, "wake dissipation", &mut s.wake_dissipation, 0.01, 0.01..=10.0, "wake inverse dissipation-length factor (XFoil 6.99 VPAR LAG, default 0.9)");
                         num(ui, "VACC", &mut s.vaccel, 0.001, 0.0..=0.1, "viscous acceleration parameter (XFoil VACC, default 0.01)");
                         check(ui, "recover unconverged points", &mut s.recover, "re-initialise the boundary layer and march in sub-steps from a converged neighbour when a point fails");
                         check(ui, "sweep outwards from zero lift", &mut s.from_zero, "every point warm-starts from an attached-flow neighbour (more robust near stall)");
@@ -963,7 +896,7 @@ impl App {
         let Some(p) = self.project.foil_polars.iter().find(|p| p.key() == (foil.to_string(), identity.to_string())).cloned() else { return };
         let Some(mut f) = self.project.foil(foil).cloned() else { return };
         let mut st = p.settings.clone().unwrap_or_else(|| AnalysisSettings {
-            re: p.re, mach: p.mach, solver_version: foiley_foil::analysis::SolverVersion::Xfoil697, ncrit: p.ncrit, ncrit_bot: p.ncrit_bot, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, viscous: p.viscous,
+            re: p.re, mach: p.mach, ncrit: p.ncrit, ncrit_bot: p.ncrit_bot, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, viscous: p.viscous,
             ..Default::default()
         });
         // Recompute this operating point, including its exact Re/Mach and

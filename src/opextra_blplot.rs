@@ -150,6 +150,21 @@ pub fn read_n(s: &mut Session, n: usize) -> Option<Option<Vec<f64>>> {
     }
 }
 
+/// XBLSET (x) or SBLSET (arc length s): BL plot abscissae.  The top side
+/// continues into the wake; in s its wake abscissae are shifted so they run
+/// on from the top trailing edge.
+fn blset(xf: &crate::xfoil::XFoil, arc: bool, xxbl: &mut [Vec<f64>; 3]) {
+    for is in 1..=2 {
+        for ibl in 2..=xf.nbl[is] {
+            xxbl[is][ibl] = if arc { xf.xssi[is][ibl] } else { xf.x[xf.ipan[is][ibl]] };
+        }
+    }
+    let shift = if arc { xxbl[1][xf.iblte[1]] - xxbl[2][xf.iblte[2]] } else { 0.0 };
+    for iblw in 1..=xf.nbl[2].saturating_sub(xf.iblte[2]) {
+        xxbl[1][xf.iblte[1] + iblw] = xxbl[2][xf.iblte[2] + iblw] + shift;
+    }
+}
+
 /// BLPLOT menu
 pub fn blplot(s: &mut Session) {
     let mut kplot = 0usize;
@@ -160,19 +175,8 @@ pub fn blplot(s: &mut Session) {
         let ns2 = xf.nbl[2];
         ([0, ns1, ns2], [0, ns1.saturating_sub(1), ns2.saturating_sub(1)])
     };
-    // Cartesian BL x-arrays
     let mut xxbl = [vec![0.0; IVX + 2], vec![0.0; IVX + 2], vec![0.0; IVX + 2]];
-    {
-        let xf = &s.xf;
-        for is in 1..=2 {
-            for ibl in 2..=xf.nbl[is] {
-                xxbl[is][ibl] = if s.extra_state.bl_plot_s { xf.xssi[is][ibl] } else { xf.x[xf.ipan[is][ibl]] };
-            }
-        }
-        for iblw in 1..=xf.nbl[2].saturating_sub(xf.iblte[2]) {
-            xxbl[1][xf.iblte[1] + iblw] = xxbl[2][xf.iblte[2] + iblw];
-        }
-    }
+    blset(&s.xf, s.extra_state.bl_plot_s, &mut xxbl);
     let mut lim = defaults(s, nside, numbl);
     let (mut ymin, mut ymax, mut ydel) = (0.0, 0.0, 0.0);
     loop {
@@ -186,13 +190,7 @@ pub fn blplot(s: &mut Session) {
             "" => return,
             "XPLO" => {
                 s.extra_state.bl_plot_s = !s.extra_state.bl_plot_s;
-                for is in 1..=2 {
-                    for ibl in 2..=nside[is] {
-                        let (js, jbl) = if is == 1 && ibl > s.xf.iblte[1] { (2, s.xf.iblte[2] + ibl - s.xf.iblte[1]) } else { (is, ibl) };
-                        xxbl[is][ibl] = if s.extra_state.bl_plot_s { s.xf.xssi[js][jbl] } else { s.xf.x[s.xf.ipan[js][jbl]] };
-                    }
-                }
-                crate::outln!(" BL coordinate: {}", if s.extra_state.bl_plot_s { "s" } else { "x" });
+                blset(&s.xf, s.extra_state.bl_plot_s, &mut xxbl);
                 0
             }
             "?" => {
@@ -392,9 +390,14 @@ fn dump(s: &mut Session, kplot: usize, fname: &str, xxbl: &[Vec<f64>; 3], nside:
     out += &format!("#  alpha ={}\n", f_fmt(xf.alfa / DTOR, 9, 4));
     out += &format!("#  Mach  ={}\n", f_fmt(xf.minf, 9, 4));
     out += &format!("#  Reyn  ={}\n", i_fmt((xf.reinf + 0.5).trunc() as i64, 9));
-    out += &format!("#  Ncrit ={}\n", f_fmt(xf.acrit, 9, 4));
+    if xf.ncrit(1) == xf.ncrit(2) {
+        out += &format!("#  Ncrit ={}\n", f_fmt(xf.acrit, 9, 4));
+    } else {
+        out += &format!("#  Ncrit ={}{}\n", f_fmt(xf.ncrit(1), 9, 4), f_fmt(xf.ncrit(2), 9, 4));
+    }
     out += "#\n";
-    out += &format!("#    {}           {}\n", if s.extra_state.bl_plot_s { "s" } else { "x" }, FILSUF[kplot]);
+    // (labelled x also when XPLO has switched the abscissa to s)
+    out += &format!("#    x           {}\n", FILSUF[kplot]);
     let mut ibl1 = [0usize, 2, 2];
     let mut ibl2 = [0usize, nside[1], nside[2]];
     let mut ws = [vec![0.0; IVX + 2], vec![0.0; IVX + 2], vec![0.0; IVX + 2]];

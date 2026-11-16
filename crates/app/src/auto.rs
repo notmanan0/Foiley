@@ -269,32 +269,25 @@ impl AutoPlan {
     }
 }
 
-/// (mach, ncrit, xtr_top, xtr_bot) of a polar family.
+/// Analysis settings of the polars the plan adds to a family: defaults
+/// apart from the family's key values and its polars' wake controls.
 type FamilyParams = AnalysisSettings;
 
-/// (mach, ncrit, xtr_top, xtr_bot) of the family the plan fills for a
-/// foil, and that family if it exists already.  The selection's values
-/// (defaults where it leaves them open) when it matches nothing yet.
+/// The settings for the family the plan fills for a foil, and that family
+/// if it exists already.  The selection's values (defaults where it leaves
+/// them open) when it matches nothing yet.
 fn family_params(db: &FoilDb, foil: &str, def: &PlanePolarDef) -> Result<(FamilyParams, Option<FamilyId>), String> {
     let sel = &def.family;
     let d = AnalysisSettings::default();
-    let fresh = AnalysisSettings { mach: sel.mach.unwrap_or(d.mach), ncrit: sel.ncrit.unwrap_or(d.ncrit), ncrit_bot: sel.ncrit_bot, xtr_top: sel.xtr_top.unwrap_or(d.xtr_top), xtr_bot: sel.xtr_bot.unwrap_or(d.xtr_bot), ..d };
     let hits = db.families_of(foil).into_iter().filter(|&i| db.family(i).key.flap_deg == 0.0 && sel.matches(&db.family(i).key)).count();
     if hits == 0 {
+        let fresh = AnalysisSettings { mach: sel.mach.unwrap_or(d.mach), ncrit: sel.ncrit.unwrap_or(d.ncrit), ncrit_bot: sel.ncrit_bot, xtr_top: sel.xtr_top.unwrap_or(d.xtr_top), xtr_bot: sel.xtr_bot.unwrap_or(d.xtr_bot), ..d };
         return Ok((fresh, None));
     }
     let id = db.resolve(foil, sel)?.expect("a matching family exists");
     let k = db.family(id).key;
-    let mut settings = db.family(id).polars[0].settings.clone().unwrap_or_else(|| AnalysisSettings {
-        solver_version: foiley_foil::analysis::SolverVersion::Xfoil697, ..Default::default()
-    });
-    settings.re = 1e6;
-    settings.mach = k.mach;
-    settings.ncrit = k.ncrit;
-    settings.ncrit_bot = k.ncrit_bot;
-    settings.xtr_top = k.xtr_top;
-    settings.xtr_bot = k.xtr_bot;
-    Ok((settings, Some(id)))
+    let (wake_length, wake_dissipation) = db.family(id).polars[0].settings.as_ref().map_or((d.wake_length, d.wake_dissipation), |s| (s.wake_length, s.wake_dissipation));
+    Ok((AnalysisSettings { mach: k.mach, ncrit: k.ncrit, ncrit_bot: k.ncrit_bot, xtr_top: k.xtr_top, xtr_bot: k.xtr_bot, wake_length, wake_dissipation, ..d }, Some(id)))
 }
 
 /// Stations of `want` that no polar of `have` (Re values) covers: a

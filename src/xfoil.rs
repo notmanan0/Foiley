@@ -6,18 +6,14 @@
 
 use crate::blsys::BlSys;
 
-/// Numerical conventions used for wake discretization and reported pressure drag.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Numerical conventions for wake discretization, reported pressure drag
+/// and NACA seed count.  Foiley runs 6.99; `Xfoil697` exists only so the
+/// regression tests can keep comparing against the 6.97 Fortran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SolverVersion {
     Xfoil697,
     #[default]
     Xfoil699,
-}
-
-impl SolverVersion {
-    pub fn number(self) -> f64 {
-        match self { Self::Xfoil697 => 6.97, Self::Xfoil699 => 6.99 }
-    }
 }
 
 pub const IQX: usize = 370;
@@ -377,18 +373,15 @@ impl XFoil {
         if side == 2 { self.acrit_bot.unwrap_or(self.acrit) } else { self.acrit }
     }
 
-    /// Changing wake length invalidates every geometry-dependent BL mapping.
-    pub fn set_wake_length(&mut self, length: f64) -> Result<(), &'static str> {
-        if !length.is_finite() || !(1.0..=20.0).contains(&length) {
-            return Err("wake length/chord must be between 1 and 20");
-        }
+    /// VPAR WAKE: changing the wake length invalidates the wake trajectory
+    /// and every BL mapping built on it.
+    pub fn set_wake_length(&mut self, length: f64) {
         self.waklen = length;
         self.lwake = false;
         self.lblini = false;
         self.lvconv = false;
         self.lipan = false;
         self.lwdij = false;
-        Ok(())
     }
 
     pub fn new() -> Self {

@@ -761,25 +761,47 @@ pub fn sortdup(kk: usize, s: &mut [f64], w: &mut [f64]) {
 }
 
 /// FIXDUP: remove leading/trailing duplicates and triple duplicates.
+/// (6.99 repeats the passes until nothing changes; the KK < 2 guards stop
+/// an all-duplicate input from running off the arrays)
 pub fn fixdup(kk: &mut usize, s: &mut [f64], w: &mut [f64]) {
     loop {
-        if *kk <= 1 { return; }
-        if s[2] == s[1] {
-            for n in 1..*kk { s[n] = s[n + 1]; w[n] = w[n + 1]; }
-            *kk -= 1;
-            continue;
+        if *kk < 2 {
+            return;
         }
-        if s[*kk] == s[*kk - 1] {
+        let mut done = true;
+        // check first elements for dups
+        if s[2] == s[1] {
+            for n in 1..*kk {
+                s[n] = s[n + 1];
+                w[n] = w[n + 1];
+            }
+            *kk -= 1;
+            done = false;
+        }
+        // check last elements for dups
+        if *kk >= 2 && s[*kk] == s[*kk - 1] {
+            s[*kk - 1] = s[*kk];
             w[*kk - 1] = w[*kk];
             *kk -= 1;
-            continue;
+            done = false;
         }
-        let duplicate = (1..=kk.saturating_sub(2))
-            .find(|&n| s[n] == s[n + 1] && s[n] == s[n + 2]);
-        if let Some(n) = duplicate {
-            for i in n..*kk { s[i] = s[i + 1]; w[i] = w[i + 1]; }
-            *kk -= 1;
-        } else { return; }
+        // eliminate more than 2 succeeding identical elements
+        'again: loop {
+            for n in 1..=kk.saturating_sub(2) {
+                if s[n] == s[n + 1] && s[n] == s[n + 2] {
+                    for i in n..*kk {
+                        s[i] = s[i + 1];
+                        w[i] = w[i + 1];
+                    }
+                    *kk -= 1;
+                    continue 'again;
+                }
+            }
+            break;
+        }
+        if done {
+            return;
+        }
     }
 }
 

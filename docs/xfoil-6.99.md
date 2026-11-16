@@ -1,9 +1,10 @@
 # XFOIL 6.99 upgrade
 
-Foiley now defaults to the 6.99 wake discretization and surface-integrated
-pressure-drag output. The integral boundary-layer correlations and their
-baseline calibration are unchanged. The original 6.97 numerical conventions
-remain selectable for reproducing earlier runs.
+Foiley's 2D engine follows XFOIL 6.99: its wake discretization, its
+surface-integrated pressure drag, separate top and bottom Ncrit, a
+configurable wake length and the wake dissipation constant. The integral
+boundary-layer correlations and their baseline calibration are unchanged
+from 6.97.
 
 The port was checked against the original MIT archives, including the
 intervening 6.98 changes:
@@ -17,23 +18,22 @@ intervening 6.98 changes:
 
 | Area | Change |
 |---|---|
-| Wake | `N/12 + 10*INT(WAKLEN)` points, capped by the wake array. A 160-node, one-chord wake uses 23 points instead of 22. Wake length is configurable. |
-| Transition | Independent top/bottom Ncrit, defaulting to 9 on both surfaces; fractional transition panel indices are recorded in polars. |
-| Lag | The third LAG constant controls wake inverse dissipation length. Two-argument scripts retain the existing third constant without prompting. |
-| CDp | 6.99 preserves the integrated surface pressure drag. The iteration display still prints `CD-CDf` as upstream does. These quantities need not be equal. |
-| Geometry | Zero-normal fallback, repeated endpoint cleanup, trailing-edge pairing in camber/thickness extraction, and stored-airfoil point-count/state fixes. |
-| Design | `GDES NMOV` normal offsets and `CAMB WRTT` thickness/slope export. Studio supports dragging geometry nodes into a preview and dragging inverse target speeds in QDES/MDES. |
-| Plots | Native Cp overlay control, x/arc-length BL coordinate selection, and `VPLO XPLO` for script-mode variable dumps. |
-| Files | Dual Ncrit headers, transition indices, extended DUMP, detailed 24-column DMP, and backward reading of single-Ncrit polar/defaults files. |
+| Wake | `N/12 + 10*INT(WAKLEN)` points, capped by the wake array (`IWX` = 48). A 160-node, one-chord wake uses 23 points instead of 22. |
+| Transition | Separate top and bottom Ncrit, 9 on both by default. Polars record the fractional transition panel index of each side (`Top_Itr`, `Bot_Itr`). |
+| Lag | The third LAG constant is the wake inverse dissipation-length factor (default 0.9). |
+| CDp | 6.99 keeps the integrated surface pressure drag instead of overwriting it with `CD-CDf`. The iteration display still prints `CD-CDf`, as upstream does. |
+| Geometry | Zero-normal fallback in NCALC, repeated FIXDUP passes, trailing-edge pairing in camber/thickness extraction, stored-airfoil point counts, and LOAD keeping an existing MSES domain string. |
+| Design | `GDES NMOV` (normal offset) and `CAMB WRTT` (thickness and slope export). |
+| Plots | `VPLO XPLO` switches the BL abscissa between x and arc length s; `OPER CPIO` toggles the inviscid Cp overlay flag (script mode draws no Cp plot, as with `CPGR`). Studio can plot the BL against arc length. |
+| Files | Two Ncrit values in polar, polar-dump, defaults and VPLO dump headers; Ncrit and Itr columns; the 6.99 DUMP layout (H*, P, m, K on surface rows) and the 24-column DMP; the 6.99 polar listing, mismatch tables and VPAR display. Single-Ncrit files still read. |
 
-New analysis controls are available in Studio and the modern CLI:
+The controls are available in Studio and the modern CLI:
 
 ```text
 foiley foil polar naca2412 --ncrit 5 --ncrit-bot 11 --wake-length 2.5 --wake-dissipation 1.1
-foiley foil polar naca2412 --xfoil-version 6.97
 ```
 
-For XFOIL scripts, the controls live in `OPER` → `VPAR`:
+For XFOIL scripts they live in `OPER` → `VPAR`, as in 6.99:
 
 ```text
 NT 5
@@ -42,44 +42,54 @@ WAKE 2.5
 LAG 5.6 1.0 1.1
 ```
 
-`N 9` sets both surfaces together. `VERS 6.97` can be used at top level
-before `NACA` to reproduce 6.97's seed geometry as well as its wake and CDp
-conventions; `VPAR VERS` changes conventions on the current geometry.
-The shared `Foil::naca` library generator keeps its existing 120 points per
-side so existing 3D meshes remain stable. XFOIL script-mode NACA follows
-each version's array-derived seed count.
+`N` sets both surfaces, `NT` and `NB` one each. Like XFOIL, script mode does
+not range-check these values. One deliberate difference: a two-argument
+`LAG` (a 6.97 script) sets the first two constants and keeps the third,
+where 6.99 would prompt for all three and consume the next script lines.
 
-Wake length accepts 1–20 chords; very long wakes hit the array cap, so
-lengthening the wake is not equivalent to a mesh-refinement study. Changing
-the wake invalidates its trajectory, BL mapping, initialization and convergence.
+`Foil::naca` (Studio, the CLI, 3D meshes) keeps its 120 points per side so
+saved projects and meshes do not move; script-mode `NACA` uses 6.99's
+array-derived 123. After repaneling the two agree to the printed digits of
+the coefficients.
 
-## Saved data and exports
+Studio and the modern CLI accept a wake length of 1 to 20 chords. Beyond
+about 4 chords (at 160 panels) the wake array is full, so a longer wake
+spreads the same points further apart: lengthening it is not a
+mesh-refinement study.
 
-`AnalysisSettings` records solver version, optional bottom Ncrit, wake length,
-and wake dissipation. Settings serialized before the version field existed
-load with 6.97 conventions; newly created settings default to 6.99. A missing
-bottom Ncrit follows the existing scalar value. Polar identities and 3D
-family keys distinguish bottom Ncrit and solver/wake calibration. Auto-polar
-generation reuses the selected family's saved settings.
+## Saved data and compatibility
 
-6.99 `CDp` is not a substitute for `CD-CDf`. Native results retain actual
-friction drag separately. Native text exports include a CDf column. On import,
-if a 6.99 file omits CDf, that field is recorded as 0 (unavailable), rather than
-inferring friction from the difference of total and integrated pressure drag.
-Consumers should inspect column labels instead of assuming seven columns.
+All new analyses run 6.99. There is no user-facing 6.97 mode: the engine
+keeps a `SolverVersion` switch only so the regression tests can still
+compare against the 6.97 Fortran.
 
-Foiley writes consistent DUMP columns on both surface and wake rows and
-supports delimiters in its detailed DMP export. It does not reproduce the
-MIT archive's inconsistent DUMP header or unconditional diagnostic `.bl`
-file writes.
+`AnalysisSettings` gains `ncrit_bot`, `wake_length` and `wake_dissipation`.
+At their defaults (none, 1, 0.9) they are left out of the JSON, so existing
+settings, polar identities and family hashes are unchanged. A bottom Ncrit
+equal to the top one is treated as no split.
+
+Polars computed before this change (6.97 CDp = `CD-CDf`) and new ones share a
+family when their Mach, Ncrit and trips agree; only a split bottom Ncrit forms
+a separate family, selected by the 3D analysis's bottom Ncrit. Wake length
+and dissipation are analysis settings like paneling, not family keys;
+auto-polar generation carries a family's wake settings to the polars it adds.
+
+The project format is now 3. Format 2 projects load unchanged; builds from
+before this change refuse format 3 files instead of silently dropping the
+new settings.
+
+6.99 `CDp` is not a substitute for `CD-CDf`. Native results keep friction drag
+separately, and native text exports include a `CDf` column. Importing a 6.99
+file (recognized by its version line) without `CDf` records friction as 0,
+unavailable, rather than inferring it from CD and the integrated CDp.
 
 ## Validation and limits
 
-Six committed Fortran polar fixtures cover NACA 4/5-digit generation,
-160/240 nodes, split Ncrit, a 2.5-chord wake, changed dissipation, integrated
-CDp, and transition indices. They run in CI without a Fortran installation.
-Tests also cover old/new settings and polar/defaults files, input guards,
-normal offsets, export layouts, and incompatible polar-family separation.
+Six committed MIT 6.99 polars cover NACA 4/5-digit generation, 160 and 240
+nodes, split Ncrit, a 2.5-chord wake, changed dissipation, integrated CDp and
+transition indices. Script mode reproduces them at printed precision; the
+library path (`analyze`) is checked against the split-Ncrit polar. They run
+in CI without a Fortran installation.
 
 The optional 6.99 raw-array audit uses the original 48-case corpus plus
 three new-control cases. In the local double-precision run, the new-control
@@ -103,10 +113,8 @@ The builder stages a copy, adds the existing raw-dump hook, and removes only
 the archive's post-solve diagnostic writer, which generates invalid Windows
 filenames. It leaves numerical calculations and convergence logic intact.
 
-The old 6.97 polar fixtures and raw-array audit explicitly select 6.97
+The 6.97 polar fixtures and raw-array audit select the engine's 6.97
 conventions. Native rendering replaces the Fortran Xplot/PPLOT UI; their
 platform build changes and Fortran-only reconstructed velocity-profile
 plotting are outside this port. The sharp-trailing-edge viscous influence
-correction is a later 6.996 change and is not included here. Studio drag
-interactions are compiled with the workspace; manual pointer-interaction
-QA is still required.
+correction is a later 6.996 change and is not included here.

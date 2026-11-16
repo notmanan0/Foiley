@@ -174,9 +174,6 @@ impl XfoilOpts {
 
 #[derive(Args, Clone)]
 struct SolverOpts {
-    /// Solver numerical conventions
-    #[arg(long, default_value = "6.99", value_parser = ["6.97", "6.99"])]
-    xfoil_version: String,
     /// Wake length in chord lengths (1..20)
     #[arg(long, default_value_t = 1.0)]
     wake_length: f64,
@@ -216,7 +213,6 @@ impl SolverOpts {
             return Err("--xtr needs two values: top,bottom".into());
         }
         Ok(AnalysisSettings {
-            solver_version: if self.xfoil_version == "6.97" { foiley::xfoil::SolverVersion::Xfoil697 } else { foiley::xfoil::SolverVersion::Xfoil699 },
             wake_length: self.wake_length,
             wake_dissipation: self.wake_dissipation,
             xtr_top: x[0],

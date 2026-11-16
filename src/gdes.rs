@@ -1889,7 +1889,8 @@ fn camb(s: &mut Session) {
             }
             "WRTC" | "WRTT" => {
                 let thickness = comand == "WRTT";
-                let fname = if comarg.trim().is_empty() { s.input.ask("Enter output camber/thickness filename^").trim().to_string() } else { comarg.trim().to_string() };
+                let what = if thickness { "thickness" } else { "camber" };
+                let fname = if comarg.trim().is_empty() { s.input.ask(&format!("Enter output {what} filename^")).trim().to_string() } else { comarg.trim().to_string() };
                 if s.input.eof {
                     return;
                 }
@@ -1898,29 +1899,26 @@ fn camb(s: &mut Session) {
                     crate::outln!(" Output file exists.  Overwrite?  Y");
                     let ans = s.input.ask("");
                     if ans.starts_with(['N', 'n']) {
-                        crate::outln!(" Current camber not saved.");
+                        crate::outln!(" Current {what} not saved.");
                         continue;
                     }
                 }
                 let st = &s.gdes_state;
+                let g = |v: f64| crate::fmt::g_fmt(v, 15, 7);
                 let mut txt = format!("{}: {}\n", if thickness { "Thickness" } else { "Camber" }, fixed(&s.xf.name, 48));
                 let (xs, ys, count) = if thickness { (&st.xtk, &st.ytk, st.ntk) } else { (&st.xcm, &st.ycm, st.ncm) };
+                // FORMAT(1X, 3G15.7); WRTT adds the slope dy/dx
                 for k in 1..=count {
-                    txt += &format!(
-                        " {} {}\n",
-                        crate::fmt::g_fmt((xs[k] - xs[1]) / xbch, 15, 7),
-                        crate::fmt::g_fmt((ys[k] - ys[1]) / xbch, 15, 7)
-                    );
+                    txt += &format!(" {}{}", g((xs[k] - xs[1]) / xbch), g((ys[k] - ys[1]) / xbch));
                     if thickness {
                         let km = k.saturating_sub(1).max(1);
                         let kp = (k + 1).min(count);
-                        let slope = if xs[kp] != xs[km] { (ys[kp] - ys[km]) / (xs[kp] - xs[km]) } else { 0.0 };
-                        txt.pop();
-                        txt += &format!(" {}\n", crate::fmt::g_fmt(slope, 15, 7));
+                        txt += &g((ys[kp] - ys[km]) / (xs[kp] - xs[km]));
                     }
+                    txt.push('\n');
                 }
                 if std::fs::write(&fname, txt).is_err() {
-                    crate::outln!(" Error opening camber/thickness save file");
+                    crate::outln!(" Error opening {what} save file");
                 }
             }
             "RDAC" => {

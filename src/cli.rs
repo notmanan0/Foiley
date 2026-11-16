@@ -213,14 +213,6 @@ impl Session {
                 "" => {}
                 "?" => self.help_top(),
                 "QUIT" | "Q" => break,
-                "VERS" => {
-                    match r.first().copied() {
-                        Some(6.97) => self.xf.solver_version = crate::xfoil::SolverVersion::Xfoil697,
-                        Some(6.99) => self.xf.solver_version = crate::xfoil::SolverVersion::Xfoil699,
-                        _ => { crate::outln!(" Expected VERS 6.97 or VERS 6.99"); continue; }
-                    }
-                    let _ = self.xf.set_wake_length(self.xf.waklen);
-                }
                 "OPER" => self.oper(),
                 "NACA" => {
                     let ides = if !i.is_empty() { i[0] } else { self.input.aski("Enter NACA 4 or 5-digit airfoil designation^", 0) };
@@ -818,15 +810,15 @@ impl Session {
 
     fn vpar(&mut self) {
         let show = |xf: &XFoil| {
-            let turb = 100.0 * (-(xf.acrit + 8.43) / 2.4).exp();
+            let turb = |is: usize| 100.0 * (-(xf.ncrit(is) + 8.43) / 2.4).exp();
             let p = xf.bl.par;
             crate::outln!(
-                "\n Xtr/c     ={:8.4}    top    side\n Xtr/c     ={:8.4}    bottom side\n Ncrit     ={:8.2}   ({:6.3} % turb. level )\n Vacc      ={:8.4}\n\n Klag  ={:8.4}     Uxwt  ={:8.2}\n A     ={:8.4}     B     ={:8.4}       KCt ={:8.5}\n CtiniK={:8.4}     CtiniX={:8.4}",
-                xf.xstrip[1], xf.xstrip[2], xf.acrit, turb, xf.vaccel, p.sccon, p.duxcon, p.gacon, p.gbcon, p.ctcon, p.ctrcon, p.ctrcex
+                "\n Xtr/c     ={:8.4}    top    side\n Xtr/c     ={:8.4}    bottom side\n NcritT    ={:8.2}   ({:6.3} % turb. level )\n NcritB    ={:8.2}   ({:6.3} % turb. level )\n Vacc      ={:8.4}\n WakeL/c   ={:8.3}\n\n Klag  ={:8.4}     Uxwt  ={:8.2}       Kdl ={:8.4}\n A     ={:8.4}     B     ={:8.4}       KCt ={:8.5}\n CtiniK={:8.4}     CtiniX={:8.4}",
+                xf.xstrip[1], xf.xstrip[2], xf.ncrit(1), turb(1), xf.ncrit(2), turb(2), xf.vaccel, xf.waklen,
+                p.sccon, p.duxcon, p.dlcon, p.gacon, p.gbcon, p.ctcon, p.ctrcon, p.ctrcex
             );
         };
         show(&self.xf);
-        crate::outln!(" Bottom Ncrit = {:.3}   WakeL/c = {:.3}   Kdl = {:.4}   Solver = {:.2}", self.xf.ncrit(2), self.xf.waklen, self.xf.bl.par.dlcon, self.xf.solver_version.number());
         loop {
             let (com, arg) = self.input.askc("..VPAR");
             if com.is_empty() || (self.input.eof && com == "QUIT") {
@@ -836,10 +828,7 @@ impl Session {
             let locked = self.xf.lpacc && self.xf.lvisc;
             let lockmsg = || crate::outln!("\n * Polar is being accumulated.\n * Cannot change its parameters in midstream.");
             match com.as_str() {
-                "SHOW" => {
-                    show(&self.xf);
-                    crate::outln!(" Bottom Ncrit = {:.3}   WakeL/c = {:.3}   Kdl = {:.4}   Solver = {:.2}", self.xf.ncrit(2), self.xf.waklen, self.xf.bl.par.dlcon, self.xf.solver_version.number());
-                },
+                "SHOW" => show(&self.xf),
                 "XTR" | "X" => {
                     if locked {
                         lockmsg();
@@ -854,38 +843,36 @@ impl Session {
                     }
                     self.xf.lvconv = false;
                 }
-                "N" | "NT" | "NB" => {
+                "N" => {
                     if locked {
                         lockmsg();
                         continue;
                     }
-                    let old = if com == "NB" { self.xf.ncrit(2) } else { self.xf.acrit };
-                    let value = r.first().copied().unwrap_or_else(|| self.input.askr("Enter critical amplification ratio^", old));
-                    if !value.is_finite() || !(0.1..=20.0).contains(&value) {
-                        crate::outln!(" Ncrit must be between 0.1 and 20");
+                    self.xf.acrit = if !r.is_empty() { r[0] } else { self.input.askr("Enter critical amplification ratio^", self.xf.acrit) };
+                    self.xf.acrit_bot = None;
+                    self.xf.lvconv = false;
+                }
+                "NT" => {
+                    if locked {
+                        lockmsg();
                         continue;
                     }
-                    if com == "NB" { self.xf.acrit_bot = Some(value); }
-                    else {
-                        // NT changes only the top, even if bottom was following it.
-                        if com == "NT" && self.xf.acrit_bot.is_none() { self.xf.acrit_bot = Some(self.xf.acrit); }
-                        self.xf.acrit = value;
-                        if com == "N" { self.xf.acrit_bot = None; }
+                    // ACRIT(1) only: a bottom value that followed the top keeps its value
+                    self.xf.acrit_bot = Some(self.xf.ncrit(2));
+                    self.xf.acrit = if !r.is_empty() { r[0] } else { self.input.askr("Enter top-surface critical amplification^", self.xf.acrit) };
+                    self.xf.lvconv = false;
+                }
+                "NB" => {
+                    if locked {
+                        lockmsg();
+                        continue;
                     }
+                    self.xf.acrit_bot = Some(if !r.is_empty() { r[0] } else { self.input.askr("Enter bot-surface critical amplification^", self.xf.ncrit(2)) });
                     self.xf.lvconv = false;
                 }
                 "WAKE" | "W" => {
-                    if locked { lockmsg(); continue; }
-                    let length = r.first().copied().unwrap_or_else(|| self.input.askr("Enter wake length/chord^", self.xf.waklen));
-                    if let Err(e) = self.xf.set_wake_length(length) { crate::outln!(" {e}"); }
-                }
-                "VERS" => {
-                    if locked { lockmsg(); continue; }
-                    let version = r.first().copied().unwrap_or_else(|| self.input.askr("Enter solver version (6.97 or 6.99)^", self.xf.solver_version.number()));
-                    self.xf.solver_version = if version == 6.97 { crate::xfoil::SolverVersion::Xfoil697 }
-                        else if version == 6.99 { crate::xfoil::SolverVersion::Xfoil699 }
-                        else { crate::outln!(" Expected 6.97 or 6.99"); continue; };
-                    let _ = self.xf.set_wake_length(self.xf.waklen);
+                    let length = if !r.is_empty() { r[0] } else { self.input.askr("Enter wake length/chord^", self.xf.waklen) };
+                    self.xf.set_wake_length(length);
                 }
                 "VACC" | "V" => {
                     self.xf.vaccel = if !r.is_empty() { r[0] } else { self.input.askr("Enter viscous acceleration parameter^", self.xf.vaccel) };
@@ -961,7 +948,7 @@ impl Session {
                     }
                     self.xf.bl.par = crate::blsys::BlPar::default();
                 }
-                "?" => crate::outln!("\n   <cr>    Return to OPER menu\n   SHOW    Display viscous parameters\n   XTR  rr Change trip positions Xtr/c\n   N    r  Set Ncrit on both surfaces\n   NT/NB r Set top/bottom Ncrit independently\n   WAKE r  Set wake length/chord\n   VERS r  Select solver 6.97 or 6.99\n   VACC r  Change Newton solution acceleration parameter\n   INIT    BL initialization flag toggle\n\n   LAG rrr Set shear lag, Ux weight, wake dissipation constants\n   GB      change G-beta constants\n   CTR     change initial transition-Ctau constants\n   REST    restore BL calibration to baseline"),
+                "?" => crate::outln!("\n   <cr>    Return to OPER menu\n   SHOW    Display viscous parameters\n   Xtr  rr Change trip positions Xtr/c\n   N    r  Change critical amplification exponent Ncrit\n   NT   r  Change Ncrit on Top\n   NB   r  Change Ncrit on Bot\n   Vacc r  Change Newton solution acceleration parameter\n   Wake r  Change wake length/chord\n   INIT    BL initialization flag toggle\n\n   LAG     change lag equation constants\n   GB      change G-beta constants A,B\n   CTR     change initial transition-Ctau constants\n   REST    restore BL calibration to baseline"),
                 _ => crate::outln!(" {:<4} command not recognized.  Type a \"?\" for list", com),
             }
         }

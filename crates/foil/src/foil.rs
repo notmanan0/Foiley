@@ -413,12 +413,6 @@ impl Foil {
         f.hinge = self.hinge;
         Ok(f)
     }
-    /// Offset the whole contour along its outward normal (XFoil 6.99 NMOV).
-    pub fn with_normal_offset(&self, distance: f64) -> Result<Foil, FoilError> {
-        if !distance.is_finite() { return Err(FoilError::Geometry("normal offset must be finite".into())); }
-        self.gdes(&format!("NMOV {distance}"), format!("normal offset {distance:+}"))
-    }
-
     /// Set the trailing-edge gap (fraction of chord), blended over `blend` (x/c).
     pub fn with_te_gap(&self, gap: f64, blend: f64) -> Result<Foil, FoilError> {
         self.gdes(&format!("TGAP {gap} {blend}"), format!("TE gap {gap}"))

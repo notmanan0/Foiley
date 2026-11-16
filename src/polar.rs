@@ -316,6 +316,23 @@ pub fn index(s: &str, pat: &str) -> usize {
     }
 }
 
+/// INDEX of `label` as a whole blank-delimited field (1-based, 0 if absent).
+/// Plain INDEX finds Xtr inside Top_Xtrip and Ncrit inside Top_Ncrit, which
+/// mis-assigns columns when a 6.99 file carries both.
+pub fn index_field(s: &str, label: &str) -> usize {
+    let b = s.as_bytes();
+    let blank = |k: usize| b.get(k).is_none_or(|c| c.is_ascii_whitespace());
+    let mut from = 0;
+    while let Some(k) = s[from..].find(label) {
+        let at = from + k;
+        if (at == 0 || blank(at - 1)) && blank(at + label.len()) {
+            return at + 1;
+        }
+        from = at + 1;
+    }
+    0
+}
+
 /// Fortran substring LINE(a:b) of a CHARACTER*len variable (1-based, blank padded)
 pub fn substr(s: &str, a: usize, b: usize) -> String {
     let bytes = s.as_bytes();
@@ -524,22 +541,15 @@ pub fn polread(txt: &str, pol: &mut Polar) -> bool {
                 let nt = IPTOT + 2 * JPTOT;
                 let mut itmp0 = vec![0usize; nt + 1];
                 for ip in 1..=IPTOT {
-                    itmp0[ip] = index(&line, CPOLNAME[ip]);
+                    itmp0[ip] = index_field(&line, CPOLNAME[ip]);
                 }
                 for jp in 1..=JPTOT {
-                    let k1 = index(&line, &format!("Top {}", CPOLSNAME[jp]));
-                    let k2 = index(&line, &format!("Top_{}", CPOLSNAME[jp]));
+                    let k1 = index_field(&line, &format!("Top {}", CPOLSNAME[jp]));
+                    let k2 = index_field(&line, &format!("Top_{}", CPOLSNAME[jp]));
                     itmp0[IPTOT + jp] = k1.max(k2);
-                    let k1 = index(&line, &format!("Bot {}", CPOLSNAME[jp]));
-                    let k2 = index(&line, &format!("Bot_{}", CPOLSNAME[jp]));
+                    let k1 = index_field(&line, &format!("Bot {}", CPOLSNAME[jp]));
+                    let k2 = index_field(&line, &format!("Bot_{}", CPOLSNAME[jp]));
                     itmp0[IPTOT + jp + JPTOT] = k1.max(k2);
-                    if jp == JTN {
-                        if itmp0[IPTOT + jp] == index(&line, "Top_Xtrip") || itmp0[IPTOT + jp] == index(&line, "Top Xtrip") { itmp0[IPTOT + jp] = 0; }
-                        if itmp0[IPTOT + jp + JPTOT] == index(&line, "Bot_Xtrip") || itmp0[IPTOT + jp + JPTOT] == index(&line, "Bot Xtrip") { itmp0[IPTOT + jp + JPTOT] = 0; }
-                    }
-                }
-                if line.contains("Top_Ncrit") || line.contains("Top Ncrit") {
-                    itmp0[INC] = 0;
                 }
                 let mut itmp = itmp0.clone();
                 for _ in 1..=nt {
@@ -594,9 +604,9 @@ pub fn polread(txt: &str, pol: &mut Polar) -> bool {
                 sd[jp][2] = rinp[ispol[2][jp]];
             }
             let acl = row[ICL].max(0.001);
-            // (the Fortran tests IPOL(KP)/ISPOL(1,KP) against the parameter
-            //  indices; for XFoil-written files Re/Mach/Ncrit/trip come from
-            //  the header)
+            // (here IPOL/ISPOL map quantity -> column, so presence is a
+            //  non-zero entry; for XFoil-written files Re/Mach/Ncrit/trip
+            //  come from the header)
             let lire = ipol[IRE] != 0;
             let lima = ipol[IMA] != 0;
             let linc = ipol[INC] != 0;

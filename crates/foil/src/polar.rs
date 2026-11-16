@@ -77,7 +77,8 @@ pub struct FoilPolar {
     pub re: f64,
     pub mach: f64,
     pub ncrit: f64,
-    #[serde(default)]
+    /// bottom-surface Ncrit when it differs from `ncrit`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ncrit_bot: Option<f64>,
     pub xtr_top: f64,
     pub xtr_bot: f64,
@@ -120,17 +121,21 @@ impl FoilPolar {
     pub fn identity(&self) -> Hash32 {
         let settings = self.settings.as_ref().map(|s| {
             let mut s = s.clone();
-            // Retaining distributions does not change the solved polar.
+            // Retaining distributions does not change the solved polar, and
+            // a bottom Ncrit equal to the top one is no split at all.
             s.keep_details = false;
+            s.ncrit_bot = s.bottom_ncrit();
             s
         });
-        foiley_core::provenance::hash_json(
-            "foiley.polar2d.identity.v1",
-            &(&self.foil, self.foil_hash, self.polar_type, self.re, self.mach, self.ncrit, self.ncrit_bot, self.xtr_top, self.xtr_bot, self.viscous, self.flap_deg,
-                // Legacy/imported polars have no complete settings snapshot;
-                // preserve their independently named definitions.
-                self.settings.is_none().then_some(&self.name), settings),
-        )
+        let key = (&self.foil, self.foil_hash, self.polar_type, self.re, self.mach, self.ncrit, self.xtr_top, self.xtr_bot, self.viscous, self.flap_deg,
+            // Legacy/imported polars have no complete settings snapshot;
+            // preserve their independently named definitions.
+            self.settings.is_none().then_some(&self.name), settings);
+        // (a split Ncrit extends the key, so unsplit polars keep their identity)
+        match self.ncrit_bot.filter(|&n| n != self.ncrit) {
+            None => foiley_core::provenance::hash_json("foiley.polar2d.identity.v1", &key),
+            Some(n) => foiley_core::provenance::hash_json("foiley.polar2d.identity.v1", &(key, n)),
+        }
     }
 
     pub fn key(&self) -> (String, String) {
@@ -306,11 +311,16 @@ impl FoilPolar {
         let mut pol = FoilPolar { polar_type: 1, viscous: true, ncrit: 9.0, xtr_top: 1.0, xtr_bot: 1.0, foil: foil_fallback.into(), ..Default::default() };
         let mut in_table = false;
         let mut columns: Vec<&str> = Vec::new();
-        let mut version699 = false;
+        let mut version = 0.0;
         for line in text.lines() {
             let l = line.trim();
-            if l.contains("6.99") { version699 = true; }
-            if l.starts_with("alpha") { columns = l.split_whitespace().collect(); }
+            // "XFOIL   Version 6.99" or "Foiley polar (XFoil 6.99 format)"
+            if !in_table && (l.starts_with("XFOIL") || l.starts_with("Foiley polar")) {
+                version = l.split_whitespace().find_map(|t| t.parse::<f64>().ok()).unwrap_or(version);
+            }
+            if l.starts_with("alpha") {
+                columns = l.split_whitespace().collect();
+            }
             if let Some(r) = l.strip_prefix("Calculated polar for:") {
                 pol.foil = r.trim().to_string();
             }
@@ -327,7 +337,7 @@ impl FoilPolar {
                 }
                 if let Some(i) = t.iter().position(|v| *v == "Ncrit") {
                     pol.ncrit = t.get(i + 2).and_then(|v| v.parse().ok()).unwrap_or(9.0);
-                    pol.ncrit_bot = t.get(i + 3).and_then(|v| v.parse().ok());
+                    pol.ncrit_bot = t.get(i + 3).and_then(|v| v.parse().ok()).filter(|&n: &f64| n != pol.ncrit);
                 }
             }
             if l.starts_with("xtrf") {
@@ -349,9 +359,9 @@ impl FoilPolar {
                         cl: v[1],
                         cd: v[2],
                         cdp: v[3],
-                        // 6.99 CDp is not the residual CD-CDf. Imported
-                        // friction is unknown unless explicitly recorded.
-                        cdf: columns.iter().position(|c| *c == "CDf").and_then(|i| v.get(i)).copied().unwrap_or_else(|| if version699 { 0.0 } else { v[2] - v[3] }),
+                        // 6.99 CDp is integrated, not the residual CD-CDf:
+                        // friction is then unknown unless recorded (0)
+                        cdf: columns.iter().position(|c| *c == "CDf").and_then(|i| v.get(i)).copied().unwrap_or(if version >= 6.99 { 0.0 } else { v[2] - v[3] }),
                         cm: v[4],
                         xtr_top: *v.get(5).unwrap_or(&1.0),
                         xtr_bot: *v.get(6).unwrap_or(&1.0),
