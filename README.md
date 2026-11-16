@@ -262,8 +262,7 @@ attached flow on one wing. Run it with
 * Ground effect reduces induced drag and increases lift.
 * Galerkin linear-doublet triangles (`crates/plane/tests/trilinear.rs`) pass
   thin-wing lift-slope, trailing-edge pressure, mesh and quadrature refinement,
-  symmetry, camber, ground, fuselage and flap checks. See
-  [the formulation and validation limits](docs/TRILINEAR.md).
+  symmetry, camber, ground, fuselage and flap checks.
 * The free wake stays within 5% of the rigid-wake lift and trails downwards.
 * The sideslip response is antisymmetric.
 * LLT and VLM agree to within 12% in the linear range.
@@ -317,8 +316,7 @@ gfortran-built Fortran XFoil are in `bench/run_bench.py`:
 (Kutta–Joukowski on the shed circulation) and moments from the integrated
 pressures, as flow5 does. Far-field forces converge much faster with
 chordwise panel count. In the default 3D methods all operating points of a
-polar share one LU factorisation. `docs/PORTING.md` documents the XFoil port
-conventions.
+polar share one LU factorisation.
 
 `trilinear` uses three independent doublet values per triangle, linear
 Galerkin test functions, and a wake tied to the actual trailing-edge values.

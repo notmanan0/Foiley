@@ -1,4 +1,4 @@
-//! Fixtures shared by the per-finding test files (docs/REMEDIATION_PLAN.md).
+//! Fixtures shared by the per-finding test files.
 #![allow(dead_code)]
 use foiley_core::{Progress, Vec3};
 use foiley_foil::{Foil, FoilPoint, FoilPolar};

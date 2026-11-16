@@ -1,4 +1,4 @@
-//! Reproduce the code-review findings tracked in docs/REMEDIATION_PLAN.md.
+//! Reproduce the code-review findings.
 //! This diagnostic prints current behavior; it does not assert correctness.
 use foiley_core::{Progress, Vec3};
 use foiley_foil::{Foil, FoilPoint, FoilPolar};

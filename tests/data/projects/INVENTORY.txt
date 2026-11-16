@@ -1,4 +1,4 @@
-# Project fixtures (docs/REMEDIATION_PLAN.md, F016).  One file per line:
+# Project fixtures for the F016 checks.  One file per line:
 # path relative to this directory, then the format and how it was written.
 # crates/app/tests/f016.rs (project_roundtrip) loads, saves, reloads and
 # compares every file listed here.  Regenerate the v2 files with

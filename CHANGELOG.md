@@ -1,7 +1,6 @@
 # Changelog of reported numbers
 
-Every change to a number in a golden test or the README, per
-docs/REMEDIATION_PLAN.md ("Record").
+Records every change to a number in a golden test or the README.
 
 | Item | Quantity | Fixture | Before | After | Why |
 |---|---|---|---|---|---|
