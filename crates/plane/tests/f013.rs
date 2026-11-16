@@ -17,8 +17,7 @@ fn vlm_matrix(lat: &Lattice) -> DenseMatrix {
     let mesh = lat.mesh;
     let n = mesh.panels.len();
     let mut a = DenseMatrix::zeros(n, n);
-    for i in 0..n {
-        let p = &mesh.panels[i];
+    for (i, p) in mesh.panels.iter().enumerate() {
         for j in 0..n {
             a.set(i, j, lat.element_velocity(j, p.ctrl, false).dot(p.normal));
         }

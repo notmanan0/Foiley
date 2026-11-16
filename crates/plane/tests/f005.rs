@@ -190,11 +190,11 @@ fn f006_symmetric_beta0_block_diagonal_matches_4x4() {
     let (p, db) = (review_rect(&f), db_with(&f));
     let s = run1(&p, &db, &t1_derivs(4.0, 0.0)).stability.unwrap();
     // off-diagonal blocks vanish against their rows' diagonal blocks
-    for r in 0..8 {
+    for (r, row) in s.a.iter().enumerate().take(8) {
         let blk = if r < 4 { 0 } else { 4 };
-        let diag = (blk..blk + 4).map(|c| s.a[r][c].abs()).fold(0.0, f64::max);
+        let diag = (blk..blk + 4).map(|c| row[c].abs()).fold(0.0, f64::max);
         for c in (0..8).filter(|c| (c / 4) * 4 != blk) {
-            assert!(s.a[r][c].abs() <= 1e-12 * diag, "a[{r}][{c}] = {} vs row scale {diag}", s.a[r][c]);
+            assert!(row[c].abs() <= 1e-12 * diag, "a[{r}][{c}] = {} vs row scale {diag}", row[c]);
         }
     }
     // the blocks are the previous 4x4 assembly from the same derivatives
