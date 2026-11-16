@@ -11,6 +11,11 @@ on:
 # dialogs use the XDG portal), and apt-get on the runners can hang.
 env:
   CARGO_TERM_COLOR: always
+  # Replaces .cargo/config.toml's target-cpu=native: rust-cache shares the
+  # compiled dependencies between runners whose CPUs differ, and a cache
+  # built on an AVX-512 runner crashed the tests elsewhere with SIGILL.
+  # x86-64-v2 is the release baseline; src/simd.rs still picks AVX2 at run time.
+  RUSTFLAGS: -C target-cpu=x86-64-v2
   # The GPL reference builds are not on CI; tests that need them print SKIPPED(ref).
   FOILEY_REQUIRE_REF: "0"
 
