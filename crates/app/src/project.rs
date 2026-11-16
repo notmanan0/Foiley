@@ -7,7 +7,10 @@ use std::path::Path;
 
 /// Project file format.  2: polar provenance (settings snapshot, geometry
 /// hash, run manifest) and explicit families; 1 files migrate on load.
-pub const FORMAT_VERSION: u32 = 2;
+/// 3: XFoil 6.99 polars (integrated CDp, bottom Ncrit, wake controls), so
+/// older builds refuse them instead of dropping those settings; 2 files
+/// load unchanged.
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {

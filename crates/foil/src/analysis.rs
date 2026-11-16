@@ -114,6 +114,17 @@ pub struct AnalysisSettings {
     pub mach: f64,
     /// e^N transition criterion (9 = average wind tunnel, 11-12 = quiet free air, 4-6 = turbulent)
     pub ncrit: f64,
+    /// bottom-surface Ncrit (XFoil 6.99 VPAR NB); None: `ncrit` on both
+    /// surfaces.  The three 6.99 controls below are left out of the JSON at
+    /// their defaults, so older settings (and their hashes) are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ncrit_bot: Option<f64>,
+    /// wake length behind the trailing edge, chords (XFoil 6.99 VPAR WAKE)
+    #[serde(skip_serializing_if = "is_default_wake_length")]
+    pub wake_length: f64,
+    /// wake inverse dissipation-length factor (XFoil 6.99 VPAR LAG, third constant)
+    #[serde(skip_serializing_if = "is_default_wake_dissipation")]
+    pub wake_dissipation: f64,
     /// forced transition (trip) location x/c, upper surface (1 = free)
     pub xtr_top: f64,
     /// forced transition location x/c, lower surface (1 = free)
@@ -153,6 +164,9 @@ impl Default for AnalysisSettings {
             re: 1.0e6,
             mach: 0.0,
             ncrit: 9.0,
+            ncrit_bot: None,
+            wake_length: DEFAULT_WAKE_LENGTH,
+            wake_dissipation: DEFAULT_WAKE_DISSIPATION,
             xtr_top: 1.0,
             xtr_bot: 1.0,
             viscous: true,
@@ -171,7 +185,22 @@ impl Default for AnalysisSettings {
     }
 }
 
+const DEFAULT_WAKE_LENGTH: f64 = 1.0;
+const DEFAULT_WAKE_DISSIPATION: f64 = 0.9;
+fn is_default_wake_length(v: &f64) -> bool {
+    *v == DEFAULT_WAKE_LENGTH
+}
+fn is_default_wake_dissipation(v: &f64) -> bool {
+    *v == DEFAULT_WAKE_DISSIPATION
+}
+
 impl AnalysisSettings {
+    /// The bottom Ncrit when it differs from `ncrit`: a bottom value equal
+    /// to the top one is the same analysis as none.
+    pub fn bottom_ncrit(&self) -> Option<f64> {
+        self.ncrit_bot.filter(|&n| n != self.ncrit)
+    }
+
     /// Check inputs and explain problems in plain words.
     pub fn validate(&self) -> Result<(), String> {
         if self.viscous && !(self.re > 1.0e3 && self.re < 1.0e10) {
@@ -182,6 +211,15 @@ impl AnalysisSettings {
         }
         if !(0.1..=20.0).contains(&self.ncrit) {
             return Err(format!("Ncrit {} should be between 0.1 and 20 (9 is the usual value)", self.ncrit));
+        }
+        if let Some(n) = self.ncrit_bot.filter(|n| !(0.1..=20.0).contains(n)) {
+            return Err(format!("bottom Ncrit {n} should be between 0.1 and 20"));
+        }
+        if !(1.0..=20.0).contains(&self.wake_length) {
+            return Err(format!("wake length {} must be 1..20 chords", self.wake_length));
+        }
+        if !(0.01..=10.0).contains(&self.wake_dissipation) {
+            return Err(format!("wake dissipation factor {} must be 0.01..10 (XFoil default 0.9)", self.wake_dissipation));
         }
         for (n, v) in [("top", self.xtr_top), ("bottom", self.xtr_bot)] {
             if !(0.0..=1.0).contains(&v) {
@@ -204,6 +242,9 @@ impl AnalysisSettings {
         };
         if self.viscous {
             s.push_str(&format!("_N{:.1}", self.ncrit));
+            if let Some(n) = self.bottom_ncrit() {
+                s.push_str(&format!("_NB{n:.1}"));
+            }
             if self.xtr_top < 1.0 || self.xtr_bot < 1.0 {
                 s.push_str(&format!("_trip{:.2}-{:.2}", self.xtr_top, self.xtr_bot));
             }
@@ -291,6 +332,9 @@ fn setup_engine(foil: &Foil, st: &AnalysisSettings, re: f64) -> Result<XFoil, Fo
     xf.reinf1 = re;
     xf.minf1 = st.mach;
     xf.acrit = st.ncrit;
+    xf.acrit_bot = st.bottom_ncrit();
+    xf.set_wake_length(st.wake_length);
+    xf.bl.par.dlcon = st.wake_dissipation;
     xf.xstrip[1] = st.xtr_top;
     xf.xstrip[2] = st.xtr_bot;
     xf.itmax = st.max_iter;
@@ -340,6 +384,8 @@ fn to_foil_point(xf: &XFoil, q: &foiley::polar::PolarPoint) -> FoilPoint {
         cm: q.cm,
         xtr_top: if xf.lvisc { q.xtr_top } else { 1.0 },
         xtr_bot: if xf.lvisc { q.xtr_bot } else { 1.0 },
+        itr_top: q.itr_top,
+        itr_bot: q.itr_bot,
         cpmin: q.cpmin,
         re: if xf.lvisc { xf.reinf } else { 0.0 },
         mach: xf.minf,
@@ -519,6 +565,7 @@ pub fn analyze(foil: &Foil, st: &AnalysisSettings, sweep: &Sweep, prog: &Progres
         re: st.re,
         mach: st.mach,
         ncrit: st.ncrit,
+        ncrit_bot: st.bottom_ncrit(),
         xtr_top: st.xtr_top,
         xtr_bot: st.xtr_bot,
         viscous: st.viscous,

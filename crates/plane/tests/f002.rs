@@ -8,6 +8,34 @@ fn ncrit(n: f64) -> FamilySelector {
     FamilySelector { ncrit: Some(n), ..Default::default() }
 }
 
+/// A legacy polar and a new one at the same Mach, Ncrit and trips are one
+/// family (wake controls are analysis settings, not family keys, and a
+/// bottom Ncrit equal to the top one is no split); a split bottom Ncrit is
+/// another family, chosen by the selector's bottom Ncrit.
+#[test]
+fn only_a_split_bottom_ncrit_forms_another_family() {
+    let f = naca0012();
+    let mut db = db_with(&f);
+    db.add_polar(&synth_polar(&f.name, "legacy", 1e6, 9.0, 0.01));
+    let mut new = synth_polar(&f.name, "new", 2e6, 9.0, 0.01);
+    new.settings = Some(foiley_foil::AnalysisSettings { wake_length: 2.5, ..Default::default() });
+    new.ncrit_bot = Some(9.0);
+    db.add_polar(&new);
+    assert_eq!(db.families_of(&f.name).len(), 1);
+    let one = db.resolve(&f.name, &ncrit(9.0)).unwrap().unwrap();
+    assert_eq!(db.family(one).polars.len(), 2);
+    let mut split = synth_polar(&f.name, "split", 1e6, 9.0, 0.01);
+    split.ncrit_bot = Some(5.0);
+    db.add_polar(&split);
+    assert_eq!(db.families_of(&f.name).len(), 2);
+    assert!(db.resolve(&f.name, &ncrit(9.0)).is_err());
+    let bottom = |n| FamilySelector { ncrit_bot: Some(n), ..ncrit(9.0) };
+    assert_eq!(db.resolve(&f.name, &bottom(9.0)).unwrap(), Some(one));
+    let other = db.resolve(&f.name, &bottom(5.0)).unwrap().unwrap();
+    assert_ne!(other, one);
+    assert_ne!(db.family(other).key.hash(), db.family(one).key.hash());
+}
+
 /// Two families (Ncrit 9 and 5) at the same Re: the selected family decides,
 /// never the order in which the polars were added.
 #[test]

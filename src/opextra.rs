@@ -8,7 +8,7 @@
 use crate::cli::{args, Session};
 use crate::fmt::{f_fmt, fixed, g_fmt};
 use crate::polar::*;
-use crate::xfoil::{DTOR, IBX};
+use crate::xfoil::{XFoil, DTOR, IBX, IVX};
 
 /// Global polar / plotting state that lives in XFOIL.INC commons.
 #[derive(Clone, Debug)]
@@ -51,6 +51,8 @@ pub struct ExtraState {
     pub cpolplf: [[f64; 4]; 5],
     pub lppsho: bool,
     pub lcpgrd: bool,
+    pub lcpinv: bool,
+    pub bl_plot_s: bool,
     pub lcpref: bool,
     pub lforef: bool,
     /// VELS point (XXX,YYY)
@@ -69,6 +71,7 @@ impl Default for ExtraState {
         ipol[5] = ICM;
         let mut jpol = [0usize; JPTOT + 1];
         jpol[1] = JTN;
+        jpol[2] = JTI;
         let mut cpolplf = [[0.0; 4]; 5];
         cpolplf[ICD] = [0.0, 0.0, 0.04, 0.01];
         cpolplf[ICL] = [0.0, 0.0, 1.5, 0.5];
@@ -79,7 +82,7 @@ impl Default for ExtraState {
             nipol: 5,
             nipol0: 5,
             jpol,
-            njpol: 1,
+            njpol: 2,
             lcminp: false,
             lhmomp: false,
             lpfile: false,
@@ -108,6 +111,8 @@ impl Default for ExtraState {
             cpolplf,
             lppsho: false,
             lcpgrd: false,
+            lcpinv: true,
+            bl_plot_s: false,
             lcpref: false,
             lforef: false,
             vels_xy: (0.0, 0.0),
@@ -179,6 +184,12 @@ pub fn oper_cmd(s: &mut Session, com: &str, arg: &str) -> bool {
     let ninput = r.len();
     match com {
         "DUMP" => bldump(s, arg),
+        "DMP" => bldump2(s, arg),
+        "CPIO" => {
+            // plot flag only, like CPGR: script mode draws no Cp plot
+            s.extra_state.lcpinv = !s.extra_state.lcpinv;
+            crate::outln!(" Inviscid Cp overlay {}", if s.extra_state.lcpinv { "enabled" } else { "disabled" });
+        }
         "CPWR" => cpdump(s, arg),
         "FMOM" => {
             mhinge(s);
@@ -602,7 +613,8 @@ fn bldump(s: &mut Session, arg: &str) {
     let xf = &mut s.xf;
     let mut out = String::new();
     if xf.kdelim == 0 {
-        out += "#    s        x        y     Ue/Vinf    Dstar     Theta      Cf       H\n";
+        // (the header names tau and Di, which 6.99 does not write)
+        out += "#    s        x        y     Ue/Vinf    Dstar     Theta      Cf       H       H*        P         m          K          tau         Di\n";
     } else {
         out += &format!("#s{d}x{d}y{d}Ue/Vinf{d}Dstar{d}Theta{d}Cf{d}H\n", d = delim);
     }
@@ -610,10 +622,11 @@ fn bldump(s: &mut Session, arg: &str) {
     let gamm1 = xf.gamm1;
     let hstinv = gamm1 * (xf.minf / xf.qinf).powi(2) / (1.0 + 0.5 * gamm1 * xf.minf * xf.minf);
     let n = xf.n;
-    let line = |s_: f64, x: f64, y: f64, ue: f64, ds: f64, th: f64, cf: f64, hk: f64| -> String {
+    // FORMAT 8500 / 8510; only blank-delimited surface rows carry H*, P, m, K
+    let line = |s_: f64, x: f64, y: f64, ue: f64, ds: f64, th: f64, cf: f64, hk: f64, extra: Option<[f64; 4]>| -> String {
         if xf.kdelim == 0 {
-            format!(
-                " {}{}{}{}{}{}{}{}\n",
+            let mut l = format!(
+                " {}{}{}{}{}{}{}{}",
                 f_fmt(s_, 9, 5),
                 f_fmt(x, 9, 5),
                 f_fmt(y, 9, 5),
@@ -621,8 +634,12 @@ fn bldump(s: &mut Session, arg: &str) {
                 f_fmt(ds, 10, 6),
                 f_fmt(th, 10, 6),
                 f_fmt(cf, 10, 6),
-                f_fmt(hk, 10, 3)
-            )
+                f_fmt(hk, 10, 4)
+            );
+            if let Some([hs, p, m, k]) = extra {
+                l += &format!("{}{}{}{}", f_fmt(hs, 10, 4), f_fmt(p, 9, 5), f_fmt(m, 9, 5), f_fmt(k, 9, 5));
+            }
+            l + "\n"
         } else {
             let l = format!(
                 " {}{d}{}{d}{}{d}{}{d}{}{d}{}{d}{}{d}{}",
@@ -633,7 +650,7 @@ fn bldump(s: &mut Session, arg: &str) {
                 f_fmt(ds, 10, 6),
                 f_fmt(th, 10, 6),
                 f_fmt(cf, 10, 6),
-                f_fmt(hk, 10, 3),
+                f_fmt(hk, 10, 4),
                 d = delim
             );
             format!("{}\n", bstrip(&l))
@@ -643,24 +660,27 @@ fn bldump(s: &mut Session, arg: &str) {
     let qinf = xf.qinf;
     for i in 1..=n {
         let is = if xf.gam[i] < 0.0 { 2 } else { 1 };
-        let (ds, th, cf, h);
+        let (ds, th, ts, cf, h, hs);
         if xf.lipan && xf.lvisc {
             let ibl = if is == 1 { xf.iblte[is] + 1 - i } else { xf.iblte[is] + i - n };
             ds = xf.dstr[is][ibl];
             th = xf.thet[is][ibl];
+            ts = xf.tstr[is][ibl];
             cf = xf.tau[is][ibl] / (0.5 * qinf * qinf);
-            h = if th == 0.0 { 1.0 } else { ds / th };
+            (h, hs) = if th == 0.0 { (1.0, 1.0) } else { (ds / th, ts / th) };
         } else {
             ds = 0.0;
             th = 0.0;
+            ts = 0.0;
             cf = 0.0;
             h = 1.0;
+            hs = 2.0;
         }
         let g = xf.gam[i] / qinf;
         let ue = g * (1.0 - tklam) / (1.0 - tklam * g * g);
         let amsq = ue * ue * hstinv / (gamm1 * (1.0 - 0.5 * ue * ue * hstinv));
         let (hk, _, _) = crate::blsys::hkin(h, amsq);
-        out += &line(xf.s[i], xf.x[i], xf.y[i], ue, ds, th, cf, hk);
+        out += &line(xf.s[i], xf.x[i], xf.y[i], ue, ds, th, cf, hk, Some([hs, th * ue * ue, ds * ue, ts * ue.powi(3)]));
     }
     if xf.lwake {
         let is = 2;
@@ -675,7 +695,113 @@ fn bldump(s: &mut Session, arg: &str) {
             let ue = g * (1.0 - tklam) / (1.0 - tklam * g * g);
             let amsq = ue * ue * hstinv / (gamm1 * (1.0 - 0.5 * ue * ue * hstinv));
             let (hk, _, _) = crate::blsys::hkin(h, amsq);
-            out += &line(xf.s[i], xf.x[i], xf.y[i], ue, ds, th, cf, hk);
+            out += &line(xf.s[i], xf.x[i], xf.y[i], ue, ds, th, cf, hk, None);
+        }
+    }
+    write_file(&fname, eol(&out).as_bytes());
+}
+
+/// BLDUMP2 (OPER DMP): fixed-format columns whatever the delimiter setting.
+fn bldump2(s: &mut Session, arg: &str) {
+    let fname = dump_fname(s, arg, ".bl");
+    let xf = &mut s.xf;
+    let mut out = String::new();
+    out += "#    s        x        y      Ue/Vinf    Dstar      Theta      Tstar       Cf         CD         H         H*         m          P         Pf        Pp         K/2         tau       Diss    -m du/ds    dP/ds      DV         dm/ds     N     Rtheta
+";
+    out += "#    1        2        3        4          5          6          7          8         9          10        11         12         13        14        15         16          17         18        19        20        21          22      23      24   
+";
+    xf.comset();
+    let hstinv = xf.gamm1 * (xf.minf / xf.qinf).powi(2) / (1.0 + 0.5 * xf.gamm1 * xf.minf.powi(2));
+    // integrated wall shear, the wake starting from the sum of both surfaces
+    let mut ptau = [vec![0.0; IVX + 1], vec![0.0; IVX + 1], vec![0.0; IVX + 1]];
+    let tau_step = |xf: &XFoil, ptau: &mut [Vec<f64>; 3], is: usize, ibl: usize| {
+        let dxssi = xf.xssi[is][ibl] - xf.xssi[is][ibl - 1];
+        let taua = (xf.tau[is][ibl] + xf.tau[is][ibl - 1]) * 0.5;
+        ptau[is][ibl] = ptau[is][ibl - 1] + taua * dxssi;
+    };
+    for is in 1..=2 {
+        for ibl in 2..=xf.iblte[is] {
+            tau_step(xf, &mut ptau, is, ibl);
+        }
+    }
+    let ibl = xf.iblte[2] + 1;
+    ptau[2][ibl] = ptau[1][xf.iblte[1]] + ptau[2][xf.iblte[2]];
+    for ibl in xf.iblte[2] + 2..=xf.nbl[2] {
+        tau_step(xf, &mut ptau, 2, ibl);
+    }
+    for is in 1..=2 {
+        for ibl in 2..=xf.nbl[is] {
+            let i = xf.ipan[is][ibl];
+            let mut iblm = if ibl == 2 { ibl } else { ibl - 1 };
+            let mut iblp = if ibl == xf.iblte[is] { ibl } else { ibl + 1 };
+            if is == 2 {
+                if ibl == xf.iblte[is] + 1 {
+                    iblm = ibl;
+                }
+                if ibl == xf.nbl[is] {
+                    iblp = ibl;
+                }
+            }
+            let mut xs = xf.xssi[is][ibl];
+            if is == 2 && ibl > xf.iblte[2] {
+                xs = xs - xf.xssi[2][xf.iblte[2]] + xf.xssi[1][xf.iblte[1]];
+            }
+            let (ue, ds, th, ts, cf, cdis, ptaui, pprei, dprei, hk, hs, duds, dmds, dk, ct, rt);
+            if xf.lipan && xf.lvisc {
+                ue = xf.uedg[is][ibl];
+                ds = xf.dstr[is][ibl];
+                th = xf.thet[is][ibl];
+                ts = xf.tstr[is][ibl];
+                cf = xf.tau[is][ibl] / (0.5 * xf.qinf.powi(2));
+                cdis = xf.dis[is][ibl] / xf.qinf.powi(3);
+                ptaui = ptau[is][ibl];
+                pprei = th * ue * ue - ptaui;
+                dprei = (1.0 - ue * ue) * 0.5;
+                let h;
+                (h, hs) = if th == 0.0 { (1.0, 1.0) } else { (ds / th, ts / th) };
+                let amsq = ue * ue * hstinv / (xf.gamm1 * (1.0 - 0.5 * ue * ue * hstinv));
+                hk = crate::blsys::hkin(h, amsq).0;
+                let dxssi = xf.xssi[is][iblp] - xf.xssi[is][iblm];
+                duds = (xf.uedg[is][iblp] - xf.uedg[is][iblm]) / dxssi;
+                dmds = (xf.uedg[is][iblp] * xf.dstr[is][iblp] - xf.uedg[is][iblm] * xf.dstr[is][iblm]) / dxssi;
+                dk = hk * xf.thet[is][ibl];
+                ct = xf.ctau[is][ibl];
+                rt = ue * th * xf.reinf;
+            } else {
+                let g = xf.gam[i] / xf.qinf;
+                ue = g * (1.0 - xf.tklam) / (1.0 - xf.tklam * g * g);
+                (ds, th, ts, cf, cdis, ptaui, pprei, dprei) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                (hs, hk) = (1.0, 1.0);
+                (duds, dmds, dk, ct, rt) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            }
+            let (tau, dis) = (xf.tau[is][ibl], xf.dis[is][ibl]);
+            // FORMAT(1X, 4F9.5, 3F11.7, 2F11.7, 2F10.4, 5F11.7, 4F11.7, 3F11.7, F11.3)
+            let f9 = [xs, xf.x[i], xf.y[i], ue].map(|v| f_fmt(v, 9, 5)).concat();
+            let f11a = [ds, th, ts, cf, cdis].map(|v| f_fmt(v, 11, 7)).concat();
+            let f10 = [hk, hs].map(|v| f_fmt(v, 10, 4)).concat();
+            let f11b = [
+                ds * ue,
+                th * ue * ue,
+                ptaui,
+                pprei,
+                0.5 * ts * ue.powi(3),
+                tau,
+                dis,
+                -ue * ds * duds,
+                tau - ue * ds * duds,
+                th * ue * ue - dprei * dk,
+                dmds,
+                ct,
+            ]
+            .map(|v| f_fmt(v, 11, 7))
+            .concat();
+            out += &format!(" {f9}{f11a}{f10}{f11b}{}\n", f_fmt(rt, 11, 3));
+            if is == 2 && ibl == xf.iblte[2] {
+                out.push('\n');
+            }
+        }
+        if is == 1 {
+            out.push('\n');
         }
     }
     write_file(&fname, eol(&out).as_bytes());
@@ -933,8 +1059,8 @@ fn set_nipol_b(s: &mut Session) {
 /// PLRSUM
 pub fn plrsum(s: &Session, ip1: usize, ip2: usize) {
     crate::outln!();
-    crate::outln!(" {}{}", "       airfoil                    Re           Mach     ", "  Ncrit  XtripT  XtripB     file");
-    crate::outln!(" {}{}", "      ------------------------  ------------  ----------", "  -----  ------  ------    -------------------");
+    crate::outln!(" {}{}", "       airfoil                    Re           Mach     ", "  NcritT  NcritB  XtripT  XtripB       file");
+    crate::outln!(" {}{}", "      ------------------------  ------------  ----------", "  ------  ------  ------  ------    -------------------");
     const CLTYP: [&str; 4] = ["     ", "     ", "/sqCL", "/CL  "];
     // IEXP keeps its previous value when Re = 0 (undefined at first: '*')
     let mut iexp: i64 = 99;
@@ -961,7 +1087,7 @@ pub fn plrsum(s: &Session, ip1: usize, ip2: usize) {
             ct(p.retyp),
             f_fmt(p.mach, 7, 3),
             ct(p.matyp),
-            f_fmt(p.acrit, 7, 2),
+            f_fmt(p.acrit, 8, 2) + &f_fmt(p.acrit_bot.unwrap_or(p.acrit), 8, 2),
             f_fmt(p.xstrip[1], 8, 3),
             f_fmt(p.xstrip[2], 8, 3),
             cfil,
@@ -988,6 +1114,7 @@ fn apcopy(s: &mut Session, ip: usize) {
         return;
     }
     let xf = &mut s.xf;
+    let old_n = xf.n;
     xf.n = p.nxy;
     for i in 1..=p.nxy {
         xf.x[i] = p.xyx[i];
@@ -996,6 +1123,7 @@ fn apcopy(s: &mut Session, ip: usize) {
     xf.name = p.name.clone();
     xf.finish_current_airfoil();
     xf.invalidate_geometry();
+    if old_n != xf.n { xf.lblini = false; }
 }
 
 /// PLRSET: returns the (possibly zeroed) polar index.
@@ -1052,6 +1180,7 @@ fn plrset(s: &mut Session, ip: usize) -> usize {
         xf.minf1 = p.mach;
         xf.reinf1 = p.reyn;
         xf.acrit = p.acrit;
+        xf.acrit_bot = p.acrit_bot;
         xf.xstrip[1] = p.xstrip[1];
         xf.xstrip[2] = p.xstrip[2];
         ip
@@ -1064,6 +1193,7 @@ fn plrset(s: &mut Session, ip: usize) -> usize {
             reyn: if xf.lvisc { xf.reinf1 } else { 0.0 },
             mach: xf.minf1,
             acrit: xf.acrit,
+            acrit_bot: xf.acrit_bot,
             nxy: xf.n,
             ..Default::default()
         };
@@ -1123,11 +1253,12 @@ fn plrini(s: &mut Session, ip: usize) {
             || p.retyp != xf.retyp
             || p.matyp != xf.matyp
             || p.acrit != xf.acrit
+            || p.acrit_bot.unwrap_or(p.acrit) != xf.ncrit(2)
             || p.xstrip[1] != xf.xstrip[1]
             || p.xstrip[2] != xf.xstrip[2]
         {
             crate::outln!(
-                "\n              Current                         Save file\n          ------------------              ------------------\n name :   {}{}\n Re   :   {}{:20}{}\n Mach :   {}{:20}{}\n Retyp:   {}{:25}{}\n Matyp:   {}{:25}{}\n Ncrit:   {}{:20}{}\n xtr T:   {}{:20}{}\n xtr B:   {}{:20}{}",
+                "\n               Current                         Save file\n           ------------------              ------------------\n name  :   {}{}\n Re    :   {}{:20}{}\n Mach  :   {}{:20}{}\n Retyp :   {}{:25}{}\n Matyp :   {}{:25}{}\n NcritT:   {}{:20}{}\n NcritB:   {}{:20}{}\n xtr T :   {}{:20}{}\n xtr B :   {}{:20}{}",
                 fixed(&xf.name, 48),
                 fixed(&p.name, 48),
                 f0(xf.reinf1, 12),
@@ -1145,6 +1276,9 @@ fn plrini(s: &mut Session, ip: usize) {
                 f_fmt(xf.acrit, 12, 4),
                 "",
                 f_fmt(p.acrit, 12, 4),
+                f_fmt(xf.ncrit(2), 12, 4),
+                "",
+                f_fmt(p.acrit_bot.unwrap_or(p.acrit), 12, 4),
                 f_fmt(xf.xstrip[1], 12, 4),
                 "",
                 f_fmt(p.xstrip[1], 12, 4),
@@ -1163,6 +1297,7 @@ fn plrini(s: &mut Session, ip: usize) {
                 xf.retyp = p.retyp;
                 xf.matyp = p.matyp;
                 xf.acrit = p.acrit;
+                xf.acrit_bot = p.acrit_bot;
                 xf.xstrip[1] = p.xstrip[1];
                 xf.xstrip[2] = p.xstrip[2];
             } else {
@@ -1251,25 +1386,26 @@ fn plxini(s: &mut Session, ip: usize) {
             let machx = rd_f64(r2, 0)?;
             let reynx = rd_f64(r2, 1)?;
             let acritx = rd_f64(r2, 2)?;
+            let acrit_botx = if r2.len() >= 32 { Some(rd_f64(r2, 3)?) } else { None };
             let r3 = recs.get(2)?;
             let matypx = rd_i32(r3, 0)?;
             let retypx = rd_i32(r3, 1)?;
             let r4 = recs.get(3)?;
             rd_i32(r4, 3)?;
-            Some((namex, machx, reynx * 1.0e6, acritx, matypx, retypx))
+            Some((namex, machx, reynx * 1.0e6, acritx, acrit_botx, matypx, retypx))
         })();
         match hdr {
             None => {
                 crate::outln!(" Polar dump file READ error");
                 return;
             }
-            Some((namex, machx, reynx, acritx, matypx, retypx)) => {
+            Some((namex, machx, reynx, acritx, acrit_botx, matypx, retypx)) => {
                 s.polars[ip - 1].pfnamx = fname.clone();
                 let xf = &s.xf;
                 let namdif = name48(&xf.name) != namex;
-                if namdif || reynx != xf.reinf1 || machx != xf.minf1 || acritx != xf.acrit || retypx != xf.retyp || matypx != xf.matyp {
+                if namdif || reynx != xf.reinf1 || machx != xf.minf1 || acritx != xf.acrit || acrit_botx.unwrap_or(acritx) != xf.ncrit(2) || retypx != xf.retyp || matypx != xf.matyp {
                     crate::outln!(
-                        "\n              Dump file                       Current\n            ------------                    ------------\n name :   {}{}\n Re   :   {}{:20}{}\n Mach :   {}{:20}{}\n Retyp:   {}{:25}{}\n Matyp:   {}{:25}{}\n Ncrit:   {}{:20}{}",
+                        "\n               Dump file                       Current\n             ------------                    ------------\n name  :   {}{}\n Re    :   {}{:20}{}\n Mach  :   {}{:20}{}\n Retyp :   {}{:25}{}\n Matyp :   {}{:25}{}\n NcritT:   {}{:20}{}\n NcritB:   {}{:20}{}",
                         fixed(&namex, 32),
                         fixed(&xf.name, 48),
                         f0(reynx, 12),
@@ -1286,7 +1422,11 @@ fn plxini(s: &mut Session, ip: usize) {
                         i_fmt(xf.matyp as i64, 7),
                         f_fmt(acritx, 12, 4),
                         "",
-                        f_fmt(xf.acrit, 12, 4)
+                        f_fmt(xf.acrit, 12, 4),
+                        // (6.99 prints ACRITX(1) here; the dump file's bottom value is meant)
+                        f_fmt(acrit_botx.unwrap_or(acritx), 12, 4),
+                        "",
+                        f_fmt(xf.ncrit(2), 12, 4)
                     );
                     crate::outln!();
                     crate::outln!(" Current parameters different from old dump file values.");
@@ -1297,6 +1437,7 @@ fn plxini(s: &mut Session, ip: usize) {
                         xf.minf1 = machx;
                         xf.reinf1 = reynx;
                         xf.acrit = acritx;
+                        xf.acrit_bot = acrit_botx;
                         xf.retyp = retypx;
                         xf.matyp = matypx;
                     } else {
@@ -1325,6 +1466,7 @@ fn plxini(s: &mut Session, ip: usize) {
     pr(&mut r, xf.minf1);
     pr(&mut r, xf.reinf1 / 1.0e6);
     pr(&mut r, xf.acrit);
+    pr(&mut r, xf.ncrit(2));
     ufrec(&mut buf, &r);
     let mut r = Vec::new();
     pi(&mut r, xf.matyp);
@@ -1414,6 +1556,10 @@ pub fn plradd(s: &mut Session) {
         row[IRE] = re;
         row[INC] = xf.acrit;
         let mut sd = [[0.0f64; 3]; JPTOT + 1];
+        sd[JNC][1] = xf.acrit;
+        sd[JNC][2] = xf.ncrit(2);
+        sd[JTI][1] = if xf.lvisc { xf.tindex[1] } else { 0.0 };
+        sd[JTI][2] = if xf.lvisc { xf.tindex[2] } else { 0.0 };
         for is in 1..=2 {
             let xoct = if xf.lvisc { xf.xoctr[is] } else { 0.0 };
             sd[JTP][is] = xf.xstrip[is];
@@ -2162,8 +2308,7 @@ fn inte(s: &mut Session, lx: bool) {
                 }
                 let p = &s.polars[ip as usize - 1];
                 nint[k] = p.nxy;
-                // (the Fortran copies N points of the stored airfoil)
-                for i in 1..=s.xf.n.min(p.xyx.len() - 1) {
+                for i in 1..=p.nxy {
                     xint[k][i] = p.xyx[i];
                     yint[k][i] = p.xyy[i];
                 }
@@ -2597,7 +2742,7 @@ pub fn wrtdef(s: &Session) -> String {
     o += &format!(" {}{}{}{} | ALmin   ALmax   ALdel\n", f(c[IAL][1]), f(c[IAL][2]), f(c[IAL][3]), b9);
     o += &format!(" {}{}{}{} | CMmin   CMmax   CMdel\n", f(c[ICM][1]), f(c[ICM][2]), f(c[ICM][3]), b9);
     o += &format!(" {}      {}{}{} | MAtype  Mach    Vaccel\n", i_fmt(xf.matyp as i64, 3), f(xf.minf1), f(xf.vaccel), b9);
-    o += &format!(" {}      {}{}{} | REtype  Re/10^6 Ncrit\n", i_fmt(xf.retyp as i64, 3), f(xf.reinf1 / 1.0e6), f(xf.acrit), b9);
+    o += &format!(" {}      {}{}{} | REtype  Re/10^6 Ncrit1 Ncrit2\n", i_fmt(xf.retyp as i64, 3), f(xf.reinf1 / 1.0e6), f(xf.acrit), f(xf.ncrit(2)));
     o += &format!(" {}{}{}{} | XtripT  XtripB\n", f(xf.xstrip[1]), f(xf.xstrip[2]), b9, b9);
     o
 }
@@ -2690,13 +2835,14 @@ pub fn getdef(s: &mut Session, filnam: &str, lask: bool) {
         s.xf.matyp = list_int1(&t[0])? as i32;
         s.xf.minf1 = parse_fortran_real(&t[1])?;
         s.xf.vaccel = parse_fortran_real(&t[2])?;
-        let t = match rd.read_tokens(3) {
-            ListRead::Ok(t) if t.len() == 3 => t,
+        let t = match rd.read_record_tokens() {
+            ListRead::Ok(t) if t.len() >= 3 => t,
             _ => return None,
         };
         s.xf.retyp = list_int1(&t[0])? as i32;
         let rmill = parse_fortran_real(&t[1])?;
         s.xf.acrit = parse_fortran_real(&t[2])?;
+        s.xf.acrit_bot = t.get(3).and_then(|v| parse_fortran_real(v));
         let v = rr(&mut rd, 2)?;
         s.xf.xstrip[1] = v[0];
         s.xf.xstrip[2] = v[1];

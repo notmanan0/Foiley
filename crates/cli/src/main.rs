@@ -159,18 +159,27 @@ struct XfoilOpts {
     /// e^N transition criterion (9 = wind tunnel, 11-12 = quiet free air, 4-6 = turbulent)
     #[arg(long, default_value_t = 9.0)]
     ncrit: f64,
+    /// Bottom Ncrit (defaults to --ncrit on both surfaces)
+    #[arg(long)]
+    ncrit_bot: Option<f64>,
     #[command(flatten)]
     solver: SolverOpts,
 }
 
 impl XfoilOpts {
     fn settings(&self) -> Result<AnalysisSettings, String> {
-        Ok(AnalysisSettings { re: self.re, mach: self.mach, ncrit: self.ncrit, ..self.solver.settings()? })
+        Ok(AnalysisSettings { re: self.re, mach: self.mach, ncrit: self.ncrit, ncrit_bot: self.ncrit_bot, ..self.solver.settings()? })
     }
 }
 
 #[derive(Args, Clone)]
 struct SolverOpts {
+    /// Wake length in chord lengths (1..20)
+    #[arg(long, default_value_t = 1.0)]
+    wake_length: f64,
+    /// Wake inverse dissipation-length factor (VPAR LAG's third constant)
+    #[arg(long, default_value_t = 0.9)]
+    wake_dissipation: f64,
     /// forced transition x/c "top,bottom" (1 = free transition)
     #[arg(long, default_value = "1,1")]
     xtr: String,
@@ -180,7 +189,7 @@ struct SolverOpts {
     /// Newton iteration limit per point
     #[arg(long, default_value_t = 100)]
     iter: usize,
-    /// number of panel nodes (XFoil PANGEN, max 354)
+    /// number of panel nodes (XFoil PANGEN, max 364)
     #[arg(long, default_value_t = 160)]
     panels: usize,
     /// solve on the foil's own coordinates (XFoil LOAD + PCOP) instead of PANGEN
@@ -204,6 +213,8 @@ impl SolverOpts {
             return Err("--xtr needs two values: top,bottom".into());
         }
         Ok(AnalysisSettings {
+            wake_length: self.wake_length,
+            wake_dissipation: self.wake_dissipation,
             xtr_top: x[0],
             xtr_bot: x[1],
             viscous: !self.inviscid,

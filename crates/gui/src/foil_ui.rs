@@ -58,6 +58,7 @@ pub struct FoilUi {
     pub preview: Option<Foil>,
     pub new_name: String,
     pub bl_var: usize,
+    pub bl_arc_length: bool,
     pub cp_inviscid: bool,
     pub show_failed: bool,
     pub inv_mode: InverseMode,
@@ -101,6 +102,7 @@ impl Default for FoilUi {
             preview: None,
             new_name: String::new(),
             bl_var: 0,
+            bl_arc_length: false,
             cp_inviscid: true,
             show_failed: true,
             inv_mode: InverseMode::Mixed,
@@ -591,6 +593,13 @@ impl App {
                     }
                     num(ui, "Mach", &mut s.mach, 0.01, 0.0..=0.9, "freestream Mach number (Karman-Tsien compressibility correction)");
                     num(ui, "Ncrit", &mut s.ncrit, 0.1, 0.1..=20.0, "e^N transition criterion: 9 = average wind tunnel, 11-12 = quiet free flight, gliders, 4-7 = turbulent or rough conditions");
+                    let mut separate = s.ncrit_bot.is_some();
+                    if ui.checkbox(&mut separate, "separate bottom Ncrit").changed() {
+                        s.ncrit_bot = separate.then_some(s.ncrit);
+                    }
+                    if let Some(n) = &mut s.ncrit_bot {
+                        num(ui, "Ncrit bottom", n, 0.1, 0.1..=20.0, "e^N transition criterion on the lower surface (XFoil 6.99 VPAR NB)");
+                    }
                     num(ui, "trip top x/c", &mut s.xtr_top, 0.01, 0.0..=1.0, "forced transition on the upper surface (1 = free transition)");
                     num(ui, "trip bottom x/c", &mut s.xtr_bot, 0.01, 0.0..=1.0, "forced transition on the lower surface (1 = free transition)");
                     if matches!(s.polar_type, PolarType::FixedAlpha | PolarType::FlapSweep) {
@@ -639,6 +648,8 @@ impl App {
                         if let NodeInput::Pangen(p) = &mut s.paneling {
                             int(ui, "panel nodes", &mut p.panels, 40..=350, "airfoil panel nodes (XFoil PANE)");
                         }
+                        num(ui, "wake length / chord", &mut s.wake_length, 0.1, 1.0..=20.0, "wake extent behind the trailing edge (XFoil 6.99 VPAR WAKE, default 1); beyond about 4 chords the wake array limit spreads the same number of points further apart");
+                        num(ui, "wake dissipation", &mut s.wake_dissipation, 0.01, 0.01..=10.0, "wake inverse dissipation-length factor (XFoil 6.99 VPAR LAG, default 0.9)");
                         num(ui, "VACC", &mut s.vaccel, 0.001, 0.0..=0.1, "viscous acceleration parameter (XFoil VACC, default 0.01)");
                         check(ui, "recover unconverged points", &mut s.recover, "re-initialise the boundary layer and march in sub-steps from a converged neighbour when a point fails");
                         check(ui, "sweep outwards from zero lift", &mut s.from_zero, "every point warm-starts from an attached-flow neighbour (more robust near stall)");
@@ -885,7 +896,7 @@ impl App {
         let Some(p) = self.project.foil_polars.iter().find(|p| p.key() == (foil.to_string(), identity.to_string())).cloned() else { return };
         let Some(mut f) = self.project.foil(foil).cloned() else { return };
         let mut st = p.settings.clone().unwrap_or_else(|| AnalysisSettings {
-            re: p.re, mach: p.mach, ncrit: p.ncrit, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, viscous: p.viscous,
+            re: p.re, mach: p.mach, ncrit: p.ncrit, ncrit_bot: p.ncrit_bot, xtr_top: p.xtr_top, xtr_bot: p.xtr_bot, viscous: p.viscous,
             ..Default::default()
         });
         // Recompute this operating point, including its exact Re/Mach and
@@ -909,6 +920,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("alpha {:.2}  CL {:.4}  CD {:.5}  Cm {:.4}  L/D {:.1}  Xtr {:.3}/{:.3}  Re {:.0}", q.alpha, q.cl, q.cd, q.cm, q.ld(), q.xtr_top, q.xtr_bot, q.re)).strong());
             ui.checkbox(&mut self.fui.cp_inviscid, "inviscid Cp");
+            ui.checkbox(&mut self.fui.bl_arc_length, "BL versus arc length");
             ui.label("BL variable:");
             widgets::pick(ui, "blvar", &mut self.fui.bl_var, &["Ue/Vinf", "shape factor H", "Cf", "displacement thickness", "momentum thickness", "N / sqrt(Ctau)"]);
             if ui.small_button("close").clicked() {
@@ -931,7 +943,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.set_width(w / 2.0 - 6.0);
                 let v = self.fui.bl_var;
-                Plot::new("bl").height(h).legend(Legend::default()).x_axis_label("x/c").show(ui, |pu| {
+                Plot::new("bl").height(h).legend(Legend::default()).x_axis_label(if self.fui.bl_arc_length { "s/c" } else { "x/c" }).show(ui, |pu| {
                     for (i, (name, b)) in [("top", &d.top), ("bottom", &d.bot), ("wake", &d.wake)].iter().enumerate() {
                         let ys = match v {
                             0 => &b.ue,
@@ -941,7 +953,8 @@ impl App {
                             4 => &b.theta,
                             _ => &b.n_or_ctau,
                         };
-                        let pts: Vec<[f64; 2]> = b.x.iter().zip(ys).map(|(x, y)| [*x, *y]).collect();
+                        let coordinate = if self.fui.bl_arc_length { &b.s } else { &b.x };
+                        let pts: Vec<[f64; 2]> = coordinate.iter().zip(ys).map(|(x, y)| [*x, *y]).collect();
                         pu.line(Line::new(*name, PlotPoints::from(pts)).color(series_color(i)));
                     }
                 });

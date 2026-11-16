@@ -478,7 +478,7 @@ pub fn aread(fname: &str, nmax: usize) -> AreadResult {
             match getflt(line2, 4) {
                 None => return fail("\n File READ error.  Unrecognizable file format"),
                 Some(a) if a.len() < 2 => return fail("\n File READ error.  Unrecognizable file format"),
-                Some(a) if a.len() == 2 => {
+                Some(a) if a.len() < 4 => {
                     crate::outln!("\n Labeled airfoil file.  Name:  {}", name);
                     itype = 2;
                     start = idx + 1;
@@ -559,7 +559,7 @@ impl XFoil {
 
     /// NACA 4/5 digit airfoil to buffer, then panel it (NACA). Returns false if illegal.
     pub fn naca(&mut self, ides: i32) -> bool {
-        let nside = IQX / 3;
+        let nside = if self.solver_version == crate::xfoil::SolverVersion::Xfoil697 { 120 } else { IQX / 3 };
         let r = if ides <= 9999 {
             Some(naca4(ides, nside))
         } else if ides <= 25099 {
@@ -624,7 +624,8 @@ impl XFoil {
         let ybte = 0.5 * (self.yb[1] + self.yb[nb]);
         crate::outln!("\n  LE  x,y  ={:10.5}{:10.5}  |   Chord ={:10.5}", xble, yble, self.chordb);
         crate::outln!("  TE  x,y  ={:10.5}{:10.5}  |", xbte, ybte);
-        if r.itype <= 2 {
+        // (6.99: only when no MSES domain string is set)
+        if r.itype <= 2 && self.ispars.trim().is_empty() {
             let ch = self.chordb;
             let rnd = |v: f64| ((20.0 * (v / ch).abs() + 0.5).trunc() / 20.0) * ch.abs() * v.signum();
             let xinl = rnd(xble - 2.0 * ch);

@@ -191,7 +191,7 @@ impl Session {
     pub fn banner() {
         crate::outln!();
         crate::outln!(" ===================================================");
-        crate::outln!("  FOILEY (XFOIL 6.97 compatible, Rust port)");
+        crate::outln!("  FOILEY (XFOIL 6.99 compatible, Rust port)");
         crate::outln!("  Multithreaded + SIMD panel/BL solver");
         crate::outln!(" ===================================================");
     }
@@ -757,6 +757,7 @@ impl Session {
         if parallel {
             let pts = crate::sweep::run_parallel(&mut xf, lalfa, &specs, itmaxs, jobs, |_, _| {});
             self.xf = xf;
+            let keep_tindex = self.xf.tindex;
             // the replayed points carry coefficients, not their BL arrays
             #[cfg(feature = "rawdump")]
             crate::rawdump::set_bl_live(false);
@@ -780,6 +781,8 @@ impl Session {
                     }
                     x.xoctr[1] = q.xtr_top;
                     x.xoctr[2] = q.xtr_bot;
+                    x.tindex[1] = q.itr_top;
+                    x.tindex[2] = q.itr_bot;
                     x.cpmn = q.cpmin;
                     x.lvconv = p.converged;
                 }
@@ -790,6 +793,7 @@ impl Session {
             #[cfg(feature = "rawdump")]
             crate::rawdump::set_bl_live(true);
             let x = &mut self.xf;
+            x.tindex = keep_tindex;
             (x.adeg, x.alfa, x.cl, x.cd, x.cdp, x.cm, x.minf, x.reinf, x.xoctr, x.cpmn, x.lvconv) = keep;
         } else {
             // Exact XFoil semantics (alpha sweeps precompute the next point's
@@ -806,11 +810,12 @@ impl Session {
 
     fn vpar(&mut self) {
         let show = |xf: &XFoil| {
-            let turb = 100.0 * (-(xf.acrit + 8.43) / 2.4).exp();
+            let turb = |is: usize| 100.0 * (-(xf.ncrit(is) + 8.43) / 2.4).exp();
             let p = xf.bl.par;
             crate::outln!(
-                "\n Xtr/c     ={:8.4}    top    side\n Xtr/c     ={:8.4}    bottom side\n Ncrit     ={:8.2}   ({:6.3} % turb. level )\n Vacc      ={:8.4}\n\n Klag  ={:8.4}     Uxwt  ={:8.2}\n A     ={:8.4}     B     ={:8.4}       KCt ={:8.5}\n CtiniK={:8.4}     CtiniX={:8.4}",
-                xf.xstrip[1], xf.xstrip[2], xf.acrit, turb, xf.vaccel, p.sccon, p.duxcon, p.gacon, p.gbcon, p.ctcon, p.ctrcon, p.ctrcex
+                "\n Xtr/c     ={:8.4}    top    side\n Xtr/c     ={:8.4}    bottom side\n NcritT    ={:8.2}   ({:6.3} % turb. level )\n NcritB    ={:8.2}   ({:6.3} % turb. level )\n Vacc      ={:8.4}\n WakeL/c   ={:8.3}\n\n Klag  ={:8.4}     Uxwt  ={:8.2}       Kdl ={:8.4}\n A     ={:8.4}     B     ={:8.4}       KCt ={:8.5}\n CtiniK={:8.4}     CtiniX={:8.4}",
+                xf.xstrip[1], xf.xstrip[2], xf.ncrit(1), turb(1), xf.ncrit(2), turb(2), xf.vaccel, xf.waklen,
+                p.sccon, p.duxcon, p.dlcon, p.gacon, p.gbcon, p.ctcon, p.ctrcon, p.ctrcex
             );
         };
         show(&self.xf);
@@ -824,7 +829,7 @@ impl Session {
             let lockmsg = || crate::outln!("\n * Polar is being accumulated.\n * Cannot change its parameters in midstream.");
             match com.as_str() {
                 "SHOW" => show(&self.xf),
-                "XTR" => {
+                "XTR" | "X" => {
                     if locked {
                         lockmsg();
                         continue;
@@ -844,9 +849,32 @@ impl Session {
                         continue;
                     }
                     self.xf.acrit = if !r.is_empty() { r[0] } else { self.input.askr("Enter critical amplification ratio^", self.xf.acrit) };
+                    self.xf.acrit_bot = None;
                     self.xf.lvconv = false;
                 }
-                "VACC" => {
+                "NT" => {
+                    if locked {
+                        lockmsg();
+                        continue;
+                    }
+                    // ACRIT(1) only: a bottom value that followed the top keeps its value
+                    self.xf.acrit_bot = Some(self.xf.ncrit(2));
+                    self.xf.acrit = if !r.is_empty() { r[0] } else { self.input.askr("Enter top-surface critical amplification^", self.xf.acrit) };
+                    self.xf.lvconv = false;
+                }
+                "NB" => {
+                    if locked {
+                        lockmsg();
+                        continue;
+                    }
+                    self.xf.acrit_bot = Some(if !r.is_empty() { r[0] } else { self.input.askr("Enter bot-surface critical amplification^", self.xf.ncrit(2)) });
+                    self.xf.lvconv = false;
+                }
+                "WAKE" | "W" => {
+                    let length = if !r.is_empty() { r[0] } else { self.input.askr("Enter wake length/chord^", self.xf.waklen) };
+                    self.xf.set_wake_length(length);
+                }
+                "VACC" | "V" => {
                     self.xf.vaccel = if !r.is_empty() { r[0] } else { self.input.askr("Enter viscous acceleration parameter^", self.xf.vaccel) };
                 }
                 "INIT" => {
@@ -867,11 +895,15 @@ impl Session {
                     if r.len() >= 2 {
                         p.sccon = r[0];
                         p.duxcon = r[1];
+                        // Preserve old two-argument scripts without an extra prompt.
+                        if let Some(&d) = r.get(2) { p.dlcon = d; }
                     } else {
                         let a = self.input.askr("Enter shear lag constant^", self.xf.bl.par.sccon);
                         let b = self.input.askr("Enter shear lag UxEQ weight^", self.xf.bl.par.duxcon);
                         self.xf.bl.par.sccon = a;
+                        let d = self.input.askr("Enter wake 1/dissipation-length factor^", self.xf.bl.par.dlcon);
                         self.xf.bl.par.duxcon = b;
+                        self.xf.bl.par.dlcon = d;
                     }
                 }
                 "GB" => {
@@ -916,7 +948,7 @@ impl Session {
                     }
                     self.xf.bl.par = crate::blsys::BlPar::default();
                 }
-                "?" => crate::outln!("\n   <cr>    Return to OPER menu\n   SHOW    Display viscous parameters\n   XTR  rr Change trip positions Xtr/c\n   N    r  Change critical amplification exponent Ncrit\n   VACC r  Change Newton solution acceleration parameter\n   INIT    BL initialization flag toggle\n\n   LAG     change lag equation constants\n   GB      change G-beta constants\n   CTR     change initial transition-Ctau constants\n   REST    restore BL calibration to baseline"),
+                "?" => crate::outln!("\n   <cr>    Return to OPER menu\n   SHOW    Display viscous parameters\n   Xtr  rr Change trip positions Xtr/c\n   N    r  Change critical amplification exponent Ncrit\n   NT   r  Change Ncrit on Top\n   NB   r  Change Ncrit on Bot\n   Vacc r  Change Newton solution acceleration parameter\n   Wake r  Change wake length/chord\n   INIT    BL initialization flag toggle\n\n   LAG     change lag equation constants\n   GB      change G-beta constants A,B\n   CTR     change initial transition-Ctau constants\n   REST    restore BL calibration to baseline"),
                 _ => crate::outln!(" {:<4} command not recognized.  Type a \"?\" for list", com),
             }
         }

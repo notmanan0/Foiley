@@ -1,4 +1,4 @@
-//! Foiley: a Rust port of Mark Drela's XFoil 6.97 subsonic airfoil
+//! Foiley: a Rust port of Mark Drela's XFoil 6.99 subsonic airfoil
 //! analysis code, with multithreading and SIMD-friendly kernels.
 
 // Style lints allowed crate-wide: this crate is a line-by-line port of the

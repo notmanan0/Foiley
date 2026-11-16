@@ -13,7 +13,7 @@ pub struct FoilPoint {
     pub cl: f64,
     /// total drag coefficient
     pub cd: f64,
-    /// pressure drag
+    /// Surface-integrated pressure drag in 6.99; CD-CDF in legacy 6.97.
     pub cdp: f64,
     /// friction drag
     pub cdf: f64,
@@ -22,6 +22,11 @@ pub struct FoilPoint {
     /// transition x/c, upper and lower surfaces
     pub xtr_top: f64,
     pub xtr_bot: f64,
+    /// Fractional surface panel indices of transition (zero if not recorded).
+    #[serde(default)]
+    pub itr_top: f64,
+    #[serde(default)]
+    pub itr_bot: f64,
     /// minimum pressure coefficient
     pub cpmin: f64,
     /// Reynolds and Mach number actually used (vary with CL for type 2/3)
@@ -72,6 +77,9 @@ pub struct FoilPolar {
     pub re: f64,
     pub mach: f64,
     pub ncrit: f64,
+    /// bottom-surface Ncrit when it differs from `ncrit`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ncrit_bot: Option<f64>,
     pub xtr_top: f64,
     pub xtr_bot: f64,
     pub viscous: bool,
@@ -113,17 +121,21 @@ impl FoilPolar {
     pub fn identity(&self) -> Hash32 {
         let settings = self.settings.as_ref().map(|s| {
             let mut s = s.clone();
-            // Retaining distributions does not change the solved polar.
+            // Retaining distributions does not change the solved polar, and
+            // a bottom Ncrit equal to the top one is no split at all.
             s.keep_details = false;
+            s.ncrit_bot = s.bottom_ncrit();
             s
         });
-        foiley_core::provenance::hash_json(
-            "foiley.polar2d.identity.v1",
-            &(&self.foil, self.foil_hash, self.polar_type, self.re, self.mach, self.ncrit, self.xtr_top, self.xtr_bot, self.viscous, self.flap_deg,
-                // Legacy/imported polars have no complete settings snapshot;
-                // preserve their independently named definitions.
-                self.settings.is_none().then_some(&self.name), settings),
-        )
+        let key = (&self.foil, self.foil_hash, self.polar_type, self.re, self.mach, self.ncrit, self.xtr_top, self.xtr_bot, self.viscous, self.flap_deg,
+            // Legacy/imported polars have no complete settings snapshot;
+            // preserve their independently named definitions.
+            self.settings.is_none().then_some(&self.name), settings);
+        // (a split Ncrit extends the key, so unsplit polars keep their identity)
+        match self.ncrit_bot.filter(|&n| n != self.ncrit) {
+            None => foiley_core::provenance::hash_json("foiley.polar2d.identity.v1", &key),
+            Some(n) => foiley_core::provenance::hash_json("foiley.polar2d.identity.v1", &(key, n)),
+        }
     }
 
     pub fn key(&self) -> (String, String) {
@@ -272,22 +284,23 @@ impl FoilPolar {
     /// XFoil-style polar text (readable by XFoil/xflr5 importers).
     pub fn to_xfoil_text(&self) -> String {
         let mut s = String::new();
-        s.push_str("\n       Foiley polar (XFoil 6.97 format)\n\n");
+        s.push_str("\n       Foiley polar (XFoil 6.99 format)\n\n");
         s.push_str(&format!(" Calculated polar for: {}\n\n", self.foil));
         s.push_str(&format!(" {} {} Reynolds number fixed          Mach number fixed\n\n", self.polar_type.min(3), self.polar_type.min(3)));
         s.push_str(&format!(" xtrf = {:7.3} (top) {:9.3} (bottom)\n", self.xtr_top, self.xtr_bot));
         s.push_str(&format!(
-            " Mach = {:7.3}     Re = {:9.3} e 6     Ncrit = {:7.3}\n\n",
+            " Mach = {:7.3}     Re = {:9.3} e 6     Ncrit = {:7.3} {:7.3}\n\n",
             self.mach,
             self.re / 1e6,
-            self.ncrit
+            self.ncrit,
+            self.ncrit_bot.unwrap_or(self.ncrit)
         ));
-        s.push_str("  alpha    CL        CD       CDp       CM     Top_Xtr  Bot_Xtr\n");
-        s.push_str(" ------ -------- --------- --------- -------- -------- --------\n");
+        s.push_str("  alpha    CL        CD       CDp       CM     Top_Xtr  Bot_Xtr  Top_Itr  Bot_Itr       CDf\n");
+        s.push_str(" ------ -------- --------- --------- -------- -------- -------- -------- -------- ---------\n");
         for p in &self.points {
             s.push_str(&format!(
-                " {:7.3}{:9.4}{:10.5}{:10.5}{:9.4}{:9.4}{:9.4}\n",
-                p.alpha, p.cl, p.cd, p.cdp, p.cm, p.xtr_top, p.xtr_bot
+                " {:7.3}{:9.4}{:10.5}{:10.5}{:9.4}{:9.4}{:9.4}{:9.4}{:9.4}{:10.5}\n",
+                p.alpha, p.cl, p.cd, p.cdp, p.cm, p.xtr_top, p.xtr_bot, p.itr_top, p.itr_bot, p.cdf
             ));
         }
         s
@@ -297,8 +310,17 @@ impl FoilPolar {
     pub fn from_xfoil_text(text: &str, foil_fallback: &str) -> Option<FoilPolar> {
         let mut pol = FoilPolar { polar_type: 1, viscous: true, ncrit: 9.0, xtr_top: 1.0, xtr_bot: 1.0, foil: foil_fallback.into(), ..Default::default() };
         let mut in_table = false;
+        let mut columns: Vec<&str> = Vec::new();
+        let mut version = 0.0;
         for line in text.lines() {
             let l = line.trim();
+            // "XFOIL   Version 6.99" or "Foiley polar (XFoil 6.99 format)"
+            if !in_table && (l.starts_with("XFOIL") || l.starts_with("Foiley polar")) {
+                version = l.split_whitespace().find_map(|t| t.parse::<f64>().ok()).unwrap_or(version);
+            }
+            if l.starts_with("alpha") {
+                columns = l.split_whitespace().collect();
+            }
             if let Some(r) = l.strip_prefix("Calculated polar for:") {
                 pol.foil = r.trim().to_string();
             }
@@ -315,6 +337,7 @@ impl FoilPolar {
                 }
                 if let Some(i) = t.iter().position(|v| *v == "Ncrit") {
                     pol.ncrit = t.get(i + 2).and_then(|v| v.parse().ok()).unwrap_or(9.0);
+                    pol.ncrit_bot = t.get(i + 3).and_then(|v| v.parse().ok()).filter(|&n: &f64| n != pol.ncrit);
                 }
             }
             if l.starts_with("xtrf") {
@@ -336,10 +359,14 @@ impl FoilPolar {
                         cl: v[1],
                         cd: v[2],
                         cdp: v[3],
-                        cdf: v[2] - v[3],
+                        // 6.99 CDp is integrated, not the residual CD-CDf:
+                        // friction is then unknown unless recorded (0)
+                        cdf: columns.iter().position(|c| *c == "CDf").and_then(|i| v.get(i)).copied().unwrap_or(if version >= 6.99 { 0.0 } else { v[2] - v[3] }),
                         cm: v[4],
                         xtr_top: *v.get(5).unwrap_or(&1.0),
                         xtr_bot: *v.get(6).unwrap_or(&1.0),
+                        itr_top: columns.iter().position(|c| *c == "Top_Itr").and_then(|i| v.get(i)).copied().unwrap_or(0.0),
+                        itr_bot: columns.iter().position(|c| *c == "Bot_Itr").and_then(|i| v.get(i)).copied().unwrap_or(0.0),
                         re: pol.re,
                         mach: pol.mach,
                         ..Default::default()
@@ -367,6 +394,8 @@ pub fn lerp_point(a: &FoilPoint, b: &FoilPoint, t: f64) -> FoilPoint {
         cm: l(a.cm, b.cm),
         xtr_top: l(a.xtr_top, b.xtr_top),
         xtr_bot: l(a.xtr_bot, b.xtr_bot),
+        itr_top: l(a.itr_top, b.itr_top),
+        itr_bot: l(a.itr_bot, b.itr_bot),
         cpmin: l(a.cpmin, b.cpmin),
         re: l(a.re, b.re),
         mach: l(a.mach, b.mach),

@@ -889,7 +889,10 @@ impl XFoil {
         if self.verbose {
             crate::outln!(" Calculating wake trajectory ...");
         }
-        self.nw = n / 8 + 2;
+        self.nw = match self.solver_version {
+            crate::xfoil::SolverVersion::Xfoil697 => n / 8 + 2,
+            crate::xfoil::SolverVersion::Xfoil699 => n / 12 + 10 * self.waklen.trunc() as usize,
+        };
         if self.nw > crate::xfoil::IWX {
             self.nw = crate::xfoil::IWX;
         }
@@ -1234,18 +1237,18 @@ pub fn ncalc(x: &[f64], y: &[f64], s: &[f64], n: usize, xn: &mut [f64], yn: &mut
         let sx = yn[i];
         let sy = -xn[i];
         let smod = (sx * sx + sy * sy).sqrt();
-        xn[i] = sx / smod;
-        yn[i] = sy / smod;
+        xn[i] = if smod == 0.0 { -1.0 } else { sx / smod };
+        yn[i] = if smod == 0.0 { 0.0 } else { sy / smod };
     }
     for i in 1..n {
         if s[i] == s[i + 1] {
             let sx = 0.5 * (xn[i] + xn[i + 1]);
             let sy = 0.5 * (yn[i] + yn[i + 1]);
             let smod = (sx * sx + sy * sy).sqrt();
-            xn[i] = sx / smod;
-            yn[i] = sy / smod;
-            xn[i + 1] = sx / smod;
-            yn[i + 1] = sy / smod;
+            xn[i] = if smod == 0.0 { -1.0 } else { sx / smod };
+            yn[i] = if smod == 0.0 { 0.0 } else { sy / smod };
+            xn[i + 1] = xn[i];
+            yn[i + 1] = yn[i];
         }
     }
 }

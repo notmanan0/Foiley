@@ -29,7 +29,7 @@ mimalloc = { version = "0.1.52", default-features = false }
 name = "foiley"
 version = "0.1.0-dev.1"
 edition = "2021"
-description = "Rust port of XFoil 6.97 with multithreading and SIMD (2D engine of Foiley)"
+description = "Rust port of XFoil 6.99 with multithreading and SIMD (2D engine of Foiley)"
 license = "GPL-2.0-or-later"
 autobins = false
 

@@ -320,6 +320,7 @@ const GDES_HELP: &str = "
 
    CORN     Double point with cursor (set sharp corner)
    ADDP     Add    point with cursor or keyboard x,y
+   NMOV r   Move all points in surface-normal direction
    MOVP     Move   point with cursor or keyboard x,y
    DELP     Delete point with cursor
 
@@ -593,6 +594,21 @@ pub fn gdes(s: &mut Session) {
             }
             "CPLO" => pltcrv(s),
             "FLAP" | "F" => flap(s, rinput, ninput),
+            "NMOV" => {
+                let distance = if ninput >= 1 { rinput[1] } else { s.input.askr("Enter normal movement (+ outward)^", 0.0) };
+                if !distance.is_finite() { crate::outln!(" Distance must be finite"); continue; }
+                let xf = &mut s.xf;
+                for i in 1..=xf.nb {
+                    let length = xf.xbp[i].hypot(xf.ybp[i]);
+                    if length != 0.0 {
+                        xf.xb[i] += xf.ybp[i] / length * distance;
+                        xf.yb[i] -= xf.xbp[i] / length * distance;
+                    }
+                }
+                bupdate(xf);
+                xf.lgsame = false;
+                plotg(s);
+            }
             "MODI" | "M" => cursor_note(&comand),
             "SLOP" => {
                 s.gdes_state.lgslop = !s.gdes_state.lgslop;
@@ -1649,7 +1665,8 @@ const CAMB_HELP: &str = "
    TFAC rr Scale existing thickness and camber
    TSET rr Set new thickness and camber
    HIGH rr Move camber and thickness highpoints
-   WRTC    Write airfoil camber x/c,y/c to file
+   WRTT f  Write airfoil thickness x/c,t/c,slope to file
+   WRTC f  Write airfoil camber x/c,y/c to file
 
    RDAC    Read   added camber  x/c,y/c from file
    SETC    Set    added camber  x/c,y/c from camberline
@@ -1870,8 +1887,10 @@ fn camb(s: &mut Session) {
                 hipnt(s, rinput, ninput);
                 stage = 100;
             }
-            "WRTC" => {
-                let fname = s.input.ask("Enter output camber filename^").trim().to_string();
+            "WRTC" | "WRTT" => {
+                let thickness = comand == "WRTT";
+                let what = if thickness { "thickness" } else { "camber" };
+                let fname = if comarg.trim().is_empty() { s.input.ask(&format!("Enter output {what} filename^")).trim().to_string() } else { comarg.trim().to_string() };
                 if s.input.eof {
                     return;
                 }
@@ -1880,21 +1899,26 @@ fn camb(s: &mut Session) {
                     crate::outln!(" Output file exists.  Overwrite?  Y");
                     let ans = s.input.ask("");
                     if ans.starts_with(['N', 'n']) {
-                        crate::outln!(" Current camber not saved.");
+                        crate::outln!(" Current {what} not saved.");
                         continue;
                     }
                 }
                 let st = &s.gdes_state;
-                let mut txt = format!("Camber: {}\n", fixed(&s.xf.name, 48));
-                for k in 1..=st.ncm {
-                    txt += &format!(
-                        " {} {}\n",
-                        f_fmt((st.xcm[k] - st.xcm[1]) / xbch, 12, 6),
-                        f_fmt((st.ycm[k] - st.ycm[1]) / xbch, 12, 6)
-                    );
+                let g = |v: f64| crate::fmt::g_fmt(v, 15, 7);
+                let mut txt = format!("{}: {}\n", if thickness { "Thickness" } else { "Camber" }, fixed(&s.xf.name, 48));
+                let (xs, ys, count) = if thickness { (&st.xtk, &st.ytk, st.ntk) } else { (&st.xcm, &st.ycm, st.ncm) };
+                // FORMAT(1X, 3G15.7); WRTT adds the slope dy/dx
+                for k in 1..=count {
+                    txt += &format!(" {}{}", g((xs[k] - xs[1]) / xbch), g((ys[k] - ys[1]) / xbch));
+                    if thickness {
+                        let km = k.saturating_sub(1).max(1);
+                        let kp = (k + 1).min(count);
+                        txt += &g((ys[kp] - ys[km]) / (xs[kp] - xs[km]));
+                    }
+                    txt.push('\n');
                 }
                 if std::fs::write(&fname, txt).is_err() {
-                    crate::outln!(" Error opening camber save file");
+                    crate::outln!(" Error opening {what} save file");
                 }
             }
             "RDAC" => {
