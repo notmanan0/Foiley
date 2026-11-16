@@ -762,31 +762,24 @@ pub fn sortdup(kk: usize, s: &mut [f64], w: &mut [f64]) {
 
 /// FIXDUP: remove leading/trailing duplicates and triple duplicates.
 pub fn fixdup(kk: &mut usize, s: &mut [f64], w: &mut [f64]) {
-    if s[2] == s[1] {
-        for n in 1..*kk {
-            s[n] = s[n + 1];
-            w[n] = w[n + 1];
+    loop {
+        if *kk <= 1 { return; }
+        if s[2] == s[1] {
+            for n in 1..*kk { s[n] = s[n + 1]; w[n] = w[n + 1]; }
+            *kk -= 1;
+            continue;
         }
-        *kk -= 1;
-    }
-    if s[*kk] == s[*kk - 1] {
-        s[*kk - 1] = s[*kk];
-        w[*kk - 1] = w[*kk];
-        *kk -= 1;
-    }
-    'again: loop {
-        let k = *kk;
-        for n in 1..=k.saturating_sub(2) {
-            if s[n] == s[n + 1] && s[n] == s[n + 2] {
-                for i in n..k {
-                    s[i] = s[i + 1];
-                    w[i] = w[i + 1];
-                }
-                *kk -= 1;
-                continue 'again;
-            }
+        if s[*kk] == s[*kk - 1] {
+            w[*kk - 1] = w[*kk];
+            *kk -= 1;
+            continue;
         }
-        break;
+        let duplicate = (1..=kk.saturating_sub(2))
+            .find(|&n| s[n] == s[n + 1] && s[n] == s[n + 2]);
+        if let Some(n) = duplicate {
+            for i in n..*kk { s[i] = s[i + 1]; w[i] = w[i + 1]; }
+            *kk -= 1;
+        } else { return; }
     }
 }
 
@@ -815,8 +808,9 @@ pub fn getcam(
     let yl = seval(sl, y, yp, s, n);
     for i in 1..=n {
         let sopp = sopps(s[i], x, xp, y, yp, s, n, sl);
-        let xopp = seval(sopp, x, xp, s, n);
-        let yopp = seval(sopp, y, yp, s, n);
+        let (xopp, yopp) = if i == 1 { (x[n], y[n]) }
+            else if i == n { (x[1], y[1]) }
+            else { (seval(sopp, x, xp, s, n), seval(sopp, y, yp, s, n)) };
         xcm[i] = 0.5 * (x[i] + xopp);
         ycm[i] = 0.5 * (y[i] + yopp);
         xtk[i] = 0.5 * (x[i] + xopp);

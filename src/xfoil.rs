@@ -6,7 +6,21 @@
 
 use crate::blsys::BlSys;
 
-pub const IQX: usize = 360;
+/// Numerical conventions used for wake discretization and reported pressure drag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SolverVersion {
+    Xfoil697,
+    #[default]
+    Xfoil699,
+}
+
+impl SolverVersion {
+    pub fn number(self) -> f64 {
+        match self { Self::Xfoil697 => 6.97, Self::Xfoil699 => 6.99 }
+    }
+}
+
+pub const IQX: usize = 370;
 pub const IWX: usize = IQX / 8 + 2;
 pub const IBX: usize = 4 * IQX;
 pub const IZX: usize = IQX + IWX;
@@ -114,6 +128,7 @@ fn v3(n: usize) -> [Vec<f64>; 3] {
 /// Complete solver state.
 #[derive(Clone, Debug)]
 pub struct XFoil {
+    pub solver_version: SolverVersion,
     pub name: String,
     pub prefix: String,
     pub ispars: String,
@@ -296,7 +311,11 @@ pub struct XFoil {
     pub reinf1: f64,
     pub reinf: f64,
     pub reinf_cl: f64,
+    /// Top Ncrit; also used on the bottom unless overridden.
     pub acrit: f64,
+    pub acrit_bot: Option<f64>,
+    /// Fractional surface panel indices of transition (TINDEX).
+    pub tindex: [f64; 3],
     pub xstrip: [f64; 3],
     pub xoctr: [f64; 3],
     pub yoctr: [f64; 3],
@@ -354,8 +373,27 @@ impl Default for XFoil {
 }
 
 impl XFoil {
+    pub fn ncrit(&self, side: usize) -> f64 {
+        if side == 2 { self.acrit_bot.unwrap_or(self.acrit) } else { self.acrit }
+    }
+
+    /// Changing wake length invalidates every geometry-dependent BL mapping.
+    pub fn set_wake_length(&mut self, length: f64) -> Result<(), &'static str> {
+        if !length.is_finite() || !(1.0..=20.0).contains(&length) {
+            return Err("wake length/chord must be between 1 and 20");
+        }
+        self.waklen = length;
+        self.lwake = false;
+        self.lblini = false;
+        self.lvconv = false;
+        self.lipan = false;
+        self.lwdij = false;
+        Ok(())
+    }
+
     pub fn new() -> Self {
         let mut xf = XFoil {
+            solver_version: SolverVersion::default(),
             name: String::new(),
             prefix: String::new(),
             ispars: " -2.0  3.0  -2.5  3.5".to_string(),
@@ -519,6 +557,8 @@ impl XFoil {
             reinf: 0.0,
             reinf_cl: 0.0,
             acrit: 9.0,
+            acrit_bot: None,
+            tindex: [0.0; 3],
             xstrip: [0.0, 1.0, 1.0],
             xoctr: [0.0, 1.0, 1.0],
             yoctr: [0.0; 3],
@@ -887,10 +927,12 @@ impl XFoil {
                     );
                 }
             }
-            self.cdp = self.cd - self.cdf;
+            if self.solver_version == SolverVersion::Xfoil697 {
+                self.cdp = self.cd - self.cdf;
+            }
             if self.verbose {
                 crate::outln!("       a ={:7.3}      CL ={:8.4}", self.alfa / DTOR, self.cl);
-                crate::outln!("      Cm ={:8.4}     CD ={:9.5}   =>   CDf ={:9.5}    CDp ={:9.5}", self.cm, self.cd, self.cdf, self.cdp);
+                crate::outln!("      Cm ={:8.4}     CD ={:9.5}   =>   CDf ={:9.5}    CDp ={:9.5}", self.cm, self.cd, self.cdf, self.cd - self.cdf);
             }
             if self.rmsbl < EPS1 {
                 self.lvconv = true;

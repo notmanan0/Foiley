@@ -86,7 +86,7 @@ fn defaults(s: &Session, nside: [usize; 3], numbl: [usize; 3]) -> Lim {
     let qrf = xf.qinf;
     let yfac = scalit1(dismax / qrf.powi(3));
     y[6] = [0.0, 0.5 / yfac, (0.5 / yfac) / 5.0];
-    let acr1 = (xf.acrit + 1.5).max(1.0);
+    let acr1 = (xf.acrit.max(xf.ncrit(2)) + 1.5).max(1.0);
     let yfac = scalit1(acr1);
     let andel = 1.0 / (5.0 * yfac);
     y[7] = [0.0, andel * (acr1 / andel + 0.6).trunc(), andel];
@@ -166,7 +166,7 @@ pub fn blplot(s: &mut Session) {
         let xf = &s.xf;
         for is in 1..=2 {
             for ibl in 2..=xf.nbl[is] {
-                xxbl[is][ibl] = xf.x[xf.ipan[is][ibl]];
+                xxbl[is][ibl] = if s.extra_state.bl_plot_s { xf.xssi[is][ibl] } else { xf.x[xf.ipan[is][ibl]] };
             }
         }
         for iblw in 1..=xf.nbl[2].saturating_sub(xf.iblte[2]) {
@@ -184,6 +184,17 @@ pub fn blplot(s: &mut Session) {
         let set_plot = |k: usize, lim: &Lim| (lim.y[k][0], lim.y[k][1], lim.y[k][2]);
         let plot_k = match com.as_str() {
             "" => return,
+            "XPLO" => {
+                s.extra_state.bl_plot_s = !s.extra_state.bl_plot_s;
+                for is in 1..=2 {
+                    for ibl in 2..=nside[is] {
+                        let (js, jbl) = if is == 1 && ibl > s.xf.iblte[1] { (2, s.xf.iblte[2] + ibl - s.xf.iblte[1]) } else { (is, ibl) };
+                        xxbl[is][ibl] = if s.extra_state.bl_plot_s { s.xf.xssi[js][jbl] } else { s.xf.x[s.xf.ipan[js][jbl]] };
+                    }
+                }
+                crate::outln!(" BL coordinate: {}", if s.extra_state.bl_plot_s { "s" } else { "x" });
+                0
+            }
             "?" => {
                 crate::outln!("\n   <cr>   Return to OPER menu\n\n   H      Plot kinematic shape parameter\n   DT     Plot top    side Dstar and Theta\n   DB     Plot bottom side Dstar and Theta\n   UE     Plot edge velocity\n   CF     Plot skin friction coefficient\n   CD     Plot dissipation coefficient\n   N      Plot amplification ratio\n   CT     Plot max shear coefficient\n   RT     Plot Re_theta\n   RTL    Plot log(Re_theta)\n\n   DUMP f Write current plot variable to file\n   OVER f Overlay current plot variable from file\n\n   X  rrr Change x-axis limits\n   Y  rrr Change y-axis limits on current plot\n\n   BLOW   Cursor blowup of current plot\n   RESE   Reset to default x,y-axis limits\n   SIZE r Change absolute plot-object size\n  .ANNO   Annotate plot\n   HARD   Hardcopy current plot\n\n   GRID   Toggle grid plotting\n   SYMB   Toggle node-symbol plotting\n   LABE   Toggle label plotting\n   CLIP   Toggle line-plot clipping\n   FRPL   Toggle TS frequency plotting");
                 0
@@ -383,7 +394,7 @@ fn dump(s: &mut Session, kplot: usize, fname: &str, xxbl: &[Vec<f64>; 3], nside:
     out += &format!("#  Reyn  ={}\n", i_fmt((xf.reinf + 0.5).trunc() as i64, 9));
     out += &format!("#  Ncrit ={}\n", f_fmt(xf.acrit, 9, 4));
     out += "#\n";
-    out += &format!("#    x           {}\n", FILSUF[kplot]);
+    out += &format!("#    {}           {}\n", if s.extra_state.bl_plot_s { "s" } else { "x" }, FILSUF[kplot]);
     let mut ibl1 = [0usize, 2, 2];
     let mut ibl2 = [0usize, nside[1], nside[2]];
     let mut ws = [vec![0.0; IVX + 2], vec![0.0; IVX + 2], vec![0.0; IVX + 2]];

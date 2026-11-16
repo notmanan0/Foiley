@@ -23,7 +23,9 @@ pub const IPTOT: usize = 14;
 
 pub const JTP: usize = 1;
 pub const JTN: usize = 2;
-pub const JPTOT: usize = 2;
+pub const JNC: usize = 3;
+pub const JTI: usize = 4;
+pub const JPTOT: usize = 4;
 
 /// array limits from XFOIL.INC
 pub const NAX: usize = 800;
@@ -52,10 +54,10 @@ pub const CPOLFORM: [(char, usize, usize); IPTOT + 1] = [
     ('F', 9, 5),
 ];
 
-pub const CPOLSNAME: [&str; JPTOT + 1] = ["", "Xtrip", "Xtr"];
-pub const CPOLSFORM: [(char, usize, usize); JPTOT + 1] = [('F', 0, 0), ('F', 9, 4), ('F', 9, 4)];
+pub const CPOLSNAME: [&str; JPTOT + 1] = ["", "Xtrip", "Xtr", "Ncrit", "Itr"];
+pub const CPOLSFORM: [(char, usize, usize); JPTOT + 1] = [('F', 0, 0), ('F', 9, 4), ('F', 9, 4), ('F', 7, 3), ('F', 9, 4)];
 
-pub const VERSION: f64 = 6.97;
+pub const VERSION: f64 = 6.99;
 
 fn fmt_val(kind: char, w: usize, d: usize, v: f64) -> String {
     if kind == 'E' {
@@ -77,6 +79,9 @@ pub struct PolarPoint {
     pub mach: f64,
     pub re: f64,
     pub ncrit: f64,
+    pub ncrit_bot: f64,
+    pub itr_top: f64,
+    pub itr_bot: f64,
     pub xtr_top: f64,
     pub xtr_bot: f64,
     pub xtrip_top: f64,
@@ -101,6 +106,7 @@ pub struct Polar {
     pub reyn: f64,
     pub mach: f64,
     pub acrit: f64,
+    pub acrit_bot: Option<f64>,
     /// XSTRIPP(1..2) (index 0 unused)
     pub xstrip: [f64; 3],
     pub ptrat: f64,
@@ -128,6 +134,7 @@ impl Default for Polar {
             reyn: 0.0,
             mach: 0.0,
             acrit: 0.0,
+            acrit_bot: None,
             xstrip: [0.0; 3],
             ptrat: 0.0,
             etap: 0.0,
@@ -200,7 +207,7 @@ pub fn polwrit(
             " Mach = {}     Re = {} e 6     Ncrit = {}\n",
             f_fmt(pol.mach, 7, 3),
             f_fmt(pol.reyn / 1.0e6, 9, 3),
-            f_fmt(pol.acrit, 7, 3)
+            if version >= 6.99 { format!("{}{}", f_fmt(pol.acrit, 7, 3), f_fmt(pol.acrit_bot.unwrap_or(pol.acrit), 7, 3)) } else { f_fmt(pol.acrit, 7, 3) }
         ));
         if pol.ptrat != 0.0 {
             out.push_str(&format!(" pi_p = {}     eta_p = {}\n", f_fmt(pol.ptrat, 7, 4), f_fmt(pol.etap, 9, 4)));
@@ -491,8 +498,11 @@ pub fn polread(txt: &str, pol: &mut Polar) -> bool {
             }
             let k = index(&line, "Ncrit =");
             if k != 0 {
-                if let Some(v) = list_real1(&substr(&line, k + 7, 128)) {
-                    pol.acrit = v;
+                if let Some(v) = crate::geom::getflt(&substr(&line, k + 7, 128), 2) {
+                    if let Some(&top) = v.first() {
+                        pol.acrit = top;
+                        pol.acrit_bot = v.get(1).copied();
+                    }
                 }
                 ldlab = false;
             }
@@ -523,6 +533,13 @@ pub fn polread(txt: &str, pol: &mut Polar) -> bool {
                     let k1 = index(&line, &format!("Bot {}", CPOLSNAME[jp]));
                     let k2 = index(&line, &format!("Bot_{}", CPOLSNAME[jp]));
                     itmp0[IPTOT + jp + JPTOT] = k1.max(k2);
+                    if jp == JTN {
+                        if itmp0[IPTOT + jp] == index(&line, "Top_Xtrip") || itmp0[IPTOT + jp] == index(&line, "Top Xtrip") { itmp0[IPTOT + jp] = 0; }
+                        if itmp0[IPTOT + jp + JPTOT] == index(&line, "Bot_Xtrip") || itmp0[IPTOT + jp + JPTOT] == index(&line, "Bot Xtrip") { itmp0[IPTOT + jp + JPTOT] = 0; }
+                    }
+                }
+                if line.contains("Top_Ncrit") || line.contains("Top Ncrit") {
+                    itmp0[INC] = 0;
                 }
                 let mut itmp = itmp0.clone();
                 for _ in 1..=nt {
@@ -580,24 +597,10 @@ pub fn polread(txt: &str, pol: &mut Polar) -> bool {
             // (the Fortran tests IPOL(KP)/ISPOL(1,KP) against the parameter
             //  indices; for XFoil-written files Re/Mach/Ncrit/trip come from
             //  the header)
-            let mut lire = false;
-            let mut lima = false;
-            let mut linc = false;
-            let mut ljtp = false;
-            for kp in 1..=nipol.min(IPTOT) {
-                if ipol[kp] == IRE {
-                    lire = true;
-                }
-                if ipol[kp] == IMA {
-                    lima = true;
-                }
-                if ipol[kp] == INC {
-                    linc = true;
-                }
-                if kp <= JPTOT && ispol[1][kp] == JTP {
-                    ljtp = true;
-                }
-            }
+            let lire = ipol[IRE] != 0;
+            let lima = ipol[IMA] != 0;
+            let linc = ipol[INC] != 0;
+            let ljtp = ispol[1][JTP] != 0;
             if !lire {
                 match pol.retyp {
                     1 => row[IRE] = pol.reyn,
@@ -617,6 +620,8 @@ pub fn polread(txt: &str, pol: &mut Polar) -> bool {
             if !linc {
                 row[INC] = pol.acrit;
             }
+            if ispol[1][JNC] == 0 { sd[JNC][1] = pol.acrit; }
+            if ispol[2][JNC] == 0 { sd[JNC][2] = pol.acrit_bot.unwrap_or(pol.acrit); }
             if !ljtp {
                 sd[JTP][1] = pol.xstrip[1];
                 sd[JTP][2] = pol.xstrip[2];
@@ -708,6 +713,12 @@ impl ListReader {
         }
         (toks, slash)
     }
+    pub fn read_record_tokens(&mut self) -> ListRead<Vec<String>> {
+        let Some(line) = self.lines.get(self.pos) else { return ListRead::Eof; };
+        self.pos += 1;
+        ListRead::Ok(Self::tokens(line.split('|').next().unwrap_or(line)).0)
+    }
+
     /// Read n tokens (as strings) starting at the next record.
     pub fn read_tokens(&mut self, n: usize) -> ListRead<Vec<String>> {
         let mut out = Vec::new();

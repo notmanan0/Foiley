@@ -484,7 +484,11 @@ impl App {
                         self.fui.preview = Some(f);
                         self.notify(format!("{title}: new foil ready (orange preview) - CL {:.3}", d.cl), false);
                     }
-                    None => self.fui.qdist = Some(d),
+                    None => {
+                        self.fui.qdist = Some(d);
+                        self.fui.inv_target = None;
+                        self.fui.inv_drag = None;
+                    },
                 }
             }
             (Pending::Optimise, JobOutput::Optimise(r)) => {

@@ -8,6 +8,24 @@ fn ncrit(n: f64) -> FamilySelector {
     FamilySelector { ncrit: Some(n), ..Default::default() }
 }
 
+#[test]
+fn bottom_ncrit_and_solver_calibration_form_distinct_families() {
+    let f = naca0012();
+    let mut db = db_with(&f);
+    let mut p = synth_polar(&f.name, "base", 1e6, 9.0, 0.01);
+    db.add_polar(&p);
+    p.ncrit_bot = Some(5.0);
+    db.add_polar(&p);
+    p.settings = Some(foiley_foil::AnalysisSettings::default());
+    db.add_polar(&p);
+    p.settings.as_mut().unwrap().wake_length = 2.5;
+    db.add_polar(&p);
+    assert_eq!(db.families_of(&f.name).len(), 4);
+    assert!(db.resolve(&f.name, &ncrit(9.0)).is_err());
+    let chosen = FamilySelector { ncrit_bot: Some(9.0), ..ncrit(9.0) };
+    assert!(db.resolve(&f.name, &chosen).unwrap().is_some());
+}
+
 /// Two families (Ncrit 9 and 5) at the same Re: the selected family decides,
 /// never the order in which the polars were added.
 #[test]

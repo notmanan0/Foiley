@@ -7,7 +7,7 @@
 Airfoil, wing and plane design and analysis in Rust. It covers the
 xflr5 / flow5 workflow:
 
-* **2D:** XFoil 6.97, ported line by line. Measured against the double-precision Fortran on a 48-case raw-bit corpus (`tests/f015.rs`): the same points, boundary-layer stations and transition stations, and values within 1.5e-5 of each quantity's scale (CL within 4.5e-7), but not the same bits.
+* **2D:** XFoil 6.99 wake, transition and polar behavior, with selectable 6.97 numerical conventions. Six committed 6.99 Fortran polar fixtures run in CI; the optional 51-case raw-array audit reports the remaining convergence and rounding differences. See [the upgrade and validation notes](docs/xfoil-6.99.md).
 * **3D:** LLT, VLM1/VLM2 and a 3D panel method.
 * **Flight dynamics:** stability analysis.
 
@@ -72,7 +72,7 @@ Use `cargo build --profile dist` for a fully optimised (fat LTO) release.
 
 | crate | contents |
 |---|---|
-| `foiley` (repo root, `src/`) | the XFoil 6.97 engine: panel method, boundary layer, Newton solver, GDES/QDES/MDES. Results agree with the Fortran to ~1e-5 of each quantity's scale (F015 matrix); Foiley's pipelined, fine-parallel, scalar and AVX2 paths are bit-identical to its own sequential run. |
+| `foiley` (repo root, `src/`) | the XFoil 6.99 engine (with 6.97 compatibility): panel method, boundary layer, Newton solver, GDES/QDES/MDES. The upgrade notes distinguish fixture coverage from raw-array audit limits; Foiley's pipelined, fine-parallel, scalar and AVX2 paths are bit-identical to its own sequential run. |
 | `crates/core` | `Vec3`, progress and cancellation handles, dense LU and eigenvalues (faer, multithreaded), interpolation, ISA atmosphere |
 | `crates/foil` | `Foil` geometry and file I/O (Selig and Lednicer .dat), NACA 4/5 digit, every XFoil design operation as a function, inverse design (QDES/MDES), the optimiser (MOPSO/GA), the 2D analysis service with convergence recovery, polar types 1/2/3/4/6, batch polar meshes |
 | `crates/plane` | plane/wing/fuselage model (elliptic, NURBS, STL/STEP), reference dimensions, inertia, meshing (thin and thick, quads or triangles, flaps, tips, fuselage), LLT, VLM1, VLM2 with optional free wake, source/doublet panel methods, polar types T1 to T8, trim, stability and control derivatives, modes, time responses, XML/AVL/STL exchange |

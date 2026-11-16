@@ -20,7 +20,10 @@ use crate::foil::{node_hash, Foil, NodeInput};
 use crate::polar::{FoilPoint, FoilPolar};
 use crate::FoilError;
 use foiley::sweep::{polar_point, solve_point};
+pub use foiley::xfoil::SolverVersion;
 use foiley::xfoil::{XFoil, DTOR};
+
+fn legacy_solver_version() -> SolverVersion { SolverVersion::Xfoil697 }
 use foiley_core::Progress;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -114,6 +117,15 @@ pub struct AnalysisSettings {
     pub mach: f64,
     /// e^N transition criterion (9 = average wind tunnel, 11-12 = quiet free air, 4-6 = turbulent)
     pub ncrit: f64,
+    /// Bottom Ncrit; None follows ncrit on both surfaces (legacy files).
+    pub ncrit_bot: Option<f64>,
+    /// New runs use 6.99; settings saved before this field reproduce 6.97.
+    #[serde(default = "legacy_solver_version")]
+    pub solver_version: SolverVersion,
+    /// Wake length in chord lengths.
+    pub wake_length: f64,
+    /// Wake inverse dissipation-length factor (VPAR LAG's third constant).
+    pub wake_dissipation: f64,
     /// forced transition (trip) location x/c, upper surface (1 = free)
     pub xtr_top: f64,
     /// forced transition location x/c, lower surface (1 = free)
@@ -153,6 +165,10 @@ impl Default for AnalysisSettings {
             re: 1.0e6,
             mach: 0.0,
             ncrit: 9.0,
+            ncrit_bot: None,
+            solver_version: SolverVersion::Xfoil699,
+            wake_length: 1.0,
+            wake_dissipation: 0.9,
             xtr_top: 1.0,
             xtr_bot: 1.0,
             viscous: true,
@@ -183,6 +199,9 @@ impl AnalysisSettings {
         if !(0.1..=20.0).contains(&self.ncrit) {
             return Err(format!("Ncrit {} should be between 0.1 and 20 (9 is the usual value)", self.ncrit));
         }
+        if self.ncrit_bot.is_some_and(|n| !(0.1..=20.0).contains(&n)) { return Err("bottom Ncrit must be between 0.1 and 20".into()); }
+        if !self.wake_length.is_finite() || !(1.0..=20.0).contains(&self.wake_length) { return Err("wake length/chord must be between 1 and 20".into()); }
+        if !self.wake_dissipation.is_finite() || !(0.01..=10.0).contains(&self.wake_dissipation) { return Err("wake dissipation factor must be between 0.01 and 10".into()); }
         for (n, v) in [("top", self.xtr_top), ("bottom", self.xtr_bot)] {
             if !(0.0..=1.0).contains(&v) {
                 return Err(format!("forced transition {n} x/c = {v} must be between 0 and 1"));
@@ -204,6 +223,7 @@ impl AnalysisSettings {
         };
         if self.viscous {
             s.push_str(&format!("_N{:.1}", self.ncrit));
+            if let Some(n) = self.ncrit_bot { s.push_str(&format!("_NB{n:.1}")); }
             if self.xtr_top < 1.0 || self.xtr_bot < 1.0 {
                 s.push_str(&format!("_trip{:.2}-{:.2}", self.xtr_top, self.xtr_bot));
             }
@@ -291,6 +311,10 @@ fn setup_engine(foil: &Foil, st: &AnalysisSettings, re: f64) -> Result<XFoil, Fo
     xf.reinf1 = re;
     xf.minf1 = st.mach;
     xf.acrit = st.ncrit;
+    xf.acrit_bot = st.ncrit_bot;
+    xf.solver_version = st.solver_version;
+    xf.set_wake_length(st.wake_length).map_err(|e| FoilError::Geometry(e.into()))?;
+    xf.bl.par.dlcon = st.wake_dissipation;
     xf.xstrip[1] = st.xtr_top;
     xf.xstrip[2] = st.xtr_bot;
     xf.itmax = st.max_iter;
@@ -340,6 +364,8 @@ fn to_foil_point(xf: &XFoil, q: &foiley::polar::PolarPoint) -> FoilPoint {
         cm: q.cm,
         xtr_top: if xf.lvisc { q.xtr_top } else { 1.0 },
         xtr_bot: if xf.lvisc { q.xtr_bot } else { 1.0 },
+        itr_top: q.itr_top,
+        itr_bot: q.itr_bot,
         cpmin: q.cpmin,
         re: if xf.lvisc { xf.reinf } else { 0.0 },
         mach: xf.minf,
@@ -519,6 +545,7 @@ pub fn analyze(foil: &Foil, st: &AnalysisSettings, sweep: &Sweep, prog: &Progres
         re: st.re,
         mach: st.mach,
         ncrit: st.ncrit,
+        ncrit_bot: st.ncrit_bot,
         xtr_top: st.xtr_top,
         xtr_bot: st.xtr_bot,
         viscous: st.viscous,

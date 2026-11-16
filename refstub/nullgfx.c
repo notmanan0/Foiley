@@ -5,6 +5,7 @@ void gwxwinopen_(void){}
 void gwxclear_(void){}
 void gwxline_(void){}
 void gwxcurs_(void){}
+void gwxcursc_(void){}
 void gwxrevflag_(void){}
 void gwxresize_(void){}
 void gwxclose_(void){}

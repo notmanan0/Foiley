@@ -191,7 +191,7 @@ impl Session {
     pub fn banner() {
         crate::outln!();
         crate::outln!(" ===================================================");
-        crate::outln!("  FOILEY (XFOIL 6.97 compatible, Rust port)");
+        crate::outln!("  FOILEY (XFOIL 6.99 compatible, Rust port)");
         crate::outln!("  Multithreaded + SIMD panel/BL solver");
         crate::outln!(" ===================================================");
     }
@@ -213,6 +213,14 @@ impl Session {
                 "" => {}
                 "?" => self.help_top(),
                 "QUIT" | "Q" => break,
+                "VERS" => {
+                    match r.first().copied() {
+                        Some(6.97) => self.xf.solver_version = crate::xfoil::SolverVersion::Xfoil697,
+                        Some(6.99) => self.xf.solver_version = crate::xfoil::SolverVersion::Xfoil699,
+                        _ => { crate::outln!(" Expected VERS 6.97 or VERS 6.99"); continue; }
+                    }
+                    let _ = self.xf.set_wake_length(self.xf.waklen);
+                }
                 "OPER" => self.oper(),
                 "NACA" => {
                     let ides = if !i.is_empty() { i[0] } else { self.input.aski("Enter NACA 4 or 5-digit airfoil designation^", 0) };
@@ -757,6 +765,7 @@ impl Session {
         if parallel {
             let pts = crate::sweep::run_parallel(&mut xf, lalfa, &specs, itmaxs, jobs, |_, _| {});
             self.xf = xf;
+            let keep_tindex = self.xf.tindex;
             // the replayed points carry coefficients, not their BL arrays
             #[cfg(feature = "rawdump")]
             crate::rawdump::set_bl_live(false);
@@ -780,6 +789,8 @@ impl Session {
                     }
                     x.xoctr[1] = q.xtr_top;
                     x.xoctr[2] = q.xtr_bot;
+                    x.tindex[1] = q.itr_top;
+                    x.tindex[2] = q.itr_bot;
                     x.cpmn = q.cpmin;
                     x.lvconv = p.converged;
                 }
@@ -790,6 +801,7 @@ impl Session {
             #[cfg(feature = "rawdump")]
             crate::rawdump::set_bl_live(true);
             let x = &mut self.xf;
+            x.tindex = keep_tindex;
             (x.adeg, x.alfa, x.cl, x.cd, x.cdp, x.cm, x.minf, x.reinf, x.xoctr, x.cpmn, x.lvconv) = keep;
         } else {
             // Exact XFoil semantics (alpha sweeps precompute the next point's
@@ -814,6 +826,7 @@ impl Session {
             );
         };
         show(&self.xf);
+        crate::outln!(" Bottom Ncrit = {:.3}   WakeL/c = {:.3}   Kdl = {:.4}   Solver = {:.2}", self.xf.ncrit(2), self.xf.waklen, self.xf.bl.par.dlcon, self.xf.solver_version.number());
         loop {
             let (com, arg) = self.input.askc("..VPAR");
             if com.is_empty() || (self.input.eof && com == "QUIT") {
@@ -823,8 +836,11 @@ impl Session {
             let locked = self.xf.lpacc && self.xf.lvisc;
             let lockmsg = || crate::outln!("\n * Polar is being accumulated.\n * Cannot change its parameters in midstream.");
             match com.as_str() {
-                "SHOW" => show(&self.xf),
-                "XTR" => {
+                "SHOW" => {
+                    show(&self.xf);
+                    crate::outln!(" Bottom Ncrit = {:.3}   WakeL/c = {:.3}   Kdl = {:.4}   Solver = {:.2}", self.xf.ncrit(2), self.xf.waklen, self.xf.bl.par.dlcon, self.xf.solver_version.number());
+                },
+                "XTR" | "X" => {
                     if locked {
                         lockmsg();
                         continue;
@@ -838,15 +854,40 @@ impl Session {
                     }
                     self.xf.lvconv = false;
                 }
-                "N" => {
+                "N" | "NT" | "NB" => {
                     if locked {
                         lockmsg();
                         continue;
                     }
-                    self.xf.acrit = if !r.is_empty() { r[0] } else { self.input.askr("Enter critical amplification ratio^", self.xf.acrit) };
+                    let old = if com == "NB" { self.xf.ncrit(2) } else { self.xf.acrit };
+                    let value = r.first().copied().unwrap_or_else(|| self.input.askr("Enter critical amplification ratio^", old));
+                    if !value.is_finite() || !(0.1..=20.0).contains(&value) {
+                        crate::outln!(" Ncrit must be between 0.1 and 20");
+                        continue;
+                    }
+                    if com == "NB" { self.xf.acrit_bot = Some(value); }
+                    else {
+                        // NT changes only the top, even if bottom was following it.
+                        if com == "NT" && self.xf.acrit_bot.is_none() { self.xf.acrit_bot = Some(self.xf.acrit); }
+                        self.xf.acrit = value;
+                        if com == "N" { self.xf.acrit_bot = None; }
+                    }
                     self.xf.lvconv = false;
                 }
-                "VACC" => {
+                "WAKE" | "W" => {
+                    if locked { lockmsg(); continue; }
+                    let length = r.first().copied().unwrap_or_else(|| self.input.askr("Enter wake length/chord^", self.xf.waklen));
+                    if let Err(e) = self.xf.set_wake_length(length) { crate::outln!(" {e}"); }
+                }
+                "VERS" => {
+                    if locked { lockmsg(); continue; }
+                    let version = r.first().copied().unwrap_or_else(|| self.input.askr("Enter solver version (6.97 or 6.99)^", self.xf.solver_version.number()));
+                    self.xf.solver_version = if version == 6.97 { crate::xfoil::SolverVersion::Xfoil697 }
+                        else if version == 6.99 { crate::xfoil::SolverVersion::Xfoil699 }
+                        else { crate::outln!(" Expected 6.97 or 6.99"); continue; };
+                    let _ = self.xf.set_wake_length(self.xf.waklen);
+                }
+                "VACC" | "V" => {
                     self.xf.vaccel = if !r.is_empty() { r[0] } else { self.input.askr("Enter viscous acceleration parameter^", self.xf.vaccel) };
                 }
                 "INIT" => {
@@ -867,11 +908,15 @@ impl Session {
                     if r.len() >= 2 {
                         p.sccon = r[0];
                         p.duxcon = r[1];
+                        // Preserve old two-argument scripts without an extra prompt.
+                        if let Some(&d) = r.get(2) { p.dlcon = d; }
                     } else {
                         let a = self.input.askr("Enter shear lag constant^", self.xf.bl.par.sccon);
                         let b = self.input.askr("Enter shear lag UxEQ weight^", self.xf.bl.par.duxcon);
                         self.xf.bl.par.sccon = a;
+                        let d = self.input.askr("Enter wake 1/dissipation-length factor^", self.xf.bl.par.dlcon);
                         self.xf.bl.par.duxcon = b;
+                        self.xf.bl.par.dlcon = d;
                     }
                 }
                 "GB" => {
@@ -916,7 +961,7 @@ impl Session {
                     }
                     self.xf.bl.par = crate::blsys::BlPar::default();
                 }
-                "?" => crate::outln!("\n   <cr>    Return to OPER menu\n   SHOW    Display viscous parameters\n   XTR  rr Change trip positions Xtr/c\n   N    r  Change critical amplification exponent Ncrit\n   VACC r  Change Newton solution acceleration parameter\n   INIT    BL initialization flag toggle\n\n   LAG     change lag equation constants\n   GB      change G-beta constants\n   CTR     change initial transition-Ctau constants\n   REST    restore BL calibration to baseline"),
+                "?" => crate::outln!("\n   <cr>    Return to OPER menu\n   SHOW    Display viscous parameters\n   XTR  rr Change trip positions Xtr/c\n   N    r  Set Ncrit on both surfaces\n   NT/NB r Set top/bottom Ncrit independently\n   WAKE r  Set wake length/chord\n   VERS r  Select solver 6.97 or 6.99\n   VACC r  Change Newton solution acceleration parameter\n   INIT    BL initialization flag toggle\n\n   LAG rrr Set shear lag, Ux weight, wake dissipation constants\n   GB      change G-beta constants\n   CTR     change initial transition-Ctau constants\n   REST    restore BL calibration to baseline"),
                 _ => crate::outln!(" {:<4} command not recognized.  Type a \"?\" for list", com),
             }
         }

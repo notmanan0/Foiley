@@ -11,6 +11,7 @@ use foiley::xfoil::XFoil;
 fn setup(naca: i32, re: f64) -> XFoil {
     foiley::set_quiet(true);
     let mut xf = XFoil::new();
+    xf.solver_version = foiley::xfoil::SolverVersion::Xfoil697;
     xf.naca(naca);
     xf.lvisc = true;
     xf.reinf1 = re;

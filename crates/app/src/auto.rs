@@ -270,7 +270,7 @@ impl AutoPlan {
 }
 
 /// (mach, ncrit, xtr_top, xtr_bot) of a polar family.
-type FamilyParams = (f64, f64, f64, f64);
+type FamilyParams = AnalysisSettings;
 
 /// (mach, ncrit, xtr_top, xtr_bot) of the family the plan fills for a
 /// foil, and that family if it exists already.  The selection's values
@@ -278,14 +278,23 @@ type FamilyParams = (f64, f64, f64, f64);
 fn family_params(db: &FoilDb, foil: &str, def: &PlanePolarDef) -> Result<(FamilyParams, Option<FamilyId>), String> {
     let sel = &def.family;
     let d = AnalysisSettings::default();
-    let fresh = (sel.mach.unwrap_or(d.mach), sel.ncrit.unwrap_or(d.ncrit), sel.xtr_top.unwrap_or(d.xtr_top), sel.xtr_bot.unwrap_or(d.xtr_bot));
+    let fresh = AnalysisSettings { mach: sel.mach.unwrap_or(d.mach), ncrit: sel.ncrit.unwrap_or(d.ncrit), ncrit_bot: sel.ncrit_bot, xtr_top: sel.xtr_top.unwrap_or(d.xtr_top), xtr_bot: sel.xtr_bot.unwrap_or(d.xtr_bot), ..d };
     let hits = db.families_of(foil).into_iter().filter(|&i| db.family(i).key.flap_deg == 0.0 && sel.matches(&db.family(i).key)).count();
     if hits == 0 {
         return Ok((fresh, None));
     }
     let id = db.resolve(foil, sel)?.expect("a matching family exists");
     let k = db.family(id).key;
-    Ok(((k.mach, k.ncrit, k.xtr_top, k.xtr_bot), Some(id)))
+    let mut settings = db.family(id).polars[0].settings.clone().unwrap_or_else(|| AnalysisSettings {
+        solver_version: foiley_foil::analysis::SolverVersion::Xfoil697, ..Default::default()
+    });
+    settings.re = 1e6;
+    settings.mach = k.mach;
+    settings.ncrit = k.ncrit;
+    settings.ncrit_bot = k.ncrit_bot;
+    settings.xtr_top = k.xtr_top;
+    settings.xtr_bot = k.xtr_bot;
+    Ok((settings, Some(id)))
 }
 
 /// Stations of `want` that no polar of `have` (Re values) covers: a
@@ -324,22 +333,22 @@ pub fn plan(plane: &Plane, foils: &[Foil], db: &FoilDb, def: &PlanePolarDef, cou
         let lo = c.re.0.max(1e4);
         let want = re_list_geometric(lo, c.re.1.max(lo * 1.2), count.max(2));
         let have = |id: Option<FamilyId>| id.map(|i| db.family(i).polars.iter().map(|p| p.re).collect::<Vec<f64>>()).unwrap_or_default();
-        add(params, missing(&want, &have(base)), foil.clone());
+        add(params.clone(), missing(&want, &have(base)), foil.clone());
         let set = base.map(|b| db.flap_families(b)).unwrap_or_default();
         for &d in &c.flaps {
             let existing = set.iter().find(|(f, _)| (f - d).abs() < 0.25).map(|x| x.1);
             let Some((xh, yh)) = foil.hinge else { continue };
             let Ok(mut g) = foil.with_flap(xh, yh, d) else { continue };
             g.name = deflected_name(&foil.name, d);
-            add(params, missing(&want, &have(existing)), g);
+            add(params.clone(), missing(&want, &have(existing)), g);
         }
     }
     let batches = groups
         .into_iter()
-        .map(|((mach, ncrit, xt, xb), re, foils)| AutoBatch {
+        .map(|(settings, re, foils)| AutoBatch {
             foils,
-            cases: re.into_iter().map(|re| BatchCase { re, mach, ncrit }).collect(),
-            settings: AnalysisSettings { mach, ncrit, xtr_top: xt, xtr_bot: xb, ..Default::default() },
+            cases: re.into_iter().map(|re| BatchCase { re, mach: settings.mach, ncrit: settings.ncrit }).collect(),
+            settings,
             sweep: sweep.clone(),
         })
         .collect();

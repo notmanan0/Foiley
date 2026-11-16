@@ -23,6 +23,11 @@ fn f015_child_entry() {
     let text = std::fs::read_to_string(&script).unwrap();
     foiley::set_quiet(true);
     let mut s = foiley::cli::Session::new(foiley::cli::Input::from_string(&text));
+    s.xf.solver_version = if std::env::var("FOILEY_F015_VERSION").as_deref() == Ok("6.99") {
+        foiley::xfoil::SolverVersion::Xfoil699
+    } else {
+        foiley::xfoil::SolverVersion::Xfoil697
+    };
     s.run(None);
     foiley::flush_out();
 }
@@ -137,6 +142,44 @@ fn f015_hooks_agree_on_naca0012() {
 
 /// Largest accepted |Foiley - reference| / max |reference| per quantity.
 pub const MAX_SCALED: f64 = 1e-8;
+
+/// The original corpus, plus new 6.99 controls, against the 6.99 oracle.
+/// Build it with bench/build_reference.py and set FOILEY_REF_699 to the executable.
+#[test]
+fn f699_reference_audit() {
+    let Ok(exe) = std::env::var("FOILEY_REF_699") else {
+        println!("SKIPPED(ref699): set FOILEY_REF_699 to the instrumented 6.99 executable");
+        return;
+    };
+    let mut cases = corpus();
+    for (name, commands) in [
+        ("split_ncrit", "NT 5\nNB 11"),
+        ("long_wake", "WAKE 2.5"),
+        ("lag_dissipation", "LAG 5.6 1.0 1.1"),
+    ] {
+        cases.push(Case::new(name, "NACA 2412", "", &format!("VPAR\n{commands}\n\nVISC 1e6\nITER 100\nPACC\n@POL\n\nASEQ 0 8 2")));
+    }
+    for case in cases {
+        let dir = scratch(&format!("699-{}", case.name));
+        case.stage(&dir);
+        let script = case.script();
+        let reference = run_ref(Path::new(&exe), &dir, &script).unwrap();
+        let actual = run_foiley(None, &dir, &script, &[("FOILEY_F015_VERSION", "6.99")]).unwrap();
+        let c = compare_aligned(&reference, &actual);
+        println!("6.99 {}: {}", case.name, c.summary());
+        assert!(!reference.is_empty(), "{}: reference stored no points", case.name);
+        // The inherited stress corpus is an audit: near separation, small
+        // rounding changes can select different converged points. The three
+        // new controls are strict raw-array comparisons; committed fixtures
+        // also enforce the default 6.99 output on CI without a Fortran build.
+        if matches!(case.name.as_str(), "split_ncrit" | "long_wake" | "lag_dissipation") {
+            assert!(c.structure.is_empty(), "{}: {}", case.name, c.summary());
+            for (quantity, difference) in &c.max_scaled {
+                assert!(*difference <= 1e-7, "{} {quantity}: {difference:.3e}; {}", case.name, c.summary());
+            }
+        }
+    }
+}
 
 #[test]
 fn f015_compare_reports_ulps() {

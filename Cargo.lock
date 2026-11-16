@@ -1282,6 +1282,7 @@ dependencies = [
  "foiley",
  "mimalloc",
  "rayon",
+ "serde",
 ]
 
 [[package]]

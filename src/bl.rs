@@ -256,6 +256,7 @@ impl XFoil {
         let hlmax = 3.8;
         let htmax = 2.5;
         for is in 1..=2 {
+            self.bl.amcrit = self.ncrit(is);
             if self.verbose {
                 crate::outln!("    side  {} ...", is);
             }
@@ -445,6 +446,7 @@ impl XFoil {
         let mut sens = 0.0;
         let mut sennew = 0.0;
         for is in 1..=2 {
+            self.bl.amcrit = self.ncrit(is);
             self.xifset(is);
             self.bl.bule = 1.0;
             let itrold = self.itran[is];
@@ -687,7 +689,7 @@ impl XFoil {
             b.reybl = self.reinf * (herat * herat * herat).sqrt() * (1.0 + hv) / (herat + hv);
             b.reybl_re = (herat * herat * herat).sqrt() * (1.0 + hv) / (herat + hv);
             b.reybl_ms = b.reybl * (1.5 / herat - 1.0 / (herat + hv)) * herat_ms;
-            b.amcrit = self.acrit;
+
             b.idampv = self.idamp;
             b.dwte = self.wgap[1];
         }
@@ -733,7 +735,9 @@ impl XFoil {
 
         let mut ami = 0.0;
         let mut cti = 0.0;
+        self.tindex = [0.0; 3];
         for is in 1..=2 {
+            self.bl.amcrit = self.ncrit(is);
             let mut u1_a = 0.0;
             let mut d1_a = 0.0;
             let mut due1 = 0.0;
@@ -871,6 +875,15 @@ impl XFoil {
                     self.bl.wake = true;
                     self.bl.blvar(3);
                     self.bl.blmid(3);
+                }
+
+                if ibl == self.itran[is] && self.bl.c2.x > self.bl.c1.x {
+                    let fraction = (self.bl.xt - self.bl.c1.x) / (self.bl.c2.x - self.bl.c1.x);
+                    self.tindex[is] = if is == 1 {
+                        (self.ist as f64 - self.itran[is] as f64 + 3.0) - fraction
+                    } else {
+                        (self.ist + self.itran[is] - 2) as f64 + fraction
+                    };
                 }
 
                 // "2" -> "1" for the next station

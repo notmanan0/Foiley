@@ -99,7 +99,9 @@ impl Foil {
         let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
         let ides: i32 = digits.parse().map_err(|_| FoilError::Parse(format!("'{code}' is not a NACA 4/5-digit designation")))?;
         let _q = foiley::quiet_scope();
-        let nside = IQX / 3;
+        // Keep the library geometry stable for saved projects and 3D meshes.
+        // XFOIL script-mode NACA uses the selected version's own seed count.
+        let nside = 120;
         let r = match digits.len() {
             1..=4 => Some(naca4(ides, nside)),
             5 => naca5(ides, nside),
@@ -411,6 +413,12 @@ impl Foil {
         f.hinge = self.hinge;
         Ok(f)
     }
+    /// Offset the whole contour along its outward normal (XFoil 6.99 NMOV).
+    pub fn with_normal_offset(&self, distance: f64) -> Result<Foil, FoilError> {
+        if !distance.is_finite() { return Err(FoilError::Geometry("normal offset must be finite".into())); }
+        self.gdes(&format!("NMOV {distance}"), format!("normal offset {distance:+}"))
+    }
+
     /// Set the trailing-edge gap (fraction of chord), blended over `blend` (x/c).
     pub fn with_te_gap(&self, gap: f64, blend: f64) -> Result<Foil, FoilError> {
         self.gdes(&format!("TGAP {gap} {blend}"), format!("TE gap {gap}"))
@@ -447,7 +455,7 @@ impl Foil {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Paneling {
-    /// number of panel nodes (XFoil default 160, max 354)
+    /// number of panel nodes (XFoil default 160, max 364)
     pub panels: usize,
     /// panel bunching by curvature (LE), 0..~2 (default 1)
     pub le_bunching: f64,
