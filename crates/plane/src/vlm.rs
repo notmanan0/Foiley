@@ -172,8 +172,7 @@ impl<'a> Lattice<'a> {
 fn unit_rhs(mesh: &Mesh, cog: Vec3) -> DenseMatrix {
     let n = mesh.panels.len();
     let mut rhs = DenseMatrix::zeros(n, 6);
-    for i in 0..n {
-        let p = &mesh.panels[i];
+    for (i, p) in mesh.panels.iter().enumerate() {
         let r = p.ctrl - cog;
         let e = [Vec3::X, Vec3::Y, Vec3::Z];
         for (k, &ek) in e.iter().enumerate() {
