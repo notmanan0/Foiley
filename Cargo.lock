@@ -1490,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "foiley"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "foiley",
  "mimalloc",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-app"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "foiley-core",
  "foiley-foil",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-cli"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "clap",
  "foiley",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "blake3",
  "faer",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-foil"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "foiley",
  "foiley-core",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-gui"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "eframe",
  "egui-wgpu",
@@ -1569,7 +1569,7 @@ dependencies = [
 
 [[package]]
 name = "foiley-plane"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "foiley-core",
  "foiley-foil",

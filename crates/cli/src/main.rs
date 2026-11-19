@@ -23,6 +23,7 @@ use foiley_foil::analysis::PolarType;
 use foiley_foil::batch::BatchCase;
 use foiley_foil::foil::Paneling;
 use foiley_foil::{AnalysisSettings, Foil, FoilPolar, Sweep};
+use foiley_foil::gen::naca;
 use foiley_plane::analysis::{Method, PolarKind, Range, RefDims};
 use foiley_plane::geom::Inertia;
 use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
@@ -311,7 +312,7 @@ enum FoilCmd {
         #[arg(long)]
         save: Option<PathBuf>,
     },
-    /// Shape optimisation (MOPSO particle swarm or genetic algorithm, Hicks-Henne bumps)
+    /// Shape optimisation (MOPSO particle swarm or genetic algorithm; Hicks-Henne bumps or CST weights)
     Optimize {
         #[command(flatten)]
         src: FoilSrc,
@@ -330,12 +331,21 @@ enum FoilCmd {
         population: usize,
         #[arg(long, default_value_t = 25)]
         iterations: usize,
+        /// shape variables: hh (Hicks-Henne bumps) or cst (CST weight changes)
+        #[arg(long, default_value = "hh")]
+        shape: String,
         /// Hicks-Henne bumps per surface
         #[arg(long, default_value_t = 3)]
         bumps: usize,
         /// max bump amplitude, fraction of chord
         #[arg(long, default_value_t = 0.01)]
         amplitude: f64,
+        /// CST order (order + 1 weights per surface)
+        #[arg(long, default_value_t = 5)]
+        cst_order: usize,
+        /// largest change of a CST weight
+        #[arg(long, default_value_t = 0.05)]
+        cst_delta: f64,
         /// also optimise a TE flap angle "min,max" (deg)
         #[arg(long, allow_hyphen_values = true)]
         flap: Option<String>,
@@ -378,6 +388,35 @@ enum FoilCmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Generate a foil (NACA families, CST, PARSEC, Karman-Trefftz, cambered plate) and write it as .dat
+    #[command(visible_alias = "gen")]
+    Generate {
+        #[command(subcommand)]
+        family: GenFamily,
+        /// foil name (default: the NACA designation, or the family)
+        #[arg(long, global = true)]
+        name: Option<String>,
+        /// add the foil to this project file (created if missing)
+        #[arg(long, global = true)]
+        save: Option<PathBuf>,
+        /// output .dat (default: stdout)
+        #[arg(short, long, global = true)]
+        out: Option<PathBuf>,
+    },
+    /// Fit CST weights to a foil; print them (or the recipe as JSON) and the fit error
+    FitCst {
+        #[command(flatten)]
+        src: FoilSrc,
+        /// CST order (order + 1 weights per surface)
+        #[arg(long, default_value_t = 8)]
+        order: usize,
+        /// print the recipe as JSON (for `foil generate cst --json`)
+        #[arg(long)]
+        json: bool,
+        /// write the CST foil as .dat
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
     /// Modify a foil (XFoil GDES operations) and write it as .dat
     Design {
         #[command(flatten)]
@@ -416,6 +455,167 @@ enum FoilCmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum GenFamily {
+    /// NACA 4/5-digit, 4-digit modified, 16-, 6- or 6A-series, e.g. "23112", "0012-64", "16-212", "64(2)-415", "63-412 a=0.5", "64A010", "2412 closed TE"
+    Naca { designation: String },
+    /// Kulfan CST: weights A0..An per surface (lower ones negative)
+    Cst {
+        /// upper weights "a0,a1,..."
+        #[arg(long, allow_hyphen_values = true)]
+        upper: Option<String>,
+        /// lower weights "a0,a1,..." (same count)
+        #[arg(long, allow_hyphen_values = true)]
+        lower: Option<String>,
+        /// trailing-edge y of the upper and lower surface "yu,yl"
+        #[arg(long, allow_hyphen_values = true)]
+        te: Option<String>,
+        /// class-function exponents "N1,N2" (0.5,1 for a round nose)
+        #[arg(long)]
+        class: Option<String>,
+        /// read the whole recipe from a JSON file (as `foil fit-cst --json` prints)
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+    /// Sobieczky PARSEC (defaults close to NACA 0012)
+    Parsec {
+        /// leading-edge radius
+        #[arg(long)]
+        rle: Option<f64>,
+        /// upper crest "x,z,z''"
+        #[arg(long, allow_hyphen_values = true)]
+        upper: Option<String>,
+        /// lower crest "x,z,z''"
+        #[arg(long, allow_hyphen_values = true)]
+        lower: Option<String>,
+        /// trailing edge "z,thickness,direction_deg,wedge_deg" (direction positive below the chord line)
+        #[arg(long, allow_hyphen_values = true)]
+        te: Option<String>,
+    },
+    /// Karman-Trefftz (Joukowsky with a finite trailing-edge angle)
+    Kt {
+        /// leftward offset of the circle centre (thickness)
+        #[arg(long, default_value_t = 0.08)]
+        x_center: f64,
+        /// upward offset of the circle centre (camber)
+        #[arg(long, default_value_t = 0.08, allow_hyphen_values = true)]
+        y_center: f64,
+        /// trailing-edge angle, degrees (0 = Joukowsky)
+        #[arg(long, default_value_t = 10.0)]
+        te_angle: f64,
+        /// also print the exact inviscid CL and Cm at these angles "a1,a2,..." (deg)
+        #[arg(long, allow_hyphen_values = true)]
+        exact: Option<String>,
+    },
+    /// Constant-thickness cambered plate with round edges
+    Plate {
+        /// thickness / chord
+        #[arg(long, default_value_t = 0.02)]
+        thickness: f64,
+        /// maximum camber / chord
+        #[arg(long, default_value_t = 0.04, allow_hyphen_values = true)]
+        camber: f64,
+        /// arc (circular arc) or parabolic
+        #[arg(long, default_value = "arc")]
+        kind: String,
+        /// position of maximum camber (parabolic only)
+        #[arg(long, default_value_t = 0.5)]
+        x_camber: f64,
+        /// trailing edge: square (blunt, as thick as the plate; XFoil can analyse it) or round (geometry only)
+        #[arg(long, default_value = "square")]
+        te: String,
+    },
+}
+
+/// The recipe a `foil generate` command describes.
+fn gen_recipe(family: &GenFamily) -> Result<foiley_foil::Recipe, String> {
+    use foiley_foil::gen::{cst::Cst, kt::KarmanTrefftz, parsec::Parsec, plate, Recipe};
+    let three = |s: &Option<String>, what: &str, n: usize| -> Result<Option<Vec<f64>>, String> {
+        match s {
+            None => Ok(None),
+            Some(t) => {
+                let v = parse_list(t)?;
+                if v.len() != n {
+                    return Err(format!("{what} needs {n} numbers"));
+                }
+                Ok(Some(v))
+            }
+        }
+    };
+    Ok(match family {
+        GenFamily::Naca { designation } => Recipe::Naca { designation: designation.clone() },
+        GenFamily::Cst { upper, lower, te, class, json } => {
+            if let Some(path) = json {
+                let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                return match serde_json::from_str::<Recipe>(&text) {
+                    Ok(r @ Recipe::Cst(_)) => Ok(r),
+                    Ok(_) => Err(format!("{}: not a CST recipe", path.display())),
+                    Err(_) => serde_json::from_str::<Cst>(&text).map(Recipe::Cst).map_err(|e| format!("{}: {e}", path.display())),
+                };
+            }
+            let mut c = Cst::default();
+            if let Some(u) = upper {
+                c.upper = parse_list(u)?;
+            }
+            if let Some(l) = lower {
+                c.lower = parse_list(l)?;
+            }
+            if let Some(v) = three(te, "--te", 2)? {
+                (c.te_upper, c.te_lower) = (v[0], v[1]);
+            }
+            if let Some(v) = three(class, "--class", 2)? {
+                (c.n1, c.n2) = (v[0], v[1]);
+            }
+            Recipe::Cst(c)
+        }
+        GenFamily::Parsec { rle, upper, lower, te } => {
+            let mut p = Parsec::default();
+            if let Some(r) = rle {
+                p.r_le = *r;
+            }
+            if let Some(v) = three(upper, "--upper", 3)? {
+                (p.x_up, p.z_up, p.zxx_up) = (v[0], v[1], v[2]);
+            }
+            if let Some(v) = three(lower, "--lower", 3)? {
+                (p.x_lo, p.z_lo, p.zxx_lo) = (v[0], v[1], v[2]);
+            }
+            if let Some(v) = three(te, "--te", 4)? {
+                (p.z_te, p.dz_te, p.alpha_te, p.beta_te) = (v[0], v[1], v[2], v[3]);
+            }
+            Recipe::Parsec(p)
+        }
+        GenFamily::Kt { x_center, y_center, te_angle, .. } => Recipe::KarmanTrefftz(KarmanTrefftz { x_center: *x_center, y_center: *y_center, te_angle: *te_angle }),
+        GenFamily::Plate { thickness, camber, kind, x_camber, te } => Recipe::Plate(plate::Plate {
+            trailing_edge: match te.to_lowercase().as_str() {
+                "square" | "blunt" => plate::PlateEdge::Square,
+                "round" => plate::PlateEdge::Round,
+                o => return Err(format!("--te must be square or round, not '{o}'")),
+            },
+            thickness: *thickness,
+            camber: *camber,
+            x_camber: *x_camber,
+            kind: match kind.to_lowercase().as_str() {
+                "arc" | "circular" | "circular-arc" => plate::PlateCamber::CircularArc,
+                "parabolic" | "parabola" => plate::PlateCamber::Parabolic,
+                o => return Err(format!("--kind must be arc or parabolic, not '{o}'")),
+            },
+        }),
+    })
+}
+
+/// Print a one-line summary of a foil to stderr and write it.
+fn emit_foil(f: &Foil, out: &Option<PathBuf>) -> Result<(), String> {
+    let p = f.props();
+    eprintln!("  {}: {} points, t/c {:.2}% at {:.3}, camber {:.2}% at {:.3}, LE radius {:.4}", f.name, p.points, p.thickness * 100.0, p.x_thickness, p.camber * 100.0, p.x_camber, p.le_radius);
+    match out {
+        Some(o) => f.save(o).map_err(|e| e.to_string()),
+        None => {
+            print!("{}", f.to_dat());
+            Ok(())
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -611,12 +811,12 @@ fn resolve_foil(spec: &str, proj: &Project) -> Result<Foil, String> {
     if path.exists() {
         return Foil::load(path).map_err(|e| e.to_string());
     }
-    let l = spec.to_lowercase().replace([' ', '-', '_'], "");
-    if let Some(code) = l.strip_prefix("naca") {
+    if let Some(code) = naca::strip_naca_prefix(spec) {
         return Foil::naca(code).map_err(|e| e.to_string());
     }
+    let l = spec.trim();
     if l.chars().all(|c| c.is_ascii_digit()) && (l.len() == 4 || l.len() == 5) {
-        return Foil::naca(&l).map_err(|e| e.to_string());
+        return Foil::naca(l).map_err(|e| e.to_string());
     }
     Err(format!("'{spec}' is not a file, a NACA designation, or a foil in the project"))
 }
@@ -768,8 +968,7 @@ fn load_plane(src: &PlaneSrc) -> Result<(Project, Plane), String> {
             }
         }
         if found.is_none() {
-            let l = name.to_lowercase().replace([' ', '-', '_'], "");
-            if let Some(code) = l.strip_prefix("naca") {
+            if let Some(code) = naca::strip_naca_prefix(&name) {
                 found = Foil::naca(code).ok();
             }
         }
@@ -1082,8 +1281,8 @@ fn real_main() -> Result<(), String> {
                     }
                 }
             }
-            FoilCmd::Optimize { src, x, alpha, objectives, algorithm, population, iterations, bumps, amplitude, flap, seed, out, pareto } => {
-                use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings};
+            FoilCmd::Optimize { src, x, alpha, objectives, algorithm, population, iterations, shape, bumps, amplitude, cst_order, cst_delta, flap, seed, out, pareto } => {
+                use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings, Parameterization};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let mut st = OptimSettings {
@@ -1095,8 +1294,15 @@ fn real_main() -> Result<(), String> {
                     alpha,
                     population,
                     iterations,
+                    parameterization: match shape.to_lowercase().as_str() {
+                        "hh" | "hicks-henne" | "hickshenne" => Parameterization::HicksHenne,
+                        "cst" => Parameterization::Cst,
+                        o => return Err(format!("--shape must be hh or cst, not '{o}'")),
+                    },
                     bumps_per_side: bumps,
                     max_amplitude: amplitude,
+                    cst_order,
+                    cst_max_delta: cst_delta,
                     seed,
                     ..OptimSettings::default()
                 };
@@ -1188,6 +1394,47 @@ fn real_main() -> Result<(), String> {
                         Some(o) => f.save(&o).map_err(|e| e.to_string())?,
                         None => print!("{}", f.to_dat()),
                     }
+                }
+            }
+            FoilCmd::Generate { family, name, save, out } => {
+                let recipe = gen_recipe(&family)?;
+                let f = Foil::from_recipe(&recipe, name.as_deref()).map_err(|e| e.to_string())?;
+                if let GenFamily::Kt { exact: Some(list), .. } = &family {
+                    if let foiley_foil::Recipe::KarmanTrefftz(k) = &recipe {
+                        eprintln!("  exact inviscid solution (conformal map):");
+                        for a in parse_list(list)? {
+                            let s = k.exact(a).map_err(|e| e.to_string())?;
+                            eprintln!("    alpha {a:>6.2} deg: CL {:.5}  Cm(c/4) {:.5}", s.cl, s.cm);
+                        }
+                    }
+                }
+                if let Some(path) = save {
+                    let mut proj = if path.exists() { Project::load(&path)? } else { Project::new("cli") };
+                    let mut g = f.clone();
+                    g.name = proj.unique_foil_name(&g.name);
+                    eprintln!("  added {} to {}", g.name, path.display());
+                    proj.foils.push(g);
+                    proj.save(&path)?;
+                }
+                emit_foil(&f, &out)?;
+            }
+            FoilCmd::FitCst { src, order, json, out } => {
+                let proj = load_project(&src.project)?;
+                let foil = resolve_foil(&src.foil, &proj)?;
+                let (cst, fit) = foiley_foil::gen::cst::Cst::fit(&foil, order).map_err(|e| e.to_string())?;
+                eprintln!("  {}: CST order {order}, fit error rms {:.2e}, max {:.2e} (chord fractions)", foil.name, fit.rms, fit.max);
+                let recipe = foiley_foil::Recipe::Cst(cst.clone());
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&recipe).map_err(|e| e.to_string())?);
+                } else if out.is_none() {
+                    let row = |w: &[f64]| w.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
+                    println!("upper {}", row(&cst.upper));
+                    println!("lower {}", row(&cst.lower));
+                    println!("te    {:.6},{:.6}", cst.te_upper, cst.te_lower);
+                }
+                if out.is_some() {
+                    let f = Foil::from_recipe(&recipe, Some(&format!("{} CST{order}", foil.name))).map_err(|e| e.to_string())?;
+                    emit_foil(&f, &out)?;
                 }
             }
             FoilCmd::Design { src, flap, te_gap, le_radius, thickness, camber, high_points, repanel, normalize, mix, name, out } => {
@@ -1619,8 +1866,7 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
                 };
                 for name in pl.foil_names() {
                     if proj.foil(&name).is_none() {
-                        let l = name.to_lowercase().replace([' ', '-', '_'], "");
-                        if let Some(code) = l.strip_prefix("naca") {
+                        if let Some(code) = naca::strip_naca_prefix(&name) {
                             let mut f = Foil::naca(code).map_err(|e| e.to_string())?;
                             f.name = name.clone();
                             proj.foils.push(f);

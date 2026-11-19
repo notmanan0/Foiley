@@ -1,8 +1,9 @@
 //! Airfoil geometry.
 
+use crate::gen::Recipe;
 use crate::FoilError;
 use foiley::cli::{Input, Session};
-use foiley::geom::{geopar, naca4, naca5};
+use foiley::geom::geopar;
 use foiley::spline::{scalc, segspl, seval, sinvrt};
 use foiley::xfoil::{XFoil, IBX, IQX};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,10 @@ pub struct Foil {
     /// Free-form description / provenance ("NACA 2412", "flap 10 deg"...).
     #[serde(default)]
     pub note: String,
+    /// How the shape was generated (NACA designation, CST weights, ...), so
+    /// editors can reopen it.  Operations that change the shape clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<Recipe>,
 }
 
 /// Geometric properties of a foil.
@@ -103,7 +108,7 @@ impl SurfaceSpline {
 
 impl Foil {
     pub fn new(name: impl Into<String>, x: Vec<f64>, y: Vec<f64>) -> Result<Foil, FoilError> {
-        let f = Foil { name: name.into(), x, y, hinge: None, note: String::new() };
+        let f = Foil { name: name.into(), x, y, hinge: None, note: String::new(), recipe: None };
         f.validate()?;
         Ok(f)
     }
@@ -134,23 +139,22 @@ impl Foil {
         Ok(())
     }
 
-    /// NACA 4- or 5-digit section ("2412", "0012", "23012").
+    /// A NACA section from its designation: 4-digit ("2412"), 5-digit
+    /// ("23012", reflexed "23112", any design CL "43012"), 4-digit modified
+    /// ("0012-64"), 16-series ("16-212"), 6-series ("63-206", "64(2)-415",
+    /// "65-415 a=0.5") or 6A-series ("64A010"); "closed TE" after a 4- or
+    /// 5-digit code closes its trailing edge.  See [`crate::gen::naca::parse`].
+    ///
+    /// The codes XFoil's NACA command accepts (4-digit, 210xx-250xx) give
+    /// exactly the geometry of earlier Foiley versions.
     pub fn naca(code: &str) -> Result<Foil, FoilError> {
-        let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
-        let ides: i32 = digits.parse().map_err(|_| FoilError::Parse(format!("'{code}' is not a NACA 4/5-digit designation")))?;
-        let _q = foiley::quiet_scope();
-        // Keep the library geometry stable for saved projects and 3D meshes.
-        // XFOIL script-mode NACA uses the selected version's own seed count.
-        let nside = 120;
-        let r = match digits.len() {
-            1..=4 => Some(naca4(ides, nside)),
-            5 => naca5(ides, nside),
-            _ => None,
-        };
-        let (xb, yb, nb, _name) = r.ok_or_else(|| FoilError::Parse(format!("NACA {digits} is not a supported designation (4-digit, or 5-digit 210xx-250xx)")))?;
-        let mut f = Foil::new(format!("NACA {digits}"), xb[1..=nb].to_vec(), yb[1..=nb].to_vec())?;
-        f.note = format!("NACA {digits} generated");
-        Ok(f)
+        Recipe::Naca { designation: code.to_string() }.generate(None)
+    }
+
+    /// Generate a foil from a recipe, named `name` (a NACA section keeps its
+    /// designation as the name when `name` is `None`).
+    pub fn from_recipe(recipe: &Recipe, name: Option<&str>) -> Result<Foil, FoilError> {
+        recipe.generate(name)
     }
 
     /// Parse a coordinate file (Selig or Lednicer .dat; blanks, tabs or commas).
@@ -375,6 +379,7 @@ impl Foil {
             f.y[i] = (s * dx + c * dy) / ch;
         }
         f.note = "normalized".into();
+        f.recipe = None;
         f
     }
 
@@ -416,6 +421,7 @@ impl Foil {
         s.run(None);
         let nb = s.xf.nb;
         let mut f = self.clone();
+        f.recipe = None;
         f.x = s.xf.xb[1..=nb].to_vec();
         f.y = s.xf.yb[1..=nb].to_vec();
         f.note = note;

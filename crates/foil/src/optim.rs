@@ -1,8 +1,11 @@
 //! Airfoil shape optimisation (equivalent of xflr5's Optim2d).
 //!
-//! The design variables are the amplitudes of Hicks-Henne bump functions
-//! added to the upper and lower surfaces of the (normalised) base foil along
-//! the local surface normal, plus optionally a trailing-edge flap angle.
+//! The design variables change the shape of the (normalised) base foil:
+//! either the amplitudes of Hicks-Henne bump functions added along the local
+//! surface normal, or changes of the weights of a CST (class-shape
+//! transformation) representation added to each surface, which move the
+//! thickness, camber and leading-edge radius globally without waviness.
+//! A trailing-edge flap angle can be added as a further variable.
 //! Each candidate is analysed at one operating point with the XFoil engine,
 //! and one or more objectives (Cl, Cd, Cl/Cd, Cpmin, Cm) are minimised,
 //! maximised or driven to a target value.
@@ -100,6 +103,26 @@ impl Default for ObjectiveSpec {
     }
 }
 
+/// How the genes change the shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Parameterization {
+    /// `bumps_per_side` Hicks-Henne bumps per surface.
+    #[default]
+    HicksHenne,
+    /// `cst_order + 1` CST weight changes per surface.
+    Cst,
+}
+
+impl Parameterization {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Parameterization::HicksHenne => "Hicks-Henne",
+            Parameterization::Cst => "CST",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Algorithm {
     #[default]
@@ -121,6 +144,12 @@ impl Algorithm {
 #[serde(default)]
 pub struct OptimSettings {
     pub algorithm: Algorithm,
+    /// Hicks-Henne bumps or CST weights.
+    pub parameterization: Parameterization,
+    /// CST order: `cst_order + 1` weights per side.
+    pub cst_order: usize,
+    /// Largest change of a CST weight (genes range +-this).
+    pub cst_max_delta: f64,
     /// Hicks-Henne functions per side (design variables = 2 x this).
     pub bumps_per_side: usize,
     /// HH t1: bump j (0-based) peaks at x = t1 (j+1) / (2n+1).
@@ -167,15 +196,26 @@ impl OptimSettings {
         ]
     }
 
+    /// Shape variables per surface.
+    pub fn shape_variables_per_side(&self) -> usize {
+        match self.parameterization {
+            Parameterization::HicksHenne => self.bumps_per_side,
+            Parameterization::Cst => self.cst_order + 1,
+        }
+    }
+
     /// Number of design variables.
     pub fn dimension(&self) -> usize {
-        2 * self.bumps_per_side + usize::from(self.flap.is_some())
+        2 * self.shape_variables_per_side() + usize::from(self.flap.is_some())
     }
 
     /// (min, max) of each design variable.
     pub fn bounds(&self) -> Vec<(f64, f64)> {
-        let a = self.max_amplitude.abs();
-        let mut b = vec![(-a, a); 2 * self.bumps_per_side];
+        let a = match self.parameterization {
+            Parameterization::HicksHenne => self.max_amplitude.abs(),
+            Parameterization::Cst => self.cst_max_delta.abs(),
+        };
+        let mut b = vec![(-a, a); 2 * self.shape_variables_per_side()];
         if let Some((lo, hi)) = self.flap {
             b.push((lo.min(hi), lo.max(hi)));
         }
@@ -196,6 +236,9 @@ impl Default for OptimSettings {
     fn default() -> Self {
         OptimSettings {
             algorithm: Algorithm::Mopso,
+            parameterization: Parameterization::HicksHenne,
+            cst_order: 5,
+            cst_max_delta: 0.05,
             bumps_per_side: 3,
             t1: 1.7,
             t2: 1.0,
@@ -352,11 +395,13 @@ fn self_intersects(f: &Foil) -> bool {
     })
 }
 
-/// Build the foil described by `genes`: [upper bumps..., lower bumps...,
-/// (flap angle)].  Bumps are applied to the normalised base foil along the
-/// outward surface normal; the trailing edge and leading edge do not move.
+/// Build the foil described by `genes`: [upper shape variables..., lower
+/// shape variables..., (flap angle)].  The changes are applied to the
+/// normalised base foil and vanish at the leading and trailing edges:
+/// Hicks-Henne bumps along the outward surface normal, CST weight changes
+/// as `dy = x^0.5 (1-x) sum dA_i B_i(x)` on each surface.
 pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil, FoilError> {
-    let nb = s.bumps_per_side;
+    let nb = s.shape_variables_per_side();
     if genes.len() != s.dimension() {
         return Err(FoilError::Geometry(format!("{} genes given, {} expected", genes.len(), s.dimension())));
     }
@@ -373,22 +418,30 @@ pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil
             if i == ile {
                 continue;
             }
-            // outward normal of a counter-clockwise contour
-            let tx = b.x[i + 1] - b.x[i - 1];
-            let ty = b.y[i + 1] - b.y[i - 1];
-            let tl = (tx * tx + ty * ty).sqrt();
-            if tl < 1e-15 {
-                continue;
-            }
-            let (nx, ny) = (ty / tl, -tx / tl);
             let off = if i < ile { 0 } else { nb };
-            let mut h = 0.0;
-            for j in 0..nb {
-                let t1 = s.t1 * (j + 1) as f64 / (2 * nb + 1) as f64;
-                h += hicks_henne(b.x[i], t1, s.t2) * genes[off + j];
+            match s.parameterization {
+                Parameterization::HicksHenne => {
+                    // outward normal of a counter-clockwise contour
+                    let tx = b.x[i + 1] - b.x[i - 1];
+                    let ty = b.y[i + 1] - b.y[i - 1];
+                    let tl = (tx * tx + ty * ty).sqrt();
+                    if tl < 1e-15 {
+                        continue;
+                    }
+                    let (nx, ny) = (ty / tl, -tx / tl);
+                    let mut h = 0.0;
+                    for j in 0..nb {
+                        let t1 = s.t1 * (j + 1) as f64 / (2 * nb + 1) as f64;
+                        h += hicks_henne(b.x[i], t1, s.t2) * genes[off + j];
+                    }
+                    f.x[i] += nx * h;
+                    f.y[i] += ny * h;
+                }
+                Parameterization::Cst => {
+                    let basis = crate::gen::cst::basis(nb - 1, 0.5, 1.0, b.x[i]);
+                    f.y[i] += basis.iter().zip(&genes[off..off + nb]).map(|(p, g)| p * g).sum::<f64>();
+                }
             }
-            f.x[i] += nx * h;
-            f.y[i] += ny * h;
         }
     }
     f.validate()?;
@@ -401,7 +454,10 @@ pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil
             f = f.with_flap(s.hinge.0, s.hinge.1, deg)?;
         }
     }
-    f.note = "optimised (Hicks-Henne)".into();
+    f.note = match s.parameterization {
+        Parameterization::HicksHenne => "optimised (Hicks-Henne)".into(),
+        Parameterization::Cst => format!("optimised (CST order {})", s.cst_order),
+    };
     Ok(f)
 }
 
@@ -826,6 +882,29 @@ mod tests {
         // huge negative bumps on both sides cross over: rejected
         let s2 = OptimSettings { max_amplitude: 0.2, ..Default::default() };
         assert!(apply_genes(&base, &s2, &[-0.2; 6]).is_err());
+    }
+
+    #[test]
+    fn cst_genes_change_the_shape_smoothly() {
+        let base = Foil::naca("2412").unwrap();
+        let s = OptimSettings { parameterization: Parameterization::Cst, cst_order: 4, flap: Some((-5.0, 5.0)), ..Default::default() };
+        assert_eq!(s.dimension(), 11);
+        let f = apply_genes(&base, &s, &s.neutral_genes()).unwrap();
+        let b = base.normalized();
+        for i in 0..f.n() {
+            assert_eq!((f.x[i], f.y[i]), (b.x[i], b.y[i]), "point {i}");
+        }
+        // raising A0 of the upper surface enlarges the nose radius and thickens
+        let mut g = s.neutral_genes();
+        g[0] = 0.04;
+        let f = apply_genes(&base, &s, &g).unwrap();
+        let (p, q) = (b.props(), f.props());
+        assert!(q.le_radius > p.le_radius && q.thickness > p.thickness, "{p:?} {q:?}");
+        assert_eq!((f.y[0], f.y[f.n() - 1]), (b.y[0], b.y[b.n() - 1]));
+        assert!(f.note.contains("CST"));
+        // settings written before CST existed still load as Hicks-Henne
+        let old: OptimSettings = serde_json::from_str(r#"{"bumps_per_side": 4}"#).unwrap();
+        assert_eq!((old.parameterization, old.bumps_per_side, old.dimension()), (Parameterization::HicksHenne, 4, 8));
     }
 
     #[test]

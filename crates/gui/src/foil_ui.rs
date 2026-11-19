@@ -10,7 +10,12 @@ use foiley_foil::batch::{re_list_geometric, BatchCase};
 use foiley_foil::foil::{NodeInput, Paneling};
 use foiley_foil::{AnalysisSettings, Foil, FoilPoint, FoilPolar, Sweep};
 use foiley_foil::inverse::{modify, InverseMode, ModKind, Modification, SpeedDist};
-use foiley_foil::optim::{Algorithm, Goal, OptimResult, OptimSettings};
+use foiley_foil::gen::cst::{Cst, CstFit};
+use foiley_foil::gen::kt::KarmanTrefftz;
+use foiley_foil::gen::parsec::Parsec;
+use foiley_foil::gen::plate::{Plate, PlateCamber, PlateEdge};
+use foiley_foil::optim::{Algorithm, Goal, OptimResult, OptimSettings, Parameterization};
+use foiley_foil::Recipe;
 use foiley_app::JobId;
 use std::collections::{HashMap, HashSet};
 
@@ -31,6 +36,96 @@ fn polar_labels(polars: &[FoilPolar]) -> Vec<PolarLabel> {
         }
     }
     labels
+}
+
+pub const GEN_FAMILIES: [&str; 5] = ["NACA", "CST (Kulfan)", "PARSEC", "Karman-Trefftz", "cambered plate"];
+
+const NACA_HELP: &str = "4-digit 2412 \u{2022} 5-digit 23012, reflexed 23112, any design CL 43012 \u{2022} 4-digit modified 0012-64 \u{2022} 16-series 16-212 \u{2022} 6-series 63-206, 64(2)-415, 65-415 a=0.5 \u{2022} 6A-series 64A010";
+
+/// The Create section's generator: one parameter set per family, and the
+/// last generated preview (regenerated only when a parameter changes).
+pub struct GenUi {
+    pub family: usize,
+    pub closed_te: bool,
+    pub cst: Cst,
+    pub fit_order: usize,
+    pub fit: Option<(String, CstFit)>,
+    pub parsec: Parsec,
+    pub kt: KarmanTrefftz,
+    pub kt_alpha: f64,
+    pub plate: Plate,
+    pub show: bool,
+    cache: Option<(Recipe, Result<Foil, String>)>,
+}
+
+impl Default for GenUi {
+    fn default() -> Self {
+        GenUi { family: 0, closed_te: false, cst: Cst::default(), fit_order: 8, fit: None, parsec: Parsec::default(), kt: KarmanTrefftz::default(), kt_alpha: 4.0, plate: Plate::default(), show: true, cache: None }
+    }
+}
+
+impl GenUi {
+    /// The recipe the editor currently describes (`naca` is the NACA text field).
+    pub fn recipe(&self, naca: &str) -> Recipe {
+        match self.family {
+            1 => Recipe::Cst(self.cst.clone()),
+            2 => Recipe::Parsec(self.parsec),
+            3 => Recipe::KarmanTrefftz(self.kt),
+            4 => Recipe::Plate(self.plate),
+            _ => {
+                let code = naca.trim();
+                let closed = self.closed_te && !code.to_ascii_lowercase().contains("closed");
+                Recipe::Naca { designation: if closed { format!("{code} closed TE") } else { code.to_string() } }
+            }
+        }
+    }
+
+    /// Put a foil's recipe into the editor.
+    pub fn load(&mut self, r: &Recipe, naca: &mut String) {
+        match r {
+            Recipe::Naca { designation } => {
+                self.family = 0;
+                let lower = designation.to_ascii_lowercase();
+                self.closed_te = lower.ends_with("closed te");
+                *naca = if self.closed_te { designation[..designation.len() - "closed TE".len()].trim().to_string() } else { designation.clone() };
+            }
+            Recipe::Cst(c) => {
+                self.family = 1;
+                self.cst = c.clone();
+            }
+            Recipe::Parsec(p) => {
+                self.family = 2;
+                self.parsec = *p;
+            }
+            Recipe::KarmanTrefftz(k) => {
+                self.family = 3;
+                self.kt = *k;
+            }
+            Recipe::Plate(p) => {
+                self.family = 4;
+                self.plate = *p;
+            }
+        }
+    }
+
+    /// The generated foil for the current parameters (cached).
+    pub fn preview(&mut self, naca: &str) -> Result<Foil, String> {
+        let r = self.recipe(naca);
+        if self.cache.as_ref().map(|c| &c.0) != Some(&r) {
+            let name = match &r {
+                Recipe::Naca { .. } => None,
+                _ => Some(["NACA", "CST", "PARSEC", "Karman-Trefftz", "Plate"][self.family.min(4)]),
+            };
+            let out = Foil::from_recipe(&r, name).map_err(|e| e.to_string());
+            self.cache = Some((r, out));
+        }
+        self.cache.as_ref().unwrap().1.clone()
+    }
+
+    /// The cached preview, if it is valid and shown.
+    pub fn shown(&self) -> Option<&Foil> {
+        self.cache.as_ref().filter(|_| self.show).and_then(|c| c.1.as_ref().ok())
+    }
 }
 
 pub struct FoilUi {
@@ -73,6 +168,7 @@ pub struct FoilUi {
     pub opt: OptimSettings,
     pub opt_job: Option<JobId>,
     pub opt_result: Option<OptimResult>,
+    pub gen: GenUi,
 }
 
 impl Default for FoilUi {
@@ -117,6 +213,7 @@ impl Default for FoilUi {
             opt: OptimSettings::default(),
             opt_job: None,
             opt_result: None,
+            gen: GenUi::default(),
         }
     }
 }
@@ -168,6 +265,175 @@ impl App {
         });
     }
 
+    /// The Create section: pick a family, set its parameters with a live
+    /// preview in the foil plot, then add it or replace the selected foil.
+    fn generator_ui(&mut self, ui: &mut egui::Ui, selected: Option<&Foil>) {
+        let fui = &mut self.fui;
+        ui.horizontal(|ui| {
+            ui.label("family");
+            widgets::pick(ui, "genfam", &mut fui.gen.family, &GEN_FAMILIES);
+            ui.checkbox(&mut fui.gen.show, "preview").on_hover_text("draw the new foil (dashed) in the plot");
+        });
+        let g = &mut fui.gen;
+        match g.family {
+            1 => {
+                hint(ui, "y = x^N1 (1-x)^N2 sum A_i B_i(x) + x dz on each surface. A0 sets the LE radius (r = A0^2/2), the last weight the TE wedge.");
+                let mut order = g.cst.order();
+                egui::Grid::new("cstp").num_columns(2).show(ui, |ui| {
+                    if int(ui, "order", &mut order, 1..=15, "Bernstein polynomial order (order + 1 weights per surface)") {
+                        for w in [&mut g.cst.upper, &mut g.cst.lower] {
+                            let last = *w.last().unwrap_or(&0.1);
+                            w.resize(order + 1, last);
+                        }
+                    }
+                    num(ui, "TE y upper", &mut g.cst.te_upper, 0.0002, -0.1..=0.1, "trailing-edge height of the upper surface");
+                    num(ui, "TE y lower", &mut g.cst.te_lower, 0.0002, -0.1..=0.1, "trailing-edge height of the lower surface");
+                    num(ui, "N1", &mut g.cst.n1, 0.01, 0.0..=1.0, "class exponent at the nose (0.5 = round)");
+                    num(ui, "N2", &mut g.cst.n2, 0.01, 0.0..=2.0, "class exponent at the tail (1 = sharp)");
+                });
+                egui::Grid::new("cstw").num_columns(3).striped(true).show(ui, |ui| {
+                    ui.label("");
+                    ui.label("upper");
+                    ui.label("lower");
+                    ui.end_row();
+                    for i in 0..g.cst.upper.len() {
+                        ui.label(format!("A{i}"));
+                        ui.add(egui::DragValue::new(&mut g.cst.upper[i]).speed(0.001).fixed_decimals(4));
+                        ui.add(egui::DragValue::new(&mut g.cst.lower[i]).speed(0.001).fixed_decimals(4));
+                        ui.end_row();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(selected.is_some(), |ui| {
+                        if ui.button("Fit to selected foil").on_hover_text("least-squares CST weights of this order for the selected foil").on_disabled_hover_text("select a foil first").clicked() {
+                            if let Some(f) = selected {
+                                match Cst::fit(f, g.fit_order) {
+                                    Ok((c, fit)) => {
+                                        g.cst = c;
+                                        g.fit = Some((f.name.clone(), fit));
+                                    }
+                                    Err(e) => g.fit = Some((format!("{}: {e}", f.name), CstFit::default())),
+                                }
+                            }
+                        }
+                    });
+                    ui.label("order");
+                    ui.add(egui::DragValue::new(&mut g.fit_order).range(1..=15));
+                });
+                if let Some((n, fit)) = &g.fit {
+                    hint(ui, &format!("fit of {n}: rms {:.1e}, max {:.1e} (chord fractions)", fit.rms, fit.max));
+                }
+            }
+            2 => {
+                hint(ui, "z = sum a_n x^(n-1/2) per surface, from the LE radius, the crests and the trailing edge.");
+                let p = &mut g.parsec;
+                egui::Grid::new("parsec").num_columns(2).show(ui, |ui| {
+                    num(ui, "LE radius", &mut p.r_le, 0.0005, 0.0005..=0.2, "leading-edge radius / chord");
+                    num(ui, "upper crest x", &mut p.x_up, 0.005, 0.01..=0.99, "");
+                    num(ui, "upper crest z", &mut p.z_up, 0.001, -0.3..=0.3, "");
+                    num(ui, "upper crest z''", &mut p.zxx_up, 0.01, -10.0..=10.0, "curvature at the crest (negative)");
+                    num(ui, "lower crest x", &mut p.x_lo, 0.005, 0.01..=0.99, "");
+                    num(ui, "lower crest z", &mut p.z_lo, 0.001, -0.3..=0.3, "");
+                    num(ui, "lower crest z''", &mut p.zxx_lo, 0.01, -10.0..=10.0, "curvature at the crest (positive)");
+                    num(ui, "TE height", &mut p.z_te, 0.001, -0.2..=0.2, "height of the trailing-edge midpoint");
+                    num(ui, "TE thickness", &mut p.dz_te, 0.0005, 0.0..=0.05, "");
+                    num(ui, "TE direction (deg)", &mut p.alpha_te, 0.1, -44.0..=44.0, "bisector angle below the chord line");
+                    num(ui, "TE wedge (deg)", &mut p.beta_te, 0.1, 0.0..=89.0, "included angle");
+                });
+            }
+            3 => {
+                hint(ui, "Conformal map of a circle through zeta = 1 centred at (-x, y); TE angle 0 gives the Joukowsky section. Its inviscid flow is known exactly: a reference for the panel solvers.");
+                let k = &mut g.kt;
+                egui::Grid::new("kt").num_columns(2).show(ui, |ui| {
+                    num(ui, "centre x offset", &mut k.x_center, 0.002, 0.001..=0.5, "leftward offset of the circle centre: thickness");
+                    num(ui, "centre y offset", &mut k.y_center, 0.002, -0.5..=0.5, "upward offset: camber");
+                    num(ui, "TE angle (deg)", &mut k.te_angle, 0.5, 0.0..=60.0, "");
+                    num(ui, "alpha (deg)", &mut g.kt_alpha, 0.1, -15.0..=15.0, "angle for the exact solution below");
+                });
+                if let Ok(sol) = k.exact(g.kt_alpha) {
+                    hint(ui, &format!("exact inviscid CL {:.4}, Cm(c/4) {:.4} at {:.1} deg", sol.cl, sol.cm, g.kt_alpha));
+                }
+            }
+            4 => {
+                let p = &mut g.plate;
+                let mut t = p.thickness * 100.0;
+                let mut c = p.camber * 100.0;
+                let mut kind = usize::from(p.kind == PlateCamber::Parabolic);
+                egui::Grid::new("plate").num_columns(2).show(ui, |ui| {
+                    if num(ui, "thickness (%c)", &mut t, 0.1, 0.2..=15.0, "constant plate thickness; the edges are semicircles") {
+                        p.thickness = t / 100.0;
+                    }
+                    if num(ui, "camber (%c)", &mut c, 0.1, -15.0..=15.0, "") {
+                        p.camber = c / 100.0;
+                    }
+                    ui.label("camber line");
+                    if widgets::pick(ui, "platekind", &mut kind, &["circular arc", "parabolic"]) {
+                        p.kind = if kind == 1 { PlateCamber::Parabolic } else { PlateCamber::CircularArc };
+                    }
+                    ui.end_row();
+                    if p.kind == PlateCamber::Parabolic {
+                        num(ui, "x of max camber", &mut p.x_camber, 0.01, 0.1..=0.9, "");
+                    }
+                    let mut te = usize::from(p.trailing_edge == PlateEdge::Round);
+                    ui.label("trailing edge").on_hover_text("square: blunt, as thick as the plate (XFoil can analyse it); round: a semicircle, geometry only (XFoil's viscous solution does not converge on it)");
+                    if widgets::pick(ui, "platete", &mut te, &["square", "round"]) {
+                        p.trailing_edge = if te == 1 { PlateEdge::Round } else { PlateEdge::Square };
+                    }
+                    ui.end_row();
+                });
+            }
+            _ => {
+                ui.horizontal(|ui| {
+                    ui.label("NACA");
+                    ui.add(egui::TextEdit::singleline(&mut fui.naca).desired_width(150.0)).on_hover_text(NACA_HELP);
+                });
+                ui.checkbox(&mut g.closed_te, "closed trailing edge").on_hover_text("4- and 5-digit sections: x^4 coefficient -0.1036 instead of -0.1015");
+                hint(ui, NACA_HELP);
+            }
+        }
+        let res = fui.gen.preview(&fui.naca);
+        let mut add = None;
+        let mut replace = None;
+        match &res {
+            Ok(f) => {
+                let p = f.props();
+                hint(ui, &format!("{}: t/c {:.2}% at {:.3}, camber {:.2}% at {:.3}, LE radius {:.4}", f.name, p.thickness * 100.0, p.x_thickness, p.camber * 100.0, p.x_camber, p.le_radius));
+                ui.horizontal(|ui| {
+                    if ui.button("Add").on_hover_text("add as a new foil").clicked() {
+                        add = Some(f.clone());
+                    }
+                    if let Some(sel) = selected {
+                        if ui.button("Replace selected").on_hover_text(format!("give '{}' this shape (keeps its name and hinge; its polars are cleared)", sel.name)).clicked() {
+                            replace = Some((sel.clone(), f.clone()));
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                ui.label(RichText::new(e).color(Color32::from_rgb(230, 80, 70)));
+            }
+        }
+        if let Some(r) = selected.and_then(|f| f.recipe.as_ref()) {
+            if ui.button(format!("Edit parameters of '{}'", selected.unwrap().name)).on_hover_text(format!("load its {} recipe into the editor", r.family_label())).clicked() {
+                let r = r.clone();
+                self.fui.gen.load(&r, &mut self.fui.naca);
+            }
+        }
+        if let Some(mut f) = add {
+            self.snapshot_foil_geometry();
+            f.name = self.project.unique_foil_name(&f.name);
+            self.sel_foil = Some(f.name.clone());
+            self.project.foils.push(f);
+        }
+        if let Some((sel, mut f)) = replace {
+            self.snapshot_foil_geometry();
+            f.name = sel.name.clone();
+            f.hinge = sel.hinge;
+            self.project.upsert_foil(f);
+            self.fui.preview = None;
+        }
+    }
+
     pub fn foil_design(&mut self, ui: &mut egui::Ui) {
         egui::SidePanel::left("foil_design_left").resizable(true).default_width(340.0).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -198,21 +464,7 @@ impl App {
                 }
                 ui.separator();
                 heading(ui, "Create");
-                ui.horizontal(|ui| {
-                    ui.label("NACA");
-                    ui.add(egui::TextEdit::singleline(&mut self.fui.naca).desired_width(70.0)).on_hover_text("4-digit (e.g. 2412: 2% camber at 40%, 12% thick) or 5-digit (230xx)");
-                    if ui.button("Add").clicked() {
-                        match Foil::naca(&self.fui.naca) {
-                            Ok(mut f) => {
-                                self.snapshot_foil_geometry();
-                                f.name = self.project.unique_foil_name(&f.name);
-                                self.sel_foil = Some(f.name.clone());
-                                self.project.foils.push(f);
-                            }
-                            Err(e) => self.notify(e.to_string(), true),
-                        }
-                    }
-                });
+                self.generator_ui(ui, foil.as_ref());
                 if ui.button("Load .dat files...").on_hover_text("Selig or Lednicer coordinate files; clockwise files are reordered automatically").clicked() {
                     if let Some(files) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.add_filter("Airfoil", &["dat", "txt"]).pick_files()) {
                         self.snapshot_foil_geometry();
@@ -362,11 +614,16 @@ impl App {
                     }
                 });
                 section(ui, "Optimiser (MOPSO / genetic)", false, |ui| {
-                    hint(ui, "Hicks-Henne bumps on both surfaces (and optionally a flap) are optimised with XFoil at one operating point. Every evaluation runs in the background.");
+                    hint(ui, "The shape of both surfaces (and optionally a flap) is optimised with XFoil at one operating point. Hicks-Henne bumps change it locally; CST weights change thickness, camber and LE radius globally without waviness. Every evaluation runs in the background.");
                     let o = &mut self.fui.opt;
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut o.algorithm, Algorithm::Mopso, "particle swarm (MOPSO)");
                         ui.selectable_value(&mut o.algorithm, Algorithm::Genetic, "genetic");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("shape variables");
+                        ui.selectable_value(&mut o.parameterization, Parameterization::HicksHenne, "Hicks-Henne bumps");
+                        ui.selectable_value(&mut o.parameterization, Parameterization::Cst, "CST weights");
                     });
                     egui::Grid::new("opt").num_columns(2).show(ui, |ui| {
                         num(ui, "alpha (deg)", &mut o.alpha, 0.1, -10.0..=20.0, "operating point angle of attack");
@@ -375,8 +632,13 @@ impl App {
                         num(ui, "Ncrit", &mut o.analysis.ncrit, 0.1, 0.5..=15.0, "");
                         int(ui, "population", &mut o.population, 4..=100, "candidates per iteration (7-15 recommended)");
                         int(ui, "iterations", &mut o.iterations, 1..=500, "");
-                        int(ui, "bumps per side", &mut o.bumps_per_side, 1..=10, "Hicks-Henne functions on each surface");
-                        num(ui, "max bump (c)", &mut o.max_amplitude, 0.001, 0.0005..=0.05, "maximum bump amplitude, fraction of chord");
+                        if o.parameterization == Parameterization::Cst {
+                            int(ui, "CST order", &mut o.cst_order, 1..=12, "order + 1 weight changes on each surface");
+                            num(ui, "max weight change", &mut o.cst_max_delta, 0.002, 0.002..=0.3, "largest change of a CST weight (0.05 moves a 12% section by roughly 0.5% of chord)");
+                        } else {
+                            int(ui, "bumps per side", &mut o.bumps_per_side, 1..=10, "Hicks-Henne functions on each surface");
+                            num(ui, "max bump (c)", &mut o.max_amplitude, 0.001, 0.0005..=0.05, "maximum bump amplitude, fraction of chord");
+                        }
                         let mut fl = o.flap.is_some();
                         if check(ui, "optimise a TE flap angle", &mut fl, "adds the flap deflection as a design variable") {
                             o.flap = if fl { Some((0.0, 10.0)) } else { None };
@@ -485,6 +747,7 @@ impl App {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let foil = self.selected_foil();
             let pv = self.fui.preview.clone();
+            let new_foil = self.fui.gen.shown().cloned();
             let live = self.fui.opt_job.and_then(|id| self.jobs.get(id)).and_then(|j| j.partial.lock().unwrap().optim.clone()).or_else(|| self.fui.opt_result.clone());
             let extra = self.fui.qdist.is_some() || live.is_some();
             let h = ui.available_height();
@@ -504,6 +767,9 @@ impl App {
                 }
                 if let Some(p) = &pv {
                     pu.line(Line::new("preview", PlotPoints::from(foil_lines(p))).color(Color32::from_rgb(255, 160, 60)).width(2.0_f32));
+                }
+                if let Some(g) = &new_foil {
+                    pu.line(Line::new(format!("new: {}", g.name), PlotPoints::from(foil_lines(g))).color(Color32::from_rgb(230, 110, 230)).width(1.5_f32).style(egui_plot::LineStyle::dashed_loose()));
                 }
             });
             if extra {
