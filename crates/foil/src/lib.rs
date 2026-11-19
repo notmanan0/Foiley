@@ -6,7 +6,7 @@
 //! * [`analysis`]: operating points and polars (types 1-4) solved by the
 //!   XFoil engine, with progress reporting, cancellation, panic isolation
 //!   and an automatic recovery strategy for unconverged points.
-//! * [`gen`]: airfoil generators: every NACA family (4/5-digit, 4-digit
+//! * [`gen`]: airfoil generators: the NACA families (4/5-digit, 4-digit
 //!   modified, 16-, 6- and 6A-series), CST, PARSEC, Karman-Trefftz and
 //!   cambered plates.
 //! * [`batch`]: multithreaded polar meshes (Re x Mach x Ncrit grids) used to

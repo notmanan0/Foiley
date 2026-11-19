@@ -6,7 +6,7 @@
 //! crest position, height and curvature, and the trailing-edge height and
 //! slope.
 
-use super::{cosine_spacing, from_surfaces, surfaces_cross, Surfaces, NSIDE};
+use super::{check_contour, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
 use crate::{Foil, FoilError};
 use foiley_core::linalg::solve_dense;
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,9 @@ impl Parsec {
         if self.z_up <= self.z_lo {
             return Err(FoilError::Geometry("PARSEC: the upper crest must be above the lower crest".into()));
         }
+        if self.zxx_up >= 0.0 || self.zxx_lo <= 0.0 {
+            return Err(FoilError::Geometry("PARSEC: a crest needs curvature z'' < 0 on the upper surface and > 0 on the lower (otherwise it is a trough)".into()));
+        }
         if self.dz_te < 0.0 || self.beta_te < 0.0 || self.beta_te >= 90.0 || self.alpha_te.abs() >= 45.0 {
             return Err(FoilError::Geometry("PARSEC: need TE thickness >= 0, wedge angle 0..90 deg, TE direction within +-45 deg".into()));
         }
@@ -117,8 +120,25 @@ impl Parsec {
         if surfaces_cross(&up, &lo) {
             return Err(FoilError::Geometry("PARSEC: the upper surface dips below the lower one".into()));
         }
+        // the crests must be the extreme points of their surfaces: the
+        // conditions only make them stationary, and far-off crests can let
+        // the polynomial run away elsewhere
+        let (cu, cl) = self.coefficients()?;
+        for k in 0..=2000 {
+            let x = k as f64 / 2000.0;
+            let (zu, zl) = (eval(&cu, x), eval(&cl, x));
+            if zu > self.z_up + 1e-9 || zl < self.z_lo - 1e-9 {
+                return Err(FoilError::Geometry(format!(
+                    "PARSEC: the {} crest is not the extreme of its surface (it reaches {:.4} at x/c {x:.3})",
+                    if zu > self.z_up + 1e-9 { "upper" } else { "lower" },
+                    if zu > self.z_up + 1e-9 { zu } else { zl }
+                )));
+            }
+        }
         let mut f = from_surfaces(name, &up, &lo)?;
+        check_contour(&f, "PARSEC")?;
         f.note = "PARSEC".into();
+        f.recipe = Some(Recipe::Parsec(*self));
         Ok(f)
     }
 }
@@ -171,6 +191,12 @@ mod tests {
         let p = Parsec { z_up: -0.1, ..Default::default() };
         assert!(p.generate("p").is_err());
         let p = Parsec { r_le: 0.0, ..Default::default() };
+        assert!(p.generate("p").is_err());
+        // a "crest" with positive curvature is a trough
+        assert!(Parsec { zxx_up: 0.1, ..Default::default() }.generate("p").is_err());
+        assert!(Parsec { zxx_lo: -0.1, ..Default::default() }.generate("p").is_err());
+        // crests at x/c 0.99 let the surfaces run away to ~1e5 chords
+        let p = Parsec { x_up: 0.99, x_lo: 0.99, ..Default::default() };
         assert!(p.generate("p").is_err());
     }
 }

@@ -17,6 +17,17 @@ fn naca_digits(name: &str) -> Option<String> {
     (d.len() == 4 && d.chars().all(|c| c.is_ascii_digit())).then(|| d.to_string())
 }
 
+/// The 4-digit code AVL should generate for a foil: only when the name is
+/// "NACA dddd" and the stored geometry (`hash`, if the foil is known) is
+/// that section, so a foil reshaped under a NACA name is exported as a file.
+fn avl_naca(name: &str, hash: Option<foiley_core::hash::Hash32>) -> Option<String> {
+    let d = naca_digits(name)?;
+    match hash {
+        None => Some(d),
+        Some(h) => (Foil::naca(&d).ok()?.geom_hash() == h).then_some(d),
+    }
+}
+
 /// Shortest text that reads back to the same f64 (no exponent, no "-0").
 fn num(v: f64) -> String {
     if v == 0.0 {
@@ -156,7 +167,7 @@ fn plan_wing(iw: usize, w: &Wing, flaps: &[&FlapInfo], gains: &[(ControlTarget, 
     plan
 }
 
-fn write_surface(o: &mut String, title: &str, w: &Wing, left: bool, ydup: bool, ctrls: &[AvlControl]) {
+fn write_surface(o: &mut String, title: &str, w: &Wing, left: bool, ydup: bool, ctrls: &[AvlControl], db: &FoilDb) {
     let nx = w.sections.first().map(|s| s.nx).unwrap_or(8);
     let cspace = avl_space(w.sections.first().map(|s| s.xdist).unwrap_or_default(), false);
     o.push_str(&format!("#{}\nSURFACE\n{title}\n#Nchord Cspace\n{nx} {}\n", "=".repeat(60), num(cspace)));
@@ -185,7 +196,7 @@ fn write_surface(o: &mut String, title: &str, w: &Wing, left: bool, ydup: bool, 
             num(avl_space(seg.ydist, left))
         ));
         let foil = w.foil(k, left);
-        match naca_digits(foil) {
+        match avl_naca(foil, db.foil_hash(foil)) {
             Some(d) => o.push_str(&format!("NACA\n{d}\n")),
             None => o.push_str(&format!("AFILE\n{}.dat\n", foil.replace(' ', "_"))),
         }
@@ -227,23 +238,25 @@ pub fn avl_with_gains(plane: &Plane, db: &FoilDb, mach: f64, gains: &[(ControlTa
         let plan = plan_wing(iw, w, &wf, gains, &mut used);
         let title = format!("{} ({})", w.name, w.kind.label());
         if plan.mirrored || !w.two_sided {
-            write_surface(&mut o, &title, w, false, plan.mirrored, &plan.right);
+            write_surface(&mut o, &title, w, false, plan.mirrored, &plan.right, db);
         } else {
-            write_surface(&mut o, &format!("{title} right"), w, false, false, &plan.right);
-            write_surface(&mut o, &format!("{title} left"), w, true, false, &plan.left);
+            write_surface(&mut o, &format!("{title} right"), w, false, false, &plan.right, db);
+            write_surface(&mut o, &format!("{title} left"), w, true, false, &plan.left, db);
         }
     }
     o
 }
 
 /// Foil files referenced by `AFILE` entries: (file name, .dat text).
+/// Uses the same NACA-or-file decision as [`avl_with_gains`].
 pub fn avl_foil_files(plane: &Plane, foils: &[foiley_foil::Foil]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for n in plane.foil_names() {
-        if naca_digits(&n).is_some() {
+        let foil = foils.iter().find(|f| f.name == n);
+        if avl_naca(&n, foil.map(|f| f.geom_hash())).is_some() {
             continue;
         }
-        if let Some(f) = foils.iter().find(|f| f.name == n) {
+        if let Some(f) = foil {
             out.push((format!("{}.dat", n.replace(' ', "_")), f.to_dat()));
         }
     }
@@ -844,5 +857,23 @@ mod tests {
         assert!(avl_mass(&p, &db).contains("whole aircraft"));
         let stl = stl_mesh(&p, &db, true).unwrap();
         assert!(crate::cad::read_stl(&stl).unwrap().len() > 500);
+    }
+
+    #[test]
+    fn a_foil_reshaped_under_a_naca_name_is_exported_as_a_file() {
+        // Studio's "Replace selected" keeps the name "NACA 2412" on a CST shape
+        let mut cst = foiley_foil::Foil::from_recipe(&foiley_foil::Recipe::Cst(Default::default()), Some("NACA 2412")).unwrap();
+        cst.name = "NACA 2412".into();
+        let tail = foiley_foil::Foil::naca("0009").unwrap();
+        let mut db = FoilDb::new();
+        db.add_foil(&cst);
+        db.add_foil(&tail);
+        let p = Plane::default_plane("NACA 2412", "NACA 0009");
+        let t = avl(&p, &db, 0.0);
+        assert!(!t.contains("NACA\n2412") && t.contains("AFILE\nNACA_2412.dat"), "{t}");
+        assert!(t.contains("NACA\n0009"));
+        let files = avl_foil_files(&p, &[cst.clone(), tail]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], ("NACA_2412.dat".to_string(), cst.to_dat()));
     }
 }

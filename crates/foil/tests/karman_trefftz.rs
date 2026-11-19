@@ -17,7 +17,7 @@ fn inviscid_lift_and_pressure_match_the_exact_solution() {
             let err = (p.cl - exact.cl).abs() / exact.cl.abs().max(0.1);
             println!("{kt:?} alpha {alpha}: XFoil CL {:.5}, exact {:.5} ({:.2}%), Cm {:.5} vs {:.5}", p.cl, exact.cl, 100.0 * err, p.cm, exact.cm);
             assert!(err < 0.005, "{kt:?} alpha {alpha}: XFoil {} exact {}", p.cl, exact.cl);
-            assert!((p.cm - exact.cm).abs() < 1e-3, "{kt:?} alpha {alpha}: Cm XFoil {} exact {}", p.cm, exact.cm);
+            assert!((p.cm - exact.cm).abs() < 5e-4, "{kt:?} alpha {alpha}: Cm XFoil {} exact {}", p.cm, exact.cm);
         }
     }
 }

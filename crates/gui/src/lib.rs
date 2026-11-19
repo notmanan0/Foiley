@@ -634,6 +634,12 @@ impl App {
                 self.notify(msg, false);
             }
             (Pending::Inverse, JobOutput::Inverse(foil, d)) => {
+                // drop results for a foil that was reshaped while the job ran
+                let current = self.fui.inv_geom.as_ref().and_then(|(n, h)| self.project.foil(n).map(|f| foiley_foil::foil::node_hash(&f.x, &f.y) == *h));
+                if current != Some(true) {
+                    self.notify(format!("{title}: discarded, the foil changed while it ran"), false);
+                    return;
+                }
                 match foil {
                     Some(f) => {
                         self.fui.preview = Some(f);

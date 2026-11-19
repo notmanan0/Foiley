@@ -276,6 +276,8 @@ impl Foil {
         f.x = xf.x[1..=xf.n].to_vec();
         f.y = xf.y[1..=xf.n].to_vec();
         f.note = format!("repaneled ({} panels)", xf.n);
+        // regenerating from the recipe would undo the new paneling
+        f.recipe = None;
         Ok(f)
     }
 

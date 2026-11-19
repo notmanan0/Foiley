@@ -7,7 +7,7 @@
 //! whose gap is the plate thickness): its boundary layer cannot follow a
 //! round cap that closes to a point, and no viscous point converges.
 
-use super::{cosine_spacing, NSIDE};
+use super::{check_contour, cosine_spacing, Recipe, NSIDE};
 use crate::{Foil, FoilError};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -68,7 +68,33 @@ impl Plate {
         if self.kind == PlateCamber::Parabolic && !(0.1..=0.9).contains(&self.x_camber) {
             return Err(FoilError::Geometry("plate: the position of maximum camber must be 0.1..0.9".into()));
         }
+        // the inner side of the plate folds over where its half-thickness
+        // exceeds the radius of curvature of the camber line
+        let rmin = self.min_camber_radius();
+        if 0.5 * self.thickness >= rmin {
+            return Err(FoilError::Geometry(format!(
+                "plate: half the thickness ({:.4}) must be less than the smallest radius of curvature of the camber line ({rmin:.4}); reduce the thickness or the camber",
+                0.5 * self.thickness
+            )));
+        }
         Ok(())
+    }
+
+    /// Smallest radius of curvature of the camber line.
+    fn min_camber_radius(&self) -> f64 {
+        let h = self.camber.abs();
+        if h == 0.0 {
+            return f64::INFINITY;
+        }
+        match self.kind {
+            PlateCamber::CircularArc => (0.25 + h * h) / (2.0 * h),
+            // y'' = -2h/p^2 ahead of the crest, -2h/(1-p)^2 behind it; the
+            // radius (1 + y'^2)^1.5 / |y''| is smallest at the crest (y' = 0)
+            PlateCamber::Parabolic => {
+                let p = self.x_camber;
+                p.min(1.0 - p).powi(2) / (2.0 * h)
+            }
+        }
     }
 
     /// Camber line ordinate and slope at x.
@@ -147,6 +173,8 @@ impl Plate {
         pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12);
         let (x, y): (Vec<f64>, Vec<f64>) = pts.into_iter().unzip();
         let mut f = Foil::new(name, x, y)?;
+        check_contour(&f, "plate")?;
+        f.recipe = Some(Recipe::Plate(*self));
         f.note = format!(
             "{} plate, t/c {:.1}%, camber {:.1}%, {} trailing edge",
             match self.kind {
@@ -164,6 +192,27 @@ impl Plate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folding_plates_are_rejected() {
+        let p = Plate { thickness: 0.15, camber: 0.15, x_camber: 0.1, kind: PlateCamber::Parabolic, trailing_edge: PlateEdge::Square };
+        assert!(p.generate("p").is_err());
+        // the extremes Studio allows that do not fold still generate
+        for kind in [PlateCamber::CircularArc, PlateCamber::Parabolic] {
+            for te in [PlateEdge::Square, PlateEdge::Round] {
+                for t in [0.002, 0.05, 0.15] {
+                    for c in [-0.15, 0.0, 0.08, 0.15] {
+                        for xc in [0.1, 0.5, 0.9] {
+                            let p = Plate { thickness: t, camber: c, x_camber: xc, kind, trailing_edge: te };
+                            if p.validate().is_ok() {
+                                p.generate("p").unwrap_or_else(|e| panic!("{p:?}: {e}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn camber_lines_peak_where_asked() {

@@ -92,7 +92,7 @@ include scripts for recording the review cases.
 |---|---|
 | `foiley` (repo root, `src/`) | the XFoil 6.99 engine: panel method, boundary layer, Newton solver, GDES/QDES/MDES. The regression tests can still select 6.97 numerics to compare with the 6.97 Fortran (F015 matrix); Foiley's pipelined, fine-parallel, scalar and AVX2 paths are bit-identical to its own sequential run. |
 | `crates/core` | `Vec3`, progress and cancellation handles, dense LU and eigenvalues (faer, multithreaded), interpolation, ISA atmosphere |
-| `crates/foil` | `Foil` geometry and file I/O (Selig and Lednicer .dat), generators (every NACA family, CST, PARSEC, Kármán–Trefftz, cambered plates; see [docs/airfoil-families.md](docs/airfoil-families.md)), every XFoil design operation as a function, inverse design (QDES/MDES), the optimiser (MOPSO/GA), the 2D analysis service with convergence recovery, polar types 1/2/3/4/6, batch polar meshes |
+| `crates/foil` | `Foil` geometry and file I/O (Selig and Lednicer .dat), generators (NACA 4/5-digit, 4-digit modified, 16-, 6- and 6A-series, CST, PARSEC, Kármán–Trefftz, cambered plates; see [docs/airfoil-families.md](docs/airfoil-families.md)), every XFoil design operation as a function, inverse design (QDES/MDES), the optimiser (MOPSO/GA), the 2D analysis service with convergence recovery, polar types 1/2/3/4/6, batch polar meshes |
 | `crates/plane` | plane/wing/fuselage model (elliptic, NURBS, STL/STEP), reference dimensions, inertia, meshing (thin and thick, quads or triangles, flaps, tips, fuselage), LLT, VLM1, VLM2 with optional free wake, source/doublet panel methods, polar types T1 to T8, trim, stability and control derivatives, modes, time responses, XML/AVL/STL exchange |
 | `crates/app` | project file (`.foiley`, JSON), imports (including xflr5 `.xfl`, flow5 `.fl5`, `.plr`), automatic 2D polar meshes for 3D runs, the background **job manager** |
 | `crates/cli` | the `foiley` binary: command line, XFoil mode, start-up routing; links `crates/gui` (feature `gui`, on by default) |
@@ -284,8 +284,8 @@ in xflr5 and flow5; use VLM or panels for swept or dihedral wings.
 * The 5-digit (standard and reflexed), 4-digit modified, 16-, 6- and
   6A-series generators match the ordinates of NASA Langley's NACA4 and NACA6
   programs within 1.6e-5 of chord aft of x/c = 0.0125 (5-decimal tables).
-* The codes XFoil generates (4-digit, 210xx-250xx) are bit-identical to
-  Foiley 1.1.
+* All 10,500 codes XFoil generates (any 1- to 4-digit code, 210xx-250xx)
+  are bit-identical to Foiley 1.1.
 * XFoil's inviscid CL on Kármán–Trefftz sections is within 0.3% of the exact
   conformal-map solution, and Cm within 4e-4.
 * CST fits of NACA 2412 (order 8) are within 2e-4 of chord.

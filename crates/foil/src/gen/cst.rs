@@ -12,7 +12,7 @@
 //! A0 sets the leading-edge radius (r = A0^2 / 2), A_n the trailing-edge
 //! wedge angle, and dz the trailing-edge offset of that surface.
 
-use super::{cosine_spacing, from_surfaces, surfaces_cross, Surfaces, NSIDE};
+use super::{check_contour, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
 use crate::{Foil, FoilError};
 use foiley_core::linalg::{lstsq, DenseMatrix};
 use serde::{Deserialize, Serialize};
@@ -92,11 +92,16 @@ impl Cst {
         if self.upper.len() > 31 {
             return Err(FoilError::Geometry("CST: at most 30th order".into()));
         }
-        if !(0.0..=1.0).contains(&self.n1) || !(0.0..=2.0).contains(&self.n2) {
-            return Err(FoilError::Geometry("CST: N1 must be in 0..1 and N2 in 0..2".into()));
+        // N1 = 0 or N2 = 0 would leave the class function nonzero at the
+        // nose or the tail, so the surfaces would not meet there
+        if !(self.n1 > 0.0 && self.n1 <= 1.0 && self.n2 > 0.0 && self.n2 <= 2.0) {
+            return Err(FoilError::Geometry("CST: N1 must be in (0, 1] and N2 in (0, 2]".into()));
         }
         if self.upper.iter().chain(&self.lower).chain([&self.te_upper, &self.te_lower, &self.n1, &self.n2]).any(|v| !v.is_finite()) {
             return Err(FoilError::Geometry("CST: non-finite parameter".into()));
+        }
+        if self.te_upper < self.te_lower {
+            return Err(FoilError::Geometry(format!("CST: the upper trailing edge ({}) is below the lower one ({})", self.te_upper, self.te_lower)));
         }
         Ok(())
     }
@@ -115,7 +120,9 @@ impl Cst {
             return Err(FoilError::Geometry("CST: the upper surface dips below the lower one".into()));
         }
         let mut f = from_surfaces(name, &up, &lo)?;
+        check_contour(&f, "CST")?;
         f.note = format!("CST order {}", self.order());
+        f.recipe = Some(Recipe::Cst(self.clone()));
         Ok(f)
     }
 
@@ -152,6 +159,9 @@ impl Cst {
         let te_upper = upper.last().map(|p| p.1).unwrap_or(0.0);
         let te_lower = lower.last().map(|p| p.1).unwrap_or(0.0);
         let cst = Cst { upper: fit_side(&upper, te_upper)?, lower: fit_side(&lower, te_lower)?, n1, n2, te_upper, te_lower };
+        // a high-order fit can oscillate until its surfaces cross: report
+        // that instead of returning weights `generate` would reject
+        cst.generate("fit").map_err(|e| FoilError::Geometry(format!("the order-{order} CST fit is not a valid foil ({e}); try a lower order")))?;
         let mut sq = 0.0;
         let mut max: f64 = 0.0;
         let mut cnt = 0usize;
@@ -211,5 +221,27 @@ mod tests {
         let mut c = Cst::default();
         c.lower = c.upper.iter().map(|v| v + 0.05).collect();
         assert!(c.generate("x").is_err());
+    }
+
+    #[test]
+    fn unsupported_class_exponents_and_inverted_edges_are_rejected() {
+        for (n1, n2) in [(0.5, 0.0), (0.0, 1.0)] {
+            assert!(Cst { n1, n2, ..Cst::default() }.generate("x").is_err(), "{n1} {n2}");
+        }
+        assert!(Cst { te_upper: -1e-8, te_lower: 0.0, ..Cst::default() }.generate("x").is_err());
+        assert!(Cst { upper: vec![], lower: vec![], ..Cst::default() }.generate("x").is_err());
+        assert!(Cst { upper: vec![0.1, 0.2], lower: vec![-0.1], ..Cst::default() }.validate().is_err());
+        // order 0 is a valid (if crude) section
+        assert!(Cst { upper: vec![0.15], lower: vec![-0.15], ..Cst::default() }.generate("x").is_ok());
+    }
+
+    #[test]
+    fn every_fit_that_succeeds_regenerates() {
+        let f = Foil::naca("63A210").unwrap();
+        for order in [4, 8, 12, 20, 30] {
+            if let Ok((c, _)) = Cst::fit(&f, order) {
+                c.generate("x").unwrap_or_else(|e| panic!("order {order}: {e}"));
+            }
+        }
     }
 }

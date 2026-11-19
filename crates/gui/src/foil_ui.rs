@@ -7,7 +7,7 @@ use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
 use foiley_app::JobKind;
 use foiley_foil::analysis::{PointDetail, PolarType};
 use foiley_foil::batch::{re_list_geometric, BatchCase};
-use foiley_foil::foil::{NodeInput, Paneling};
+use foiley_foil::foil::{node_hash, NodeInput, Paneling};
 use foiley_foil::{AnalysisSettings, Foil, FoilPoint, FoilPolar, Sweep};
 use foiley_foil::inverse::{modify, InverseMode, ModKind, Modification, SpeedDist};
 use foiley_foil::gen::cst::{Cst, CstFit};
@@ -80,8 +80,10 @@ impl GenUi {
         }
     }
 
-    /// Put a foil's recipe into the editor.
-    pub fn load(&mut self, r: &Recipe, naca: &mut String) {
+    /// Put a foil's recipe into the editor, if it is valid (a saved project
+    /// could hold, say, CST weight lists of different lengths).
+    pub fn load(&mut self, r: &Recipe, naca: &mut String) -> Result<(), String> {
+        r.validate().map_err(|e| format!("cannot edit this recipe: {e}"))?;
         match r {
             Recipe::Naca { designation } => {
                 self.family = 0;
@@ -106,6 +108,7 @@ impl GenUi {
                 self.plate = *p;
             }
         }
+        Ok(())
     }
 
     /// The generated foil for the current parameters (cached).
@@ -165,6 +168,8 @@ pub struct FoilUi {
     pub inv_kind: usize,
     pub inv_val: [f64; 2],
     pub inv_iter: usize,
+    /// Name and node hash of the foil the speed distribution was computed for.
+    pub inv_geom: Option<(String, u64)>,
     pub opt: OptimSettings,
     pub opt_job: Option<JobId>,
     pub opt_result: Option<OptimResult>,
@@ -210,6 +215,7 @@ impl Default for FoilUi {
             inv_kind: 0,
             inv_val: [0.97, 0.02],
             inv_iter: 10,
+            inv_geom: None,
             opt: OptimSettings::default(),
             opt_job: None,
             opt_result: None,
@@ -280,23 +286,23 @@ impl App {
                 hint(ui, "y = x^N1 (1-x)^N2 sum A_i B_i(x) + x dz on each surface. A0 sets the LE radius (r = A0^2/2), the last weight the TE wedge.");
                 let mut order = g.cst.order();
                 egui::Grid::new("cstp").num_columns(2).show(ui, |ui| {
-                    if int(ui, "order", &mut order, 1..=15, "Bernstein polynomial order (order + 1 weights per surface)") {
+                    if int(ui, "order", &mut order, 0..=30, "Bernstein polynomial order (order + 1 weights per surface)") {
                         for w in [&mut g.cst.upper, &mut g.cst.lower] {
                             let last = *w.last().unwrap_or(&0.1);
                             w.resize(order + 1, last);
                         }
                     }
-                    num(ui, "TE y upper", &mut g.cst.te_upper, 0.0002, -0.1..=0.1, "trailing-edge height of the upper surface");
-                    num(ui, "TE y lower", &mut g.cst.te_lower, 0.0002, -0.1..=0.1, "trailing-edge height of the lower surface");
-                    num(ui, "N1", &mut g.cst.n1, 0.01, 0.0..=1.0, "class exponent at the nose (0.5 = round)");
-                    num(ui, "N2", &mut g.cst.n2, 0.01, 0.0..=2.0, "class exponent at the tail (1 = sharp)");
+                    num(ui, "TE y upper", &mut g.cst.te_upper, 0.0002, -1.0..=1.0, "trailing-edge height of the upper surface");
+                    num(ui, "TE y lower", &mut g.cst.te_lower, 0.0002, -1.0..=1.0, "trailing-edge height of the lower surface");
+                    num(ui, "N1", &mut g.cst.n1, 0.01, 0.0..=1.0, "class exponent at the nose (0.5 = round; must be > 0)");
+                    num(ui, "N2", &mut g.cst.n2, 0.01, 0.0..=2.0, "class exponent at the tail (1 = sharp; must be > 0)");
                 });
                 egui::Grid::new("cstw").num_columns(3).striped(true).show(ui, |ui| {
                     ui.label("");
                     ui.label("upper");
                     ui.label("lower");
                     ui.end_row();
-                    for i in 0..g.cst.upper.len() {
+                    for i in 0..g.cst.upper.len().min(g.cst.lower.len()) {
                         ui.label(format!("A{i}"));
                         ui.add(egui::DragValue::new(&mut g.cst.upper[i]).speed(0.001).fixed_decimals(4));
                         ui.add(egui::DragValue::new(&mut g.cst.lower[i]).speed(0.001).fixed_decimals(4));
@@ -318,7 +324,7 @@ impl App {
                         }
                     });
                     ui.label("order");
-                    ui.add(egui::DragValue::new(&mut g.fit_order).range(1..=15));
+                    ui.add(egui::DragValue::new(&mut g.fit_order).range(0..=30));
                 });
                 if let Some((n, fit)) = &g.fit {
                     hint(ui, &format!("fit of {n}: rms {:.1e}, max {:.1e} (chord fractions)", fit.rms, fit.max));
@@ -328,15 +334,15 @@ impl App {
                 hint(ui, "z = sum a_n x^(n-1/2) per surface, from the LE radius, the crests and the trailing edge.");
                 let p = &mut g.parsec;
                 egui::Grid::new("parsec").num_columns(2).show(ui, |ui| {
-                    num(ui, "LE radius", &mut p.r_le, 0.0005, 0.0005..=0.2, "leading-edge radius / chord");
+                    num(ui, "LE radius", &mut p.r_le, 0.0005, 0.0..=0.2, "leading-edge radius / chord");
                     num(ui, "upper crest x", &mut p.x_up, 0.005, 0.01..=0.99, "");
-                    num(ui, "upper crest z", &mut p.z_up, 0.001, -0.3..=0.3, "");
-                    num(ui, "upper crest z''", &mut p.zxx_up, 0.01, -10.0..=10.0, "curvature at the crest (negative)");
+                    num(ui, "upper crest z", &mut p.z_up, 0.001, -1.0..=1.0, "");
+                    num(ui, "upper crest z''", &mut p.zxx_up, 0.01, -100.0..=100.0, "curvature at the crest (negative)");
                     num(ui, "lower crest x", &mut p.x_lo, 0.005, 0.01..=0.99, "");
-                    num(ui, "lower crest z", &mut p.z_lo, 0.001, -0.3..=0.3, "");
-                    num(ui, "lower crest z''", &mut p.zxx_lo, 0.01, -10.0..=10.0, "curvature at the crest (positive)");
-                    num(ui, "TE height", &mut p.z_te, 0.001, -0.2..=0.2, "height of the trailing-edge midpoint");
-                    num(ui, "TE thickness", &mut p.dz_te, 0.0005, 0.0..=0.05, "");
+                    num(ui, "lower crest z", &mut p.z_lo, 0.001, -1.0..=1.0, "");
+                    num(ui, "lower crest z''", &mut p.zxx_lo, 0.01, -100.0..=100.0, "curvature at the crest (positive)");
+                    num(ui, "TE height", &mut p.z_te, 0.001, -1.0..=1.0, "height of the trailing-edge midpoint");
+                    num(ui, "TE thickness", &mut p.dz_te, 0.0005, 0.0..=0.5, "");
                     num(ui, "TE direction (deg)", &mut p.alpha_te, 0.1, -44.0..=44.0, "bisector angle below the chord line");
                     num(ui, "TE wedge (deg)", &mut p.beta_te, 0.1, 0.0..=89.0, "included angle");
                 });
@@ -416,7 +422,9 @@ impl App {
         if let Some(r) = selected.and_then(|f| f.recipe.as_ref()) {
             if ui.button(format!("Edit parameters of '{}'", selected.unwrap().name)).on_hover_text(format!("load its {} recipe into the editor", r.family_label())).clicked() {
                 let r = r.clone();
-                self.fui.gen.load(&r, &mut self.fui.naca);
+                if let Err(e) = self.fui.gen.load(&r, &mut self.fui.naca) {
+                    self.notify(e, true);
+                }
             }
         }
         if let Some(mut f) = add {
@@ -431,6 +439,9 @@ impl App {
             f.hinge = sel.hinge;
             self.project.upsert_foil(f);
             self.fui.preview = None;
+            self.fui.qdist = None;
+            self.fui.inv_target = None;
+            self.fui.inv_geom = None;
         }
     }
 
@@ -575,8 +586,16 @@ impl App {
                     egui::Grid::new("inv").num_columns(2).show(ui, |ui| {
                         num(ui, "alpha (deg)", &mut self.fui.inv_alpha, 0.1, -20.0..=20.0, "design angle of attack (inviscid speed distribution)");
                     });
+                    // a speed distribution belongs to the geometry it was computed for
+                    let geom = (foil.name.clone(), node_hash(&foil.x, &foil.y));
+                    if self.fui.inv_geom.as_ref().is_some_and(|g| *g != geom) {
+                        self.fui.qdist = None;
+                        self.fui.inv_target = None;
+                        self.fui.inv_geom = None;
+                    }
                     if ui.button("Get speed distribution").clicked() {
                         self.fui.inv_target = None;
+                        self.fui.inv_geom = Some(geom.clone());
                         let k = JobKind::Inverse { foil: foil.clone(), alpha: self.fui.inv_alpha, mode: self.fui.inv_mode, paneling: self.fui.repanel, target: None, iterations: 0 };
                         self.submit(format!("{} speed distribution", foil.name), k, Pending::Inverse);
                     }
@@ -608,6 +627,7 @@ impl App {
                         if seg.is_none() {
                             ui.label(RichText::new("the segment contains fewer than 2 points").color(Color32::from_rgb(230, 80, 70)));
                         } else if ui.button("Solve for this target").clicked() {
+                            self.fui.inv_geom = Some(geom.clone());
                             let k = JobKind::Inverse { foil: foil.clone(), alpha: self.fui.inv_alpha, mode: self.fui.inv_mode, paneling: self.fui.repanel, target: Some((t, seg)), iterations: self.fui.inv_iter };
                             self.submit(format!("{} inverse design", foil.name), k, Pending::Inverse);
                         }

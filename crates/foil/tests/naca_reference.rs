@@ -1,5 +1,9 @@
-//! The NACA generators against the ordinates printed by NASA Langley's
-//! original NACA4 and NACA6 programs (tests/data/naca, 5 decimals).
+//! The NACA equations (`NacaSection::surfaces_at` / `half_thickness`)
+//! against the ordinates printed by NASA Langley's original NACA4 and NACA6
+//! programs (tests/data/naca, 5 decimals).  This checks the analytic
+//! construction; the codes `Foil::naca` hands to XFoil's own routine
+//! (4-digit, 210xx-250xx, such as 23012 here) are checked bit for bit
+//! against that routine in `gen::naca::tests`.
 
 use foiley_foil::gen::naca;
 use std::path::Path;
@@ -23,6 +27,7 @@ fn compare(code: &str) -> (f64, f64) {
     let x: Vec<f64> = rows.iter().map(|r| r[0]).collect();
     let (mut nose, mut rest): (f64, f64) = (0.0, 0.0);
     let mut note = |x: f64, e: f64| {
+        assert!(e.is_finite(), "NACA {code}: non-finite ordinate at x/c {x}");
         if x < 0.0125 {
             nose = nose.max(e);
         } else {

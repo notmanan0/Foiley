@@ -10,7 +10,7 @@
 //! exact inviscid lift and pressure distribution ([`KarmanTrefftz::exact`]),
 //! which makes it a reference case for the panel solvers.
 
-use super::NSIDE;
+use super::{check_contour, Recipe, NSIDE};
 use crate::{Foil, FoilError};
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -203,14 +203,32 @@ impl KarmanTrefftz {
             y.push(p.1);
         }
         let mut f = Foil::new(name, x, y)?;
+        check_contour(&f, "Karman-Trefftz")?;
         f.note = format!("Karman-Trefftz (centre -{}, {}; TE {} deg)", self.x_center, self.y_center, self.te_angle);
+        f.recipe = Some(Recipe::KarmanTrefftz(*self));
         Ok(f)
     }
 
-    /// Exact inviscid lift, quarter-chord moment and Cp at `alpha` degrees
-    /// (relative to the chord of the normalized section).
+    /// Complex velocity dW/dzeta about the circle, unit free stream at
+    /// `a` radians (mapped plane), circulation `gamma` (clockwise positive).
+    fn circle_velocity(&self, a: f64, gamma: f64, zeta: C) -> C {
+        let zr = zeta - self.center();
+        let r = self.radius();
+        C::polar(1.0, -a) - C::polar(1.0, a) * (r * r) * (zr * zr).inv() + C(0.0, gamma / (2.0 * PI)) * zr.inv()
+    }
+
+    /// Exact inviscid lift, quarter-chord moment (nose up positive) and Cp
+    /// at `alpha` degrees, relative to the chord of the normalized section.
+    ///
+    /// Lift is Kutta-Joukowski's; the force and moment come from the
+    /// Blasius integrals, evaluated on a circle of twice the radius where
+    /// the integrand is analytic, so the periodic trapezoidal rule converges
+    /// to machine precision.
     pub fn exact(&self, alpha: f64) -> Result<KtSolution, FoilError> {
         self.validate()?;
+        if !alpha.is_finite() {
+            return Err(FoilError::Geometry("Karman-Trefftz: the angle of attack must be finite".into()));
+        }
         let c = self.center();
         let r = self.radius();
         let fr = self.frame();
@@ -219,29 +237,36 @@ impl KarmanTrefftz {
         let beta = -self.theta_te();
         let gamma = 4.0 * PI * r * (a + beta).sin();
         let cl = 2.0 * gamma / fr.chord;
+
+        // Blasius: X - iY = (i/2) oint (dW/dz)^2 dz, M0 = -(1/2) Re oint z (dW/dz)^2 dz
+        // (rho = U = 1, counter-clockwise moment about the origin of z)
+        let m = 4096;
+        let (r2, mut f_int, mut m_int) = (2.0 * r, C(0.0, 0.0), C(0.0, 0.0));
+        for k in 0..m {
+            let e = C::polar(1.0, 2.0 * PI * k as f64 / m as f64);
+            let zeta = c + e * r2;
+            let dzeta = C(0.0, 1.0) * e * (r2 * 2.0 * PI / m as f64);
+            let w = self.circle_velocity(a, gamma, zeta);
+            let g = w * w * self.dz_dzeta(zeta).inv() * dzeta;
+            f_int = f_int + g;
+            m_int = m_int + self.map(zeta) * g;
+        }
+        let xy = C(0.0, 0.5) * f_int;
+        let (fx, fy) = (xy.0, -xy.1);
+        let m0 = -0.5 * m_int.0;
+        let te = self.map(C(1.0, 0.0));
+        let qc = fr.le + (te - fr.le) * 0.25;
+        let m_qc = m0 - (qc.0 * fy - qc.1 * fx);
+        // counter-clockwise is nose down for flow from the leading edge
+        let cm = -m_qc / (0.5 * fr.chord * fr.chord);
+
         let th = self.thetas();
         let mut cp = Vec::with_capacity(th.len());
-        let ea = C::polar(1.0, -a);
-        let eb = C::polar(1.0, a);
-        let mut cm = 0.0;
         for &t in &th[1..th.len() - 1] {
-            let zr = C::polar(r, t);
-            let zeta = c + zr;
-            let w = ea - eb * (r * r) * (zr * zr).inv() + C(0.0, gamma / (2.0 * PI)) * zr.inv();
-            let v = (w / self.dz_dzeta(zeta)).abs();
+            let zeta = c + C::polar(r, t);
+            let v = (self.circle_velocity(a, gamma, zeta) / self.dz_dzeta(zeta)).abs();
             let p = (self.map(zeta) - fr.le) * fr.rot * (1.0 / fr.chord);
             cp.push((p.0, p.1, 1.0 - v * v));
-        }
-        // quarter-chord moment by integrating the pressure (closed contour)
-        for i in 0..cp.len().saturating_sub(1) {
-            let (x0, y0, p0) = cp[i];
-            let (x1, y1, p1) = cp[i + 1];
-            let pm = 0.5 * (p0 + p1);
-            let (dx, dy) = (x1 - x0, y1 - y0);
-            // force on the body from pressure on a counter-clockwise contour: -p n ds, n = (dy, -dx)
-            let (fx, fy) = (-pm * dy, pm * dx);
-            let (xm, ym) = (0.5 * (x0 + x1), 0.5 * (y0 + y1));
-            cm += -(xm - 0.25) * fy + ym * fx;
         }
         Ok(KtSolution { cl, cm, cp })
     }
@@ -273,6 +298,52 @@ mod tests {
         let s = kt.exact(4.0).unwrap();
         let want = 2.0 * PI * 4f64.to_radians();
         assert!((s.cl - want).abs() / want < 0.01, "{} {want}", s.cl);
+    }
+
+    /// Lift and quarter-chord moment by integrating the exact pressure over
+    /// `n` contour points (an independent check of the Blasius integrals).
+    fn pressure_integral(kt: &KarmanTrefftz, alpha: f64, n: usize) -> (f64, f64) {
+        let c = kt.center();
+        let r = kt.radius();
+        let fr = kt.frame();
+        let a = alpha.to_radians() - fr.rot.arg();
+        let gamma = 4.0 * PI * r * (a - kt.theta_te()).sin();
+        let t0 = kt.theta_te();
+        let pts: Vec<(f64, f64, f64)> = (1..n)
+            .map(|k| {
+                let zeta = c + C::polar(r, t0 + 2.0 * PI * k as f64 / n as f64);
+                let v = (kt.circle_velocity(a, gamma, zeta) / kt.dz_dzeta(zeta)).abs();
+                let p = (kt.map(zeta) - fr.le) * fr.rot * (1.0 / fr.chord);
+                (p.0, p.1, 1.0 - v * v)
+            })
+            .collect();
+        let (mut fx, mut fy, mut cm) = (0.0, 0.0, 0.0);
+        for w in pts.windows(2) {
+            let ((x0, y0, p0), (x1, y1, p1)) = (w[0], w[1]);
+            let pm = 0.5 * (p0 + p1);
+            let (gx, gy) = (-pm * (y1 - y0), pm * (x1 - x0));
+            fx += gx;
+            fy += gy;
+            cm += -(0.5 * (x0 + x1) - 0.25) * gy + 0.5 * (y0 + y1) * gx;
+        }
+        let al = alpha.to_radians();
+        (fy * al.cos() - fx * al.sin(), cm)
+    }
+
+    #[test]
+    fn blasius_moment_matches_a_converged_pressure_integral() {
+        for kt in [KarmanTrefftz::default(), KarmanTrefftz { x_center: 0.001, y_center: 0.5, te_angle: 0.0 }, KarmanTrefftz { x_center: 0.05, y_center: -0.04, te_angle: 25.0 }] {
+            for alpha in [-3.0, 4.0, 10.0] {
+                let s = kt.exact(alpha).unwrap();
+                let (cl, cm) = pressure_integral(&kt, alpha, 400_000);
+                assert!((cl - s.cl).abs() < 2e-4 * s.cl.abs().max(1.0), "{kt:?} {alpha}: CL {cl} vs {}", s.cl);
+                assert!((cm - s.cm).abs() < 2e-4, "{kt:?} {alpha}: Cm {cm} vs {}", s.cm);
+            }
+        }
+        // a flat plate has no moment about its quarter chord
+        let flat = KarmanTrefftz { x_center: 0.001, y_center: 0.0, te_angle: 0.0 };
+        assert!(flat.exact(15.0).unwrap().cm.abs() < 1e-3);
+        assert!(flat.exact(f64::NAN).is_err());
     }
 
     #[test]

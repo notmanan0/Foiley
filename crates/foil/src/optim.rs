@@ -200,8 +200,37 @@ impl OptimSettings {
     pub fn shape_variables_per_side(&self) -> usize {
         match self.parameterization {
             Parameterization::HicksHenne => self.bumps_per_side,
-            Parameterization::Cst => self.cst_order + 1,
+            Parameterization::Cst => self.cst_order.saturating_add(1),
         }
+    }
+
+    /// Check the shape-variable settings (the analysis settings are checked
+    /// separately): counts within reason and finite ranges.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.parameterization {
+            Parameterization::HicksHenne => {
+                if self.bumps_per_side > 50 {
+                    return Err(format!("{} Hicks-Henne bumps per side; at most 50", self.bumps_per_side));
+                }
+                if !self.max_amplitude.is_finite() || !self.t1.is_finite() || !self.t2.is_finite() {
+                    return Err("the Hicks-Henne amplitude and shape parameters must be finite".into());
+                }
+            }
+            Parameterization::Cst => {
+                if self.cst_order > 30 {
+                    return Err(format!("CST order {}; at most 30", self.cst_order));
+                }
+                if !self.cst_max_delta.is_finite() {
+                    return Err("the largest CST weight change must be finite".into());
+                }
+            }
+        }
+        if let Some((a, b)) = self.flap {
+            if !a.is_finite() || !b.is_finite() {
+                return Err("the flap angle range must be finite".into());
+            }
+        }
+        Ok(())
     }
 
     /// Number of design variables.
@@ -633,6 +662,7 @@ impl Particle {
 /// population (iteration 0) and after every iteration with a snapshot.
 pub fn optimise(base: &Foil, s: &OptimSettings, prog: &Progress, on_iteration: &(dyn Fn(usize, &OptimResult) + Sync)) -> Result<OptimResult, FoilError> {
     base.validate()?;
+    s.validate().map_err(FoilError::Geometry)?;
     s.analysis.validate().map_err(FoilError::Geometry)?;
     let specs = s.enabled();
     if specs.is_empty() {
@@ -902,6 +932,12 @@ mod tests {
         assert!(q.le_radius > p.le_radius && q.thickness > p.thickness, "{p:?} {q:?}");
         assert_eq!((f.y[0], f.y[f.n() - 1]), (b.y[0], b.y[b.n() - 1]));
         assert!(f.note.contains("CST"));
+        // absurd orders and non-finite ranges are input errors, not panics
+        let base0 = Foil::naca("0012").unwrap();
+        for bad in [OptimSettings { parameterization: Parameterization::Cst, cst_order: usize::MAX, ..Default::default() }, OptimSettings { parameterization: Parameterization::Cst, cst_max_delta: f64::NAN, ..Default::default() }] {
+            assert!(matches!(optimise(&base0, &bad, &Progress::none(), &|_, _| {}), Err(FoilError::Geometry(_))));
+            assert!(apply_genes(&base0, &bad, &[0.0; 4]).is_err());
+        }
         // settings written before CST existed still load as Hicks-Henne
         let old: OptimSettings = serde_json::from_str(r#"{"bumps_per_side": 4}"#).unwrap();
         assert_eq!((old.parameterization, old.bumps_per_side, old.dimension()), (Parameterization::HicksHenne, 4, 8));

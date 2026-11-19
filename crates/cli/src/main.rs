@@ -605,6 +605,17 @@ fn gen_recipe(family: &GenFamily) -> Result<foiley_foil::Recipe, String> {
     })
 }
 
+/// Whether two paths name the same file (existing or not).
+fn same_file(a: &Path, b: &Path) -> bool {
+    let full = |p: &Path| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.to_path_buf());
+    let (a, b) = (full(a), full(b));
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
 /// Print a one-line summary of a foil to stderr and write it.
 fn emit_foil(f: &Foil, out: &Option<PathBuf>) -> Result<(), String> {
     let p = f.props();
@@ -814,9 +825,10 @@ fn resolve_foil(spec: &str, proj: &Project) -> Result<Foil, String> {
     if let Some(code) = naca::strip_naca_prefix(spec) {
         return Foil::naca(code).map_err(|e| e.to_string());
     }
+    // a bare designation ("2412", "64A010", "0012-64")
     let l = spec.trim();
-    if l.chars().all(|c| c.is_ascii_digit()) && (l.len() == 4 || l.len() == 5) {
-        return Foil::naca(l).map_err(|e| e.to_string());
+    if l.starts_with(|c: char| c.is_ascii_digit()) {
+        return Foil::naca(l).map_err(|e| format!("'{spec}' is not a file or a foil in the project, nor a NACA designation ({e})"));
     }
     Err(format!("'{spec}' is not a file, a NACA designation, or a foil in the project"))
 }
@@ -1397,6 +1409,11 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Generate { family, name, save, out } => {
+                if let (Some(s), Some(o)) = (&save, &out) {
+                    if same_file(s, o) {
+                        return Err(format!("--save and --out both name {}: the .dat would overwrite the project", s.display()));
+                    }
+                }
                 let recipe = gen_recipe(&family)?;
                 let f = Foil::from_recipe(&recipe, name.as_deref()).map_err(|e| e.to_string())?;
                 if let GenFamily::Kt { exact: Some(list), .. } = &family {

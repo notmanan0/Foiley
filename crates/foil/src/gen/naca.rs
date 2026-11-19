@@ -85,7 +85,10 @@ pub enum Thickness {
     /// maximum thickness (x/c).
     FourDigitModified { t: f64, le_index: f64, x_max: f64 },
     /// NACA 6- or 6A-series, from the conformal mapping of a circle.
-    SixSeries { family: SixFamily, t: f64 },
+    /// `form_t` is the thickness of the basic form whose ordinates are
+    /// scaled linearly to `t` (equal to `t` except in the older
+    /// `65(318)-217` notation of NACA Report 824).
+    SixSeries { family: SixFamily, t: f64, form_t: f64 },
 }
 
 /// Mean (camber) line.
@@ -145,34 +148,63 @@ pub fn strip_naca_prefix(name: &str) -> Option<&str> {
 ///
 /// * `2412`, `0012` - 4-digit
 /// * `23012`, `23112`, `43012` - 5-digit: first digit 0.15 x design CL,
-///   second twice the position of maximum camber (tenths of chord... in
-///   twentieths), third 0 standard or 1 reflexed, last two t/c percent
-/// * `0012-64`, `2412-63` - 4-digit modified: LE radius index, position of
-///   maximum thickness in tenths
+///   second twice the position of maximum camber in tenths of chord, third
+///   0 standard or 1 reflexed, last two t/c percent
+/// * `0012-64`, `2412-63`, `23015-64` - 4-digit modified thickness (LE
+///   radius index, position of maximum thickness in tenths) with a 4- or
+///   5-digit mean line
 /// * `16-212` - 16-series: design CL in tenths, t/c percent
-/// * `63-206`, `64(2)-415`, `65_2-415`, `652-415`, `63-412 a=0.5` -
-///   6-series (subscript = low-drag range, kept in the name only; default
-///   mean line a = 1.0)
-/// * `64A010`, `63A210` - 6A-series with the modified a=0.8 mean line
+/// * `63-206`, `64(2)-415`, `64₂-415`, `65_2-415`, `652-415`,
+///   `63-412 a=0.5`, `65(318)-217` - 6-series (the low-drag-range subscript
+///   is kept in the name only; in the older `(318)` notation the last two
+///   digits give the thickness of the form scaled linearly to the final
+///   t/c; default mean line a = 1.0)
+/// * `64A010`, `63A210`, `64(2)A215` - 6A-series with the modified a=0.8
+///   mean line
 ///
 /// A trailing `closed TE` closes the trailing edge of a 4-digit thickness
-/// (4- and 5-digit sections).
+/// (4- and 5-digit sections).  Every 1- to 4-digit code and every 210xx to
+/// 250xx code generates exactly what XFoil's `NACA` command (and Foiley
+/// 1.1) generates, whatever the digits.
 pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
-    let upper = code.trim().to_ascii_uppercase();
-    let mut s: String = match strip_naca_prefix(&upper) {
-        Some(r) => r.to_string(),
-        None => upper.clone(),
-    };
+    // Unicode subscript digits (64₂-415) become a parenthesised subscript
+    let mut norm = String::new();
+    let mut in_sub = false;
+    for c in code.trim().chars() {
+        let sub = ('\u{2080}'..='\u{2089}').contains(&c);
+        if sub && !in_sub {
+            norm.push('(');
+        }
+        if !sub && in_sub {
+            norm.push(')');
+        }
+        in_sub = sub;
+        norm.push(if sub { char::from_digit(c as u32 - 0x2080, 10).unwrap() } else { c });
+    }
+    if in_sub {
+        norm.push(')');
+    }
+    let upper = norm.to_ascii_uppercase();
+    let mut s = strip_naca_prefix(&upper).unwrap_or(upper.as_str()).to_string();
+    while s.contains(" =") || s.contains("= ") {
+        s = s.replace(" =", "=").replace("= ", "=");
+    }
     let mut closed_te = false;
     let mut a: Option<f64> = None;
     loop {
         let t = s.trim_end().trim_end_matches(',').trim_end().to_string();
         if let Some(r) = t.strip_suffix("CLOSED TE").or_else(|| t.strip_suffix("CLOSED-TE")).or_else(|| t.strip_suffix("CLOSEDTE")) {
+            if closed_te {
+                return Err(bad(code, "'closed TE' is given twice"));
+            }
             closed_te = true;
             s = r.to_string();
             continue;
         }
         if let Some(pos) = t.rfind("A=") {
+            if a.is_some() {
+                return Err(bad(code, "the mean line a= is given twice"));
+            }
             let v: f64 = t[pos + 2..].trim().parse().map_err(|_| bad(code, "the mean line must be given as a=<number between 0 and 1>"))?;
             if !(0.0..=1.0).contains(&v) {
                 return Err(bad(code, "the mean-line parameter a must be between 0 and 1"));
@@ -204,61 +236,60 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
         let m = d4[0] as f64 / 100.0;
         let p = d4[1] as f64 / 10.0;
         let t = (d4[2] * 10 + d4[3]) as f64 / 100.0;
+        let mean_line = if m == 0.0 { MeanLine::Symmetric } else { MeanLine::FourDigit { m, p } };
+        if !closed_te {
+            // whatever the digits, exactly XFoil's (and Foiley 1.1's) section
+            return Ok(NacaSection { designation: body.clone(), thickness: Thickness::FourDigit { t, closed_te: false }, mean_line, xfoil_code: Some(ides) });
+        }
         if m > 0.0 && p == 0.0 {
             return Err(bad(code, "a cambered 4-digit section needs a position of maximum camber (second digit 1-9)"));
         }
-        let mean_line = if m == 0.0 { MeanLine::Symmetric } else { MeanLine::FourDigit { m, p } };
-        if closed_te {
-            check_t(code, t, 0.5)?;
-        }
+        check_t(code, t, 0.5)?;
         return Ok(NacaSection {
-            designation: if closed_te { format!("{}{}{}{}{closed_suffix}", d4[0], d4[1], d4[2], d4[3]) } else { body.clone() },
+            designation: format!("{}{}{}{}{closed_suffix}", d4[0], d4[1], d4[2], d4[3]),
             thickness: Thickness::FourDigit { t, closed_te },
             mean_line,
-            xfoil_code: (!closed_te).then_some(ides),
+            xfoil_code: None,
         });
     }
 
     // 5-digit
     if let Some(d) = digits(&body).filter(|d| d.len() == 5) {
         only_six("5-digit sections")?;
-        let (l, p, q) = (d[0], d[1], d[2]);
         let t = (d[3] * 10 + d[4]) as f64 / 100.0;
-        if l == 0 {
-            return Err(bad(code, "the first digit (design CL / 0.15) must be 1-9"));
+        if d[0] == 2 && d[2] == 0 && (1..=5).contains(&d[1]) && !closed_te {
+            // 210xx-250xx: exactly XFoil's (and Foiley 1.1's) section, any thickness
+            let mean_line = MeanLine::FiveDigit { cl: 0.3, p: d[1] as f64 / 20.0 };
+            return Ok(NacaSection { designation: body.clone(), thickness: Thickness::FourDigit { t, closed_te: false }, mean_line, xfoil_code: Some(body.parse().unwrap()) });
         }
-        let cl = 0.15 * l as f64;
-        let pos = p as f64 / 20.0;
-        let mean_line = match q {
-            0 if (1..=5).contains(&p) => MeanLine::FiveDigit { cl, p: pos },
-            1 if (2..=5).contains(&p) => MeanLine::FiveDigitReflex { cl, p: pos },
-            0 => return Err(bad(code, "the second digit of a 5-digit section (twice the position of maximum camber) must be 1-5")),
-            1 => return Err(bad(code, "reflexed 5-digit mean lines are defined for second digits 2-5 (221 to 251)")),
-            _ => return Err(bad(code, "the third digit of a 5-digit section must be 0 (standard) or 1 (reflexed)")),
-        };
+        let mean_line = five_digit_mean_line(code, &d[..3])?;
         check_t(code, t, 0.5)?;
-        let legacy = l == 2 && q == 0 && !closed_te;
-        return Ok(NacaSection {
-            designation: format!("{body}{closed_suffix}"),
-            thickness: Thickness::FourDigit { t, closed_te },
-            mean_line,
-            xfoil_code: legacy.then(|| body.parse().unwrap()),
-        });
+        return Ok(NacaSection { designation: format!("{body}{closed_suffix}"), thickness: Thickness::FourDigit { t, closed_te }, mean_line, xfoil_code: None });
     }
     if closed_te {
         return Err(bad(code, "'closed TE' applies to the 4-digit thickness of 4- and 5-digit sections only"));
     }
 
-    // 4-digit modified: MPTT-IJ
     if let Some((head, tail)) = body.split_once('-') {
-        if let (Some(h), Some(tl)) = (digits(head).filter(|d| d.len() == 4), digits(tail).filter(|d| d.len() == 2)) {
+        // 4-digit modified thickness with a 4- or 5-digit mean line: MPTT-IJ, LPQTT-IJ
+        if let (Some(h), Some(tl)) = (digits(head).filter(|d| d.len() == 4 || d.len() == 5), digits(tail).filter(|d| d.len() == 2)) {
             only_six("4-digit modified sections")?;
-            let m = h[0] as f64 / 100.0;
-            let p = h[1] as f64 / 10.0;
-            let t = (h[2] * 10 + h[3]) as f64 / 100.0;
-            if m > 0.0 && p == 0.0 {
-                return Err(bad(code, "a cambered section needs a position of maximum camber (second digit 1-9)"));
-            }
+            let n = h.len();
+            let t = (h[n - 2] * 10 + h[n - 1]) as f64 / 100.0;
+            let mean_line = if n == 5 {
+                five_digit_mean_line(code, &h[..3])?
+            } else {
+                let m = h[0] as f64 / 100.0;
+                let p = h[1] as f64 / 10.0;
+                if m > 0.0 && p == 0.0 {
+                    return Err(bad(code, "a cambered section needs a position of maximum camber (second digit 1-9)"));
+                }
+                if m == 0.0 {
+                    MeanLine::Symmetric
+                } else {
+                    MeanLine::FourDigit { m, p }
+                }
+            };
             if !(2..=6).contains(&tl[1]) {
                 return Err(bad(code, "the position of maximum thickness (last digit) must be 2-6 (tenths of chord)"));
             }
@@ -266,7 +297,7 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
             return Ok(NacaSection {
                 designation: body.clone(),
                 thickness: Thickness::FourDigitModified { t, le_index: tl[0] as f64, x_max: tl[1] as f64 / 10.0 },
-                mean_line: if m == 0.0 { MeanLine::Symmetric } else { MeanLine::FourDigit { m, p } },
+                mean_line,
                 xfoil_code: None,
             });
         }
@@ -293,6 +324,13 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
     if ch.next() == Some('6') {
         let fam_digit = ch.next().and_then(|c| c.to_digit(10)).ok_or_else(|| bad(code, "unrecognised designation"))?;
         let rest: String = ch.collect();
+        let (sub, rest) = six_subscript(code, &rest)?;
+        let sub_label = sub.as_ref().map(|s| format!("({})", s.0)).unwrap_or_default();
+        let form_t = |t: f64| -> Result<f64, FoilError> {
+            let f = sub.as_ref().and_then(|s| s.1).unwrap_or(t);
+            check_t(code, f, 0.3)?;
+            Ok(f)
+        };
         if let Some(r) = rest.strip_prefix('A') {
             let family = SixFamily::from_digit(fam_digit, true).ok_or_else(|| bad(code, "6A-series thickness forms exist for 63A, 64A and 65A"))?;
             if a.is_some() {
@@ -304,44 +342,77 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
             let t = (d[1] * 10 + d[2]) as f64 / 100.0;
             check_t(code, t, 0.3)?;
             return Ok(NacaSection {
-                designation: format!("{}{}{}{}", family.label(), d[0], d[1], d[2]),
-                thickness: Thickness::SixSeries { family, t },
+                designation: format!("{}{sub_label}A{}{}{}", &family.label()[..2], d[0], d[1], d[2]),
+                thickness: Thickness::SixSeries { family, t, form_t: form_t(t)? },
                 mean_line: if cl == 0.0 { MeanLine::Symmetric } else { MeanLine::SixA { cl } },
                 xfoil_code: None,
             });
         }
         let family = SixFamily::from_digit(fam_digit, false).ok_or_else(|| bad(code, "6-series thickness forms exist for 63 to 67"))?;
-        let (sub, tail) = rest.split_once('-').ok_or_else(|| bad(code, "a 6-series section is written 6x-CTT or 6x(n)-CTT, e.g. 63-206 or 64(2)-415"))?;
-        let subscript = if sub.is_empty() {
-            None
-        } else if let Some(inner) = sub.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-            Some(digits(inner).ok_or_else(|| bad(code, "the subscript in parentheses must be digits"))?.iter().map(|d| char::from_digit(*d, 10).unwrap()).collect::<String>())
-        } else {
-            let s = sub.strip_prefix('_').or_else(|| sub.strip_prefix(',')).unwrap_or(sub);
-            let d = digits(s).filter(|d| d.len() == 1).ok_or_else(|| bad(code, "the low-drag-range subscript must be one digit"))?;
-            Some(d[0].to_string())
-        };
+        let tail = rest.strip_prefix('-').ok_or_else(|| bad(code, "a 6-series section is written 6x-CTT or 6x(n)-CTT, e.g. 63-206 or 64(2)-415"))?;
         let d = digits(tail).filter(|d| d.len() == 3).ok_or_else(|| bad(code, "the part after the dash must be three digits: design CL in tenths, t/c percent"))?;
         let cl = d[0] as f64 / 10.0;
         let t = (d[1] * 10 + d[2]) as f64 / 100.0;
         check_t(code, t, 0.3)?;
-        let mut designation = family.label().to_string();
-        if let Some(s) = &subscript {
-            designation.push_str(&format!("({s})"));
-        }
-        designation.push_str(&format!("-{}{}{}", d[0], d[1], d[2]));
+        let mut designation = format!("{}{sub_label}-{}{}{}", family.label(), d[0], d[1], d[2]);
         let a = a.unwrap_or(1.0);
         if a != 1.0 {
             designation.push_str(&format!(" a={a}"));
         }
         return Ok(NacaSection {
             designation,
-            thickness: Thickness::SixSeries { family, t },
+            thickness: Thickness::SixSeries { family, t, form_t: form_t(t)? },
             mean_line: if cl == 0.0 { MeanLine::Symmetric } else { MeanLine::SixSeries { a, cl } },
             xfoil_code: None,
         });
     }
-    Err(bad(code, "not a supported designation (4-digit 2412, 5-digit 23012/23112, 4-digit modified 0012-64, 16-series 16-212, 6-series 63-206, 6A-series 64A010)"))
+    Err(bad(code, "not a supported designation (4-digit 2412, 5-digit 23012/23112, 4-digit modified 0012-64 or 23015-64, 16-series 16-212, 6-series 63-206, 6A-series 64A010)"))
+}
+
+/// The mean line of the first three digits of a 5-digit designation.
+fn five_digit_mean_line(code: &str, d: &[u32]) -> Result<MeanLine, FoilError> {
+    let (l, p, q) = (d[0], d[1], d[2]);
+    if l == 0 {
+        return Err(bad(code, "the first digit (design CL / 0.15) must be 1-9"));
+    }
+    let cl = 0.15 * l as f64;
+    let pos = p as f64 / 20.0;
+    Ok(match q {
+        0 if (1..=5).contains(&p) => MeanLine::FiveDigit { cl, p: pos },
+        1 if (2..=5).contains(&p) => MeanLine::FiveDigitReflex { cl, p: pos },
+        0 => return Err(bad(code, "the second digit of a 5-digit section (twice the position of maximum camber) must be 1-5")),
+        1 => return Err(bad(code, "reflexed 5-digit mean lines are defined for second digits 2-5 (221 to 251)")),
+        _ => return Err(bad(code, "the third digit of a 5-digit section must be 0 (standard) or 1 (reflexed)")),
+    })
+}
+
+/// The optional low-drag-range subscript after the 6-series family digit:
+/// `(2)`, `_2`, `,2`, or one digit followed by `-` or `A`; or the older
+/// `(318)` form (subscript 3, basic form 18% thick).  Returns the label,
+/// the thickness of the basic form if given, and the rest of the body.
+#[allow(clippy::type_complexity)]
+fn six_subscript<'a>(code: &str, rest: &'a str) -> Result<(Option<(String, Option<f64>)>, &'a str), FoilError> {
+    if let Some(r) = rest.strip_prefix('(') {
+        let (inner, after) = r.split_once(')').ok_or_else(|| bad(code, "unclosed parenthesis"))?;
+        let d = digits(inner).ok_or_else(|| bad(code, "the subscript in parentheses must be digits"))?;
+        return match d.len() {
+            1 => Ok((Some((inner.to_string(), None)), after)),
+            3 => Ok((Some((inner.to_string(), Some((d[1] * 10 + d[2]) as f64 / 100.0))), after)),
+            _ => Err(bad(code, "the parentheses hold the low-drag range (one digit) or the range and the thickness of the basic form (three digits, as in 65(318)-217)")),
+        };
+    }
+    if let Some(r) = rest.strip_prefix('_').or_else(|| rest.strip_prefix(',')) {
+        let mut c = r.chars();
+        let d = c.next().filter(|c| c.is_ascii_digit()).ok_or_else(|| bad(code, "the low-drag-range subscript must be one digit"))?;
+        return Ok((Some((d.to_string(), None)), c.as_str()));
+    }
+    let mut c = rest.chars();
+    if let (Some(d), Some(next)) = (c.next(), c.next()) {
+        if d.is_ascii_digit() && (next == '-' || next == 'A') {
+            return Ok((Some((d.to_string(), None)), &rest[1..]));
+        }
+    }
+    Ok((None, rest))
 }
 
 fn check_t(code: &str, t: f64, max: f64) -> Result<(), FoilError> {
@@ -391,7 +462,7 @@ impl NacaSection {
                 x.iter().map(|&x| if x <= 0.0 { 0.0 } else { 5.0 * t * (0.2969 * x.sqrt() + x * (-0.1260 + x * (-0.3516 + x * (0.2843 + x * a4)))) }).collect()
             }
             Thickness::FourDigitModified { t, le_index, x_max } => four_digit_modified(t, le_index, x_max, x),
-            Thickness::SixSeries { family, t } => SixForm::new(family, t)?.half_thickness(x)?,
+            Thickness::SixSeries { family, t, form_t } => SixForm::new(family, form_t)?.half_thickness(x)?.into_iter().map(|y| y * t / form_t).collect(),
         })
     }
 
@@ -436,9 +507,12 @@ impl NacaSection {
         } else {
             let x = super::nose_spacing(NSIDE);
             let (up, lo) = self.surfaces_at(&x)?;
-            super::from_surfaces(self.name(), &up, &lo)?
+            let f = super::from_surfaces(self.name(), &up, &lo)?;
+            super::check_contour(&f, &format!("NACA {}", self.designation))?;
+            f
         };
         f.note = format!("NACA {} generated", self.designation);
+        f.recipe = Some(super::Recipe::Naca { designation: self.designation.clone() });
         Ok(f)
     }
 }
@@ -548,7 +622,8 @@ fn four_digit_modified(t: f64, le_index: f64, xm: f64, x: &[f64]) -> Vec<f64> {
     // (Abbott & von Doenhoff, p. 117); NACA456's quartic fit in between
     const D1: [(f64, f64); 5] = [(0.2, 0.200), (0.3, 0.234), (0.4, 0.315), (0.5, 0.465), (0.6, 0.700)];
     let d1 = D1.iter().find(|(m, _)| (m - xm).abs() < 1e-9).map(|p| p.1).unwrap_or_else(|| [3.48e-5, 2.3076628, -10.127712, 19.961478, -10.420597].iter().rev().fold(0.0, |acc, c| acc * xm + c));
-    let rle = 1.1019 / 36.0 * (t * le_index).powi(2);
+    // r = 1.1019 (t I/6)^2; index 9 is three times the normal (I = 6) radius
+    let rle = if le_index >= 9.0 { 3.0 * 1.1019 * t * t } else { 1.1019 / 36.0 * (t * le_index).powi(2) };
     let a0 = (0.2 / t) * (2.0 * rle).sqrt();
     let omxm = 1.0 - xm;
     let a3 = 0.1 / (xm * xm * xm) + (d1 * omxm - 0.294) / (xm * omxm * omxm) - (3.0 / 8.0) * a0 / xm.powf(2.5);
@@ -694,6 +769,17 @@ mod tests {
             ("64a010", "64A010", false),
             ("63A210", "63A210", false),
             ("12", "12", true),
+            ("2012", "2012", true),
+            ("23060", "23060", true),
+            ("NACA 23015-64", "23015-64", false),
+            ("64₂-415", "64(2)-415", false),
+            ("65₂-415", "65(2)-415", false),
+            ("64(2)A215", "64(2)A215", false),
+            ("64₂A215", "64(2)A215", false),
+            ("642A215", "64(2)A215", false),
+            ("63-206 a = 0.5", "63-206 a=0.5", false),
+            ("65(318)-217", "65(318)-217", false),
+            ("0012-93", "0012-93", false),
         ];
         for (code, want, xfoil) in cases {
             let s = parse(code).unwrap_or_else(|e| panic!("{code}: {e}"));
@@ -702,7 +788,7 @@ mod tests {
             // the canonical designation parses back to the same section
             assert_eq!(parse(&s.name()).unwrap(), s, "{code}");
         }
-        for code in ["26012", "23212", "21112", "0012-67", "68-210", "66A010", "64A010 a=0.5", "16-212 a=0.5", "64-210 closed TE", "abc", "2412-6", "2012"] {
+        for code in ["26012", "23212", "21112", "0012-67", "68-210", "66A010", "64A010 a=0.5", "16-212 a=0.5", "64-210 closed TE", "abc", "2412-6", "2012 closed TE", "63-406 a=0.2 a=0.8", "65(31)-217", "65(3", "2412 closed TE closed TE"] {
             assert!(parse(code).is_err(), "{code} should not parse");
         }
     }
@@ -718,6 +804,48 @@ mod tests {
             assert_eq!(f.y, r.1[1..=r.2].to_vec());
             assert_eq!(f.name, format!("NACA {code}"));
         }
+    }
+
+    #[test]
+    fn every_code_xfoil_accepts_is_unchanged() {
+        // all 10,500 codes Foiley 1.1 generated: 0000-9999 and 2P0TT
+        let codes = (0..=9999).map(|i| format!("{i:04}")).chain((1..=5).flat_map(|p| (0..=99).map(move |t| format!("2{p}0{t:02}"))));
+        let mut n = 0;
+        for code in codes {
+            let ides: i32 = code.parse().unwrap();
+            let r = if ides <= 9999 { naca4(ides, NSIDE) } else { naca5(ides, NSIDE).unwrap() };
+            let f = crate::Foil::naca(&code).unwrap_or_else(|e| panic!("{code}: {e}"));
+            assert!(f.x.iter().zip(&r.0[1..=r.2]).all(|(a, b)| a.to_bits() == b.to_bits()), "{code}");
+            assert!(f.y.iter().zip(&r.1[1..=r.2]).all(|(a, b)| a.to_bits() == b.to_bits()), "{code}");
+            assert_eq!(f.n(), r.2, "{code}");
+            n += 1;
+        }
+        assert_eq!(n, 10_500);
+    }
+
+    #[test]
+    fn report_824_form_thickness_scales_the_basic_form() {
+        let scaled = parse("65(318)-017").unwrap();
+        let base = parse("65-018").unwrap();
+        let fresh = parse("65-017").unwrap();
+        let x = [0.01, 0.1, 0.4, 0.8];
+        let (a, b, c) = (scaled.half_thickness(&x).unwrap(), base.half_thickness(&x).unwrap(), fresh.half_thickness(&x).unwrap());
+        for i in 0..x.len() {
+            assert!((a[i] - b[i] * 17.0 / 18.0).abs() < 1e-12);
+        }
+        assert!(a.iter().zip(&c).any(|(p, q)| (p - q).abs() > 1e-5), "the scaled 18% form differs from a fresh 17% form");
+    }
+
+    #[test]
+    fn le_index_9_is_three_times_the_normal_radius() {
+        // y ~ a0 sqrt(x) near the nose: r = y^2 / (2x)
+        let x = [1e-10];
+        let r = |code: &str| {
+            let y = parse(code).unwrap().half_thickness(&x).unwrap()[0];
+            y * y / (2.0 * x[0])
+        };
+        assert!((r("0012-93") / r("0012-63") - 3.0).abs() < 1e-3, "{} {}", r("0012-93"), r("0012-63"));
+        assert!((r("0012-63") - 1.1019 * 0.0144).abs() < 1e-6);
     }
 
     #[test]

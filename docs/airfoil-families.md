@@ -2,9 +2,13 @@
 
 Foiley 1.2 generates foils from these families. Every generated foil records
 how it was made (its *recipe*), so Studio can reopen the parameters later
-with **Create → Edit parameters**. Any operation that changes the shape
-clears the recipe: a flap, a TE gap, scaling, the optimiser and the inverse
-methods. Repaneling keeps it.
+with **Create → Edit parameters**. Any operation that changes the
+coordinates clears the recipe: a flap, a TE gap, scaling, repaneling, the
+optimiser and the inverse methods. Regenerating would otherwise undo the
+change.
+
+Every generator rejects parameters whose contour would cross itself. Each
+family also checks its own conditions, described in its section below.
 
 | Family | Studio | Command line | Library |
 |---|---|---|---|
@@ -23,10 +27,19 @@ The "NACA" prefix, spaces and letter case are optional.
 | 4-digit | `2412`, `0012` | camber %, position of max camber (tenths), t/c % |
 | 5-digit | `23012`, `43012` | design CL = 0.15 × 1st digit, max camber at 2nd digit / 20, 3rd digit 0, t/c % |
 | 5-digit reflexed | `23112`, `25112` | 3rd digit 1: reflexed mean line with zero moment about c/4 (positions 221 to 251) |
-| 4-digit modified | `0012-64`, `2412-63` | 4-digit camber and t/c, then LE radius index I (0 to 9) and position of max thickness J/10 (J = 2 to 6) |
+| 4-digit modified | `0012-64`, `2412-63`, `23015-64` | 4- or 5-digit mean line and t/c, then LE radius index I (0 to 9) and position of max thickness J/10 (J = 2 to 6) |
 | 16-series | `16-009`, `16-212` | design CL in tenths, t/c %: thickness `00tt-45`, a = 1.0 mean line |
-| 6-series | `63-206`, `64(2)-415`, `65_2-415`, `652-415`, `63-412 a=0.5` | thickness family 63 to 67, low-drag-range subscript (name only), design CL in tenths, t/c %, mean line a = 1.0 unless `a=` is given |
-| 6A-series | `64A010`, `63A210` | 63A, 64A or 65A thickness; modified a = 0.8 mean line; straight surfaces aft of x/c = 0.82 |
+| 6-series | `63-206`, `64(2)-415`, `64₂-415`, `65_2-415`, `652-415`, `63-412 a=0.5` | thickness family 63 to 67, low-drag-range subscript (name only), design CL in tenths, t/c %, mean line a = 1.0 unless `a=` is given |
+| 6-series, older notation | `65(318)-217` | subscript 3, and a basic form 18% thick whose ordinates are scaled linearly to the final 17% (NACA Report 824) |
+| 6A-series | `64A010`, `63A210`, `64(2)A215` | 63A, 64A or 65A thickness; modified a = 0.8 mean line; straight surfaces aft of x/c = 0.82 |
+
+**Codes XFoil accepts.** Every 1- to 4-digit code, and every 210xx to 250xx
+code, generates exactly what XFoil's `NACA` command generates, whatever the
+digits. All 10,500 such codes are checked bit for bit. Examples are `2012`,
+which has camber but no position for it, and `23060`.
+
+**Stricter checks.** The other families, and the `closed TE` variants,
+check their digits.
 
 Add `closed TE` to a 4- or 5-digit code (`2412 closed TE`) to use −0.1036
 for the x⁴ thickness coefficient instead of −0.1015. This closes the
@@ -44,7 +57,8 @@ off **perpendicular to the mean line** (Abbott & von Doenhoff, eq. 6.1):
 
 * **4-digit modified and 16-series thickness.** Abbott & von Doenhoff
   p. 117:
-  * LE radius r = 1.1019 (t·I/6)².
+  * LE radius r = 1.1019 (t·I/6)², except index 9, which is three times
+    the normal (I = 6) radius.
   * The trailing-edge slope d1 comes from the table for the position of
     maximum thickness.
   * The a and d polynomial coefficients are solved from the continuity
@@ -135,9 +149,15 @@ control the shape:
 * **Aₙ** sets the trailing-edge wedge angle.
 * **Δz** is the trailing-edge height of that surface.
 
+**Limits.** N1 and N2 must be greater than zero, since the surfaces must
+meet at the nose and the tail. The upper trailing edge may not lie below the
+lower one.
+
 **Fitting.** *Fit* (`Cst::fit`, `foiley foil fit-cst`) normalises the foil
 and solves for the weights of each surface by least squares (QR). It
-reports the RMS and largest vertical error.
+reports the RMS and largest vertical error. A high-order fit can oscillate
+until its surfaces cross. In that case the fit is refused, with a
+suggestion to use a lower order.
 * An order-8 fit of NACA 2412 has an RMS error of 4e-5 and a maximum of
   2e-4 of chord.
 * `foiley foil fit-cst FOIL --json` prints the recipe, which
@@ -161,9 +181,18 @@ Sobieczky's 11 parameters:
 * the wedge angle.
 
 Each surface is z = Σ aₙ x^(n−½) (n = 1…6). Its six coefficients come from
-one 6×6 linear solve. The defaults are close to NACA 0012. Foiley rejects
-inconsistent inputs and surfaces that cross. PARSEC cannot represent
-reflexed or strongly aft-loaded sections well.
+one 6×6 linear solve. The defaults are close to NACA 0012.
+
+**Checks.** Foiley rejects:
+* inconsistent inputs;
+* surfaces that cross;
+* crests with the wrong curvature (the upper z'' must be negative and the
+  lower positive);
+* crests that are not the extremes of their surfaces. The six conditions
+  only make a crest stationary, and crests near the trailing edge can let
+  the polynomial run away elsewhere.
+
+PARSEC cannot represent reflexed or strongly aft-loaded sections well.
 
 ## Kármán–Trefftz
 
@@ -176,14 +205,27 @@ angle, and τ = 0 gives the Joukowsky section.
 
 **Exact solution.** The potential flow about the circle is known, so
 `KarmanTrefftz::exact(alpha)` returns the exact inviscid CL, Cm about c/4
-and Cp. CL is lift relative to the chord of the normalised section; Cm and
-Cp are integrated from the exact surface speed. Studio shows CL and Cm next
-to the parameters, and `foiley foil gen kt --exact 0,4` prints them.
+and Cp. CL is lift relative to the chord of the normalised section.
+* The force and moment come from the Blasius integrals. These are evaluated
+  on a circle of twice the radius, where the integrand is analytic, so the
+  periodic trapezoidal rule converges to machine precision.
+* A test checks them against a 400,000-point integration of the surface
+  pressure.
+
+Studio shows CL and Cm next to the parameters, and
+`foiley foil gen kt --exact 0,4` prints them.
 
 **Check against XFoil.** `crates/foil/tests/karman_trefftz.rs` checks
 XFoil's inviscid solution against the exact one on three sections:
 * CL agrees within 0.3%;
-* Cm agrees within 4e-4.
+* Cm agrees within 4e-4 (the test allows 5e-4).
+
+## AVL export
+
+A foil named `NACA dddd` is exported to AVL as a native `NACA` line only
+when its stored coordinates are that section. A foil reshaped under a NACA
+name, for example with *Replace selected*, is exported as an `AFILE` with
+its `.dat`.
 
 ## Cambered plates
 
@@ -192,6 +234,9 @@ line (the NACA 4-digit mean line, with its position of maximum camber).
 The leading edge is a semicircle of diameter equal to the thickness. This
 family is meant for very low Reynolds numbers: indoor models, micro air
 vehicles, and sail or wing-section baselines.
+
+Half the thickness must be smaller than the camber line's smallest radius
+of curvature. Otherwise the inner side of the plate folds over itself.
 
 The trailing edge can be **square** (the default) or **round**:
 
