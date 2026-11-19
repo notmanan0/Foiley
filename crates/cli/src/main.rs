@@ -523,7 +523,7 @@ enum GenFamily {
         /// position of maximum camber (parabolic only)
         #[arg(long, default_value_t = 0.5)]
         x_camber: f64,
-        /// trailing edge: square (blunt, as thick as the plate; XFoil can analyse it) or round (geometry only)
+        /// trailing edge: square (blunt, cut vertically at x/c = 1; XFoil can analyse it) or round (geometry only)
         #[arg(long, default_value = "square")]
         te: String,
     },
@@ -605,15 +605,38 @@ fn gen_recipe(family: &GenFamily) -> Result<foiley_foil::Recipe, String> {
     })
 }
 
-/// Whether two paths name the same file (existing or not).
+/// Whether two paths name the same file, existing or not: an existing path
+/// is canonicalised, a new one through its existing parent (so links and
+/// junctions in the directory part are resolved).
 fn same_file(a: &Path, b: &Path) -> bool {
-    let full = |p: &Path| std::fs::canonicalize(p).or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.to_path_buf());
+    let full = |p: &Path| -> PathBuf {
+        if let Ok(c) = std::fs::canonicalize(p) {
+            return c;
+        }
+        let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        match (std::fs::canonicalize(parent), p.file_name()) {
+            (Ok(d), Some(n)) => d.join(n),
+            _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
+        }
+    };
     let (a, b) = (full(a), full(b));
     if cfg!(windows) {
         a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
         a == b
     }
+}
+
+/// Refuse an output path that is also an input or a project being written.
+fn guard_out(out: &Option<PathBuf>, others: &[&Option<PathBuf>]) -> Result<(), String> {
+    if let Some(o) = out {
+        for p in others.iter().filter_map(|p| p.as_ref()) {
+            if same_file(o, p) {
+                return Err(format!("the output {} is also the project file {}: it would be overwritten", o.display(), p.display()));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Print a one-line summary of a foil to stderr and write it.
@@ -822,8 +845,8 @@ fn resolve_foil(spec: &str, proj: &Project) -> Result<Foil, String> {
     if path.exists() {
         return Foil::load(path).map_err(|e| e.to_string());
     }
-    if let Some(code) = naca::strip_naca_prefix(spec) {
-        return Foil::naca(code).map_err(|e| e.to_string());
+    if let Some(r) = naca::foil_from_name(spec) {
+        return r.map_err(|e| e.to_string());
     }
     // a bare designation ("2412", "64A010", "0012-64")
     let l = spec.trim();
@@ -980,8 +1003,8 @@ fn load_plane(src: &PlaneSrc) -> Result<(Project, Plane), String> {
             }
         }
         if found.is_none() {
-            if let Some(code) = naca::strip_naca_prefix(&name) {
-                found = Foil::naca(code).ok();
+            if let Some(r) = naca::foil_from_name(&name) {
+                found = r.ok();
             }
         }
         match found {
@@ -1294,6 +1317,8 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Optimize { src, x, alpha, objectives, algorithm, population, iterations, shape, bumps, amplitude, cst_order, cst_delta, flap, seed, out, pareto } => {
+                guard_out(&out, &[&src.project])?;
+                guard_out(&pareto, &[&src.project])?;
                 use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings, Parameterization};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
@@ -1367,6 +1392,8 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Inverse { src, alpha, mode, segment, scale, bump, smooth, iterations, speed_csv, out } => {
+                guard_out(&out, &[&src.project])?;
+                guard_out(&speed_csv, &[&src.project])?;
                 use foiley_foil::inverse::{modify, InverseMode, ModKind, Modification};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
@@ -1409,11 +1436,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Generate { family, name, save, out } => {
-                if let (Some(s), Some(o)) = (&save, &out) {
-                    if same_file(s, o) {
-                        return Err(format!("--save and --out both name {}: the .dat would overwrite the project", s.display()));
-                    }
-                }
+                guard_out(&out, &[&save])?;
                 let recipe = gen_recipe(&family)?;
                 let f = Foil::from_recipe(&recipe, name.as_deref()).map_err(|e| e.to_string())?;
                 if let GenFamily::Kt { exact: Some(list), .. } = &family {
@@ -1432,10 +1455,13 @@ fn real_main() -> Result<(), String> {
                     eprintln!("  added {} to {}", g.name, path.display());
                     proj.foils.push(g);
                     proj.save(&path)?;
+                    // check again now the project file exists
+                    guard_out(&out, &[&Some(path)])?;
                 }
                 emit_foil(&f, &out)?;
             }
             FoilCmd::FitCst { src, order, json, out } => {
+                guard_out(&out, &[&src.project])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let (cst, fit) = foiley_foil::gen::cst::Cst::fit(&foil, order).map_err(|e| e.to_string())?;
@@ -1455,6 +1481,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Design { src, flap, te_gap, le_radius, thickness, camber, high_points, repanel, normalize, mix, name, out } => {
+                guard_out(&out, &[&src.project])?;
                 let proj = load_project(&src.project)?;
                 let mut f = resolve_foil(&src.foil, &proj)?;
                 let e = |r: Result<Foil, foiley_foil::FoilError>| r.map_err(|e| e.to_string());
@@ -1883,8 +1910,8 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
                 };
                 for name in pl.foil_names() {
                     if proj.foil(&name).is_none() {
-                        if let Some(code) = naca::strip_naca_prefix(&name) {
-                            let mut f = Foil::naca(code).map_err(|e| e.to_string())?;
+                        if let Some(r) = naca::foil_from_name(&name) {
+                            let mut f = r.map_err(|e| e.to_string())?;
                             f.name = name.clone();
                             proj.foils.push(f);
                         }

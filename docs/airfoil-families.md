@@ -26,7 +26,7 @@ The "NACA" prefix, spaces and letter case are optional.
 |---|---|---|
 | 4-digit | `2412`, `0012` | camber %, position of max camber (tenths), t/c % |
 | 5-digit | `23012`, `43012` | design CL = 0.15 × 1st digit, max camber at 2nd digit / 20, 3rd digit 0, t/c % |
-| 5-digit reflexed | `23112`, `25112` | 3rd digit 1: reflexed mean line with zero moment about c/4 (positions 221 to 251) |
+| 5-digit reflexed | `23112`, `25112` | 3rd digit 1: reflexed mean line with nominally zero moment about c/4 (positions 221 to 251) |
 | 4-digit modified | `0012-64`, `2412-63`, `23015-64` | 4- or 5-digit mean line and t/c, then LE radius index I (0 to 9) and position of max thickness J/10 (J = 2 to 6) |
 | 16-series | `16-009`, `16-212` | design CL in tenths, t/c %: thickness `00tt-45`, a = 1.0 mean line |
 | 6-series | `63-206`, `64(2)-415`, `64₂-415`, `65_2-415`, `652-415`, `63-412 a=0.5` | thickness family 63 to 67, low-drag-range subscript (name only), design CL in tenths, t/c %, mean line a = 1.0 unless `a=` is given |
@@ -68,6 +68,9 @@ off **perpendicular to the mean line** (Abbott & von Doenhoff, eq. 6.1):
     the design CL.
   * The reflexed line takes k2/k1 from the zero-moment condition of NACA
     Report 537. The value printed in TM-4741 is wrong, as NACA456 notes.
+    The moment is nominally zero. With NACA's rounded r and k1, the
+    thin-airfoil Cm about c/4 is at most 0.0045 × design CL; the worst case
+    is position 221.
 * **a-type mean lines.** Abbott & von Doenhoff eq. 4-26/4-27.
   * The 6A-series uses NACA Report 903's modified a = 0.8 line: the
     ordinates are scaled by 0.97948 and run straight at slope −0.24521 CL
@@ -76,8 +79,9 @@ off **perpendicular to the mean line** (Abbott & von Doenhoff, eq. 6.1):
   NASA Langley ε(φ) and ψ(φ) functions, 201 points per family, taken from
   Ralph Carmichael's public-domain NACA456 (PDAS).
   * NACA456 starts from its fitted scale factor. Foiley then iterates the
-    scale until the maximum thickness equals t/c exactly, as NASA's
-    original NACA6 program did.
+    scale until the peak of the 201 mapped points equals t/c, as NASA's
+    original NACA6 program did. The splined section reaches t/c within
+    2e-5 in every family from 6% to 21%.
   * For the 6A-series, both surfaces aft of x/c = 0.82 are replaced by
     straight lines to the trailing edge, as NACA6 does.
 
@@ -225,7 +229,17 @@ XFoil's inviscid solution against the exact one on three sections:
 A foil named `NACA dddd` is exported to AVL as a native `NACA` line only
 when its stored coordinates are that section. A foil reshaped under a NACA
 name, for example with *Replace selected*, is exported as an `AFILE` with
-its `.dat`.
+its `.dat`. File names are unique per foil, even for names that differ only
+by spaces and underscores.
+
+## Names
+
+Names that start with NACA, in a plane being imported or on the command
+line, are generated from the designation. Foiley 1.1's looser spellings,
+such as `NACA_24_12` and `NACA 23-012`, still work.
+
+A `.dat` title whose first two words are numbers, such as `10 10`, is
+written in quotes so that it reads back as the title.
 
 ## Cambered plates
 
@@ -240,9 +254,10 @@ of curvature. Otherwise the inner side of the plate folds over itself.
 
 The trailing edge can be **square** (the default) or **round**:
 
-* **Square:** cut square, a blunt edge as thick as the plate. XFoil
-  analyses this one; the default 2%, 4%-camber plate converges at Re 1e5
-  from 0° to 6°.
+* **Square:** cut vertically at x/c = 1, a blunt edge as tall as the plate
+  thickness divided by the cosine of the tail slope, so slightly taller than
+  the plate is thick. No point lies aft of the cut. XFoil analyses this one;
+  the default 2%, 4%-camber plate converges at Re 1e5 from 0° to 6°.
 * **Round:** a semicircle like the leading edge. Use it for geometry, such
   as 3D meshes and STL. XFoil's viscous solution does not converge on it at
   any Reynolds number tried (1e5 to 5e5), because the boundary layer cannot

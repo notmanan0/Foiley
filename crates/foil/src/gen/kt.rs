@@ -229,6 +229,12 @@ impl KarmanTrefftz {
         if !alpha.is_finite() {
             return Err(FoilError::Geometry("Karman-Trefftz: the angle of attack must be finite".into()));
         }
+        // equivalent angles give the same flow: reduce to (-180, 180] first
+        // (rem_euclid is exact; subtracting first would round 1e20 - 180)
+        let alpha = match alpha.rem_euclid(360.0) {
+            r if r > 180.0 => r - 360.0,
+            r => r,
+        };
         let c = self.center();
         let r = self.radius();
         let fr = self.frame();
@@ -344,6 +350,12 @@ mod tests {
         let flat = KarmanTrefftz { x_center: 0.001, y_center: 0.0, te_angle: 0.0 };
         assert!(flat.exact(15.0).unwrap().cm.abs() < 1e-3);
         assert!(flat.exact(f64::NAN).is_err());
+        // equivalent angles give the same answer
+        let k = KarmanTrefftz::default();
+        let (a, b) = (k.exact(-80.0).unwrap(), k.exact(280.0).unwrap());
+        assert!((a.cl - b.cl).abs() < 1e-9 && (a.cm - b.cm).abs() < 1e-9);
+        // 1e20 is exactly 280 (mod 360)
+        assert!((k.exact(1e20).unwrap().cl - a.cl).abs() < 1e-9);
     }
 
     #[test]

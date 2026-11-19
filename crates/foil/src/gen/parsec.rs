@@ -6,7 +6,7 @@
 //! crest position, height and curvature, and the trailing-edge height and
 //! slope.
 
-use super::{check_contour, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
+use super::{check_contour, check_thickness, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
 use crate::{Foil, FoilError};
 use foiley_core::linalg::solve_dense;
 use serde::{Deserialize, Serialize};
@@ -135,6 +135,7 @@ impl Parsec {
                 )));
             }
         }
+        check_thickness("PARSEC", |x| eval(&cu, x) - eval(&cl, x))?;
         let mut f = from_surfaces(name, &up, &lo)?;
         check_contour(&f, "PARSEC")?;
         f.note = "PARSEC".into();

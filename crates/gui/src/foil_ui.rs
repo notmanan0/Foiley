@@ -1,6 +1,6 @@
 //! Foil design and 2D analysis modules.
 
-use crate::widgets::{self, check, heading, hint, int, num, section, series_color};
+use crate::widgets::{self, check, heading, hint, int, int_keep, num, num_keep, section, series_color};
 use crate::{App, Pending};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
@@ -56,11 +56,13 @@ pub struct GenUi {
     pub plate: Plate,
     pub show: bool,
     cache: Option<(Recipe, Result<Foil, String>)>,
+    #[allow(clippy::type_complexity)]
+    kt_exact: Option<((KarmanTrefftz, f64), Result<(f64, f64), String>)>,
 }
 
 impl Default for GenUi {
     fn default() -> Self {
-        GenUi { family: 0, closed_te: false, cst: Cst::default(), fit_order: 8, fit: None, parsec: Parsec::default(), kt: KarmanTrefftz::default(), kt_alpha: 4.0, plate: Plate::default(), show: true, cache: None }
+        GenUi { family: 0, closed_te: false, cst: Cst::default(), fit_order: 8, fit: None, parsec: Parsec::default(), kt: KarmanTrefftz::default(), kt_alpha: 4.0, plate: Plate::default(), show: true, cache: None, kt_exact: None }
     }
 }
 
@@ -286,16 +288,16 @@ impl App {
                 hint(ui, "y = x^N1 (1-x)^N2 sum A_i B_i(x) + x dz on each surface. A0 sets the LE radius (r = A0^2/2), the last weight the TE wedge.");
                 let mut order = g.cst.order();
                 egui::Grid::new("cstp").num_columns(2).show(ui, |ui| {
-                    if int(ui, "order", &mut order, 0..=30, "Bernstein polynomial order (order + 1 weights per surface)") {
+                    if int_keep(ui, "order", &mut order, 0..=30, "Bernstein polynomial order (order + 1 weights per surface)") {
                         for w in [&mut g.cst.upper, &mut g.cst.lower] {
                             let last = *w.last().unwrap_or(&0.1);
                             w.resize(order + 1, last);
                         }
                     }
-                    num(ui, "TE y upper", &mut g.cst.te_upper, 0.0002, -1.0..=1.0, "trailing-edge height of the upper surface");
-                    num(ui, "TE y lower", &mut g.cst.te_lower, 0.0002, -1.0..=1.0, "trailing-edge height of the lower surface");
-                    num(ui, "N1", &mut g.cst.n1, 0.01, 0.0..=1.0, "class exponent at the nose (0.5 = round; must be > 0)");
-                    num(ui, "N2", &mut g.cst.n2, 0.01, 0.0..=2.0, "class exponent at the tail (1 = sharp; must be > 0)");
+                    num_keep(ui, "TE y upper", &mut g.cst.te_upper, 0.0002, -10.0..=10.0, "trailing-edge height of the upper surface");
+                    num_keep(ui, "TE y lower", &mut g.cst.te_lower, 0.0002, -10.0..=10.0, "trailing-edge height of the lower surface");
+                    num_keep(ui, "N1", &mut g.cst.n1, 0.01, 0.0..=1.0, "class exponent at the nose (0.5 = round; must be > 0)");
+                    num_keep(ui, "N2", &mut g.cst.n2, 0.01, 0.0..=2.0, "class exponent at the tail (1 = sharp; must be > 0)");
                 });
                 egui::Grid::new("cstw").num_columns(3).striped(true).show(ui, |ui| {
                     ui.label("");
@@ -324,7 +326,7 @@ impl App {
                         }
                     });
                     ui.label("order");
-                    ui.add(egui::DragValue::new(&mut g.fit_order).range(0..=30));
+                    ui.add(egui::DragValue::new(&mut g.fit_order).range(0..=30).clamp_existing_to_range(false));
                 });
                 if let Some((n, fit)) = &g.fit {
                     hint(ui, &format!("fit of {n}: rms {:.1e}, max {:.1e} (chord fractions)", fit.rms, fit.max));
@@ -334,30 +336,36 @@ impl App {
                 hint(ui, "z = sum a_n x^(n-1/2) per surface, from the LE radius, the crests and the trailing edge.");
                 let p = &mut g.parsec;
                 egui::Grid::new("parsec").num_columns(2).show(ui, |ui| {
-                    num(ui, "LE radius", &mut p.r_le, 0.0005, 0.0..=0.2, "leading-edge radius / chord");
-                    num(ui, "upper crest x", &mut p.x_up, 0.005, 0.01..=0.99, "");
-                    num(ui, "upper crest z", &mut p.z_up, 0.001, -1.0..=1.0, "");
-                    num(ui, "upper crest z''", &mut p.zxx_up, 0.01, -100.0..=100.0, "curvature at the crest (negative)");
-                    num(ui, "lower crest x", &mut p.x_lo, 0.005, 0.01..=0.99, "");
-                    num(ui, "lower crest z", &mut p.z_lo, 0.001, -1.0..=1.0, "");
-                    num(ui, "lower crest z''", &mut p.zxx_lo, 0.01, -100.0..=100.0, "curvature at the crest (positive)");
-                    num(ui, "TE height", &mut p.z_te, 0.001, -1.0..=1.0, "height of the trailing-edge midpoint");
-                    num(ui, "TE thickness", &mut p.dz_te, 0.0005, 0.0..=0.5, "");
-                    num(ui, "TE direction (deg)", &mut p.alpha_te, 0.1, -44.0..=44.0, "bisector angle below the chord line");
-                    num(ui, "TE wedge (deg)", &mut p.beta_te, 0.1, 0.0..=89.0, "included angle");
+                    num_keep(ui, "LE radius", &mut p.r_le, 0.0005, 0.0..=0.2, "leading-edge radius / chord");
+                    num_keep(ui, "upper crest x", &mut p.x_up, 0.005, 0.01..=0.99, "");
+                    num_keep(ui, "upper crest z", &mut p.z_up, 0.001, -1.0..=1.0, "");
+                    num_keep(ui, "upper crest z''", &mut p.zxx_up, 0.01, -100.0..=100.0, "curvature at the crest (negative)");
+                    num_keep(ui, "lower crest x", &mut p.x_lo, 0.005, 0.01..=0.99, "");
+                    num_keep(ui, "lower crest z", &mut p.z_lo, 0.001, -1.0..=1.0, "");
+                    num_keep(ui, "lower crest z''", &mut p.zxx_lo, 0.01, -100.0..=100.0, "curvature at the crest (positive)");
+                    num_keep(ui, "TE height", &mut p.z_te, 0.001, -1.0..=1.0, "height of the trailing-edge midpoint");
+                    num_keep(ui, "TE thickness", &mut p.dz_te, 0.0005, 0.0..=0.5, "");
+                    num_keep(ui, "TE direction (deg)", &mut p.alpha_te, 0.1, -44.0..=44.0, "bisector angle below the chord line");
+                    num_keep(ui, "TE wedge (deg)", &mut p.beta_te, 0.1, 0.0..=89.0, "included angle");
                 });
             }
             3 => {
                 hint(ui, "Conformal map of a circle through zeta = 1 centred at (-x, y); TE angle 0 gives the Joukowsky section. Its inviscid flow is known exactly: a reference for the panel solvers.");
                 let k = &mut g.kt;
                 egui::Grid::new("kt").num_columns(2).show(ui, |ui| {
-                    num(ui, "centre x offset", &mut k.x_center, 0.002, 0.001..=0.5, "leftward offset of the circle centre: thickness");
-                    num(ui, "centre y offset", &mut k.y_center, 0.002, -0.5..=0.5, "upward offset: camber");
-                    num(ui, "TE angle (deg)", &mut k.te_angle, 0.5, 0.0..=60.0, "");
-                    num(ui, "alpha (deg)", &mut g.kt_alpha, 0.1, -15.0..=15.0, "angle for the exact solution below");
+                    num_keep(ui, "centre x offset", &mut k.x_center, 0.002, 0.001..=0.5, "leftward offset of the circle centre: thickness");
+                    num_keep(ui, "centre y offset", &mut k.y_center, 0.002, -0.5..=0.5, "upward offset: camber");
+                    num_keep(ui, "TE angle (deg)", &mut k.te_angle, 0.5, 0.0..=60.0, "");
+                    num_keep(ui, "alpha (deg)", &mut g.kt_alpha, 0.1, -15.0..=15.0, "angle for the exact solution below");
                 });
-                if let Ok(sol) = k.exact(g.kt_alpha) {
-                    hint(ui, &format!("exact inviscid CL {:.4}, Cm(c/4) {:.4} at {:.1} deg", sol.cl, sol.cm, g.kt_alpha));
+                // the exact solution costs about half a millisecond: solve it
+                // once per parameter set, not on every repaint
+                let key = (*k, g.kt_alpha);
+                if g.kt_exact.as_ref().map(|c| c.0) != Some(key) {
+                    g.kt_exact = Some((key, k.exact(g.kt_alpha).map(|s| (s.cl, s.cm)).map_err(|e| e.to_string())));
+                }
+                if let Some((_, Ok((cl, cm)))) = &g.kt_exact {
+                    hint(ui, &format!("exact inviscid CL {cl:.4}, Cm(c/4) {cm:.4} at {:.1} deg", g.kt_alpha));
                 }
             }
             4 => {
@@ -366,10 +374,10 @@ impl App {
                 let mut c = p.camber * 100.0;
                 let mut kind = usize::from(p.kind == PlateCamber::Parabolic);
                 egui::Grid::new("plate").num_columns(2).show(ui, |ui| {
-                    if num(ui, "thickness (%c)", &mut t, 0.1, 0.2..=15.0, "constant plate thickness; the edges are semicircles") {
+                    if num_keep(ui, "thickness (%c)", &mut t, 0.1, 0.2..=15.0, "constant plate thickness; the edges are semicircles") {
                         p.thickness = t / 100.0;
                     }
-                    if num(ui, "camber (%c)", &mut c, 0.1, -15.0..=15.0, "") {
+                    if num_keep(ui, "camber (%c)", &mut c, 0.1, -15.0..=15.0, "") {
                         p.camber = c / 100.0;
                     }
                     ui.label("camber line");
@@ -378,10 +386,10 @@ impl App {
                     }
                     ui.end_row();
                     if p.kind == PlateCamber::Parabolic {
-                        num(ui, "x of max camber", &mut p.x_camber, 0.01, 0.1..=0.9, "");
+                        num_keep(ui, "x of max camber", &mut p.x_camber, 0.01, 0.1..=0.9, "");
                     }
                     let mut te = usize::from(p.trailing_edge == PlateEdge::Round);
-                    ui.label("trailing edge").on_hover_text("square: blunt, as thick as the plate (XFoil can analyse it); round: a semicircle, geometry only (XFoil's viscous solution does not converge on it)");
+                    ui.label("trailing edge").on_hover_text("square: blunt, cut vertically at x/c = 1 (XFoil can analyse it); round: a semicircle, geometry only (XFoil's viscous solution does not converge on it)");
                     if widgets::pick(ui, "platete", &mut te, &["square", "round"]) {
                         p.trailing_edge = if te == 1 { PlateEdge::Round } else { PlateEdge::Square };
                     }
@@ -451,6 +459,15 @@ impl App {
                 heading(ui, "Foil");
                 self.foil_picker(ui);
                 let foil = self.selected_foil();
+                // a speed distribution belongs to the foil and geometry it was
+                // computed for: drop it as soon as either changes, before any
+                // panel or plot shows it
+                let geom = foil.as_ref().map(|f| (f.name.clone(), node_hash(&f.x, &f.y)));
+                if self.fui.inv_geom.is_some() && self.fui.inv_geom != geom {
+                    self.fui.qdist = None;
+                    self.fui.inv_target = None;
+                    self.fui.inv_geom = None;
+                }
                 if let Some(f) = &foil {
                     let p = f.props();
                     egui::Grid::new("props").num_columns(2).striped(true).show(ui, |ui| {
@@ -586,18 +603,11 @@ impl App {
                     egui::Grid::new("inv").num_columns(2).show(ui, |ui| {
                         num(ui, "alpha (deg)", &mut self.fui.inv_alpha, 0.1, -20.0..=20.0, "design angle of attack (inviscid speed distribution)");
                     });
-                    // a speed distribution belongs to the geometry it was computed for
                     let geom = (foil.name.clone(), node_hash(&foil.x, &foil.y));
-                    if self.fui.inv_geom.as_ref().is_some_and(|g| *g != geom) {
-                        self.fui.qdist = None;
-                        self.fui.inv_target = None;
-                        self.fui.inv_geom = None;
-                    }
                     if ui.button("Get speed distribution").clicked() {
                         self.fui.inv_target = None;
-                        self.fui.inv_geom = Some(geom.clone());
                         let k = JobKind::Inverse { foil: foil.clone(), alpha: self.fui.inv_alpha, mode: self.fui.inv_mode, paneling: self.fui.repanel, target: None, iterations: 0 };
-                        self.submit(format!("{} speed distribution", foil.name), k, Pending::Inverse);
+                        self.submit(format!("{} speed distribution", foil.name), k, Pending::Inverse { foil: geom.0.clone(), hash: geom.1 });
                     }
                     if let Some(d) = self.fui.qdist.clone() {
                         ui.horizontal(|ui| {
@@ -627,9 +637,8 @@ impl App {
                         if seg.is_none() {
                             ui.label(RichText::new("the segment contains fewer than 2 points").color(Color32::from_rgb(230, 80, 70)));
                         } else if ui.button("Solve for this target").clicked() {
-                            self.fui.inv_geom = Some(geom.clone());
                             let k = JobKind::Inverse { foil: foil.clone(), alpha: self.fui.inv_alpha, mode: self.fui.inv_mode, paneling: self.fui.repanel, target: Some((t, seg)), iterations: self.fui.inv_iter };
-                            self.submit(format!("{} inverse design", foil.name), k, Pending::Inverse);
+                            self.submit(format!("{} inverse design", foil.name), k, Pending::Inverse { foil: geom.0.clone(), hash: geom.1 });
                         }
                     }
                 });

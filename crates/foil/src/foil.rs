@@ -170,7 +170,8 @@ impl Foil {
             if nums.len() >= 2 {
                 pts.push((nums[0], nums[1]));
             } else if pts.is_empty() && name.is_empty() {
-                name = l.to_string();
+                // a title that would read as numbers is written quoted
+                name = l.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(l).to_string();
             }
         }
         if name.is_empty() {
@@ -181,7 +182,7 @@ impl Foil {
             if a > 1.5 && b > 1.5 && a.fract() == 0.0 && b.fract() == 0.0 {
                 let (nu, nl) = (a as usize, b as usize);
                 let body = &pts[1..];
-                if body.len() >= nu + nl {
+                if nu.checked_add(nl).is_some_and(|total| body.len() >= total) {
                     let upper = &body[..nu];
                     let lower = &body[nu..nu + nl];
                     let mut out: Vec<(f64, f64)> = upper.iter().rev().cloned().collect();
@@ -220,7 +221,11 @@ impl Foil {
 
     /// Selig-format .dat text.
     pub fn to_dat(&self) -> String {
-        let mut s = format!("{}\n", self.name);
+        // a title whose first two tokens are numbers would be read back as a
+        // point (or as Lednicer counts): quote it
+        let numeric = self.name.split(|c: char| c.is_whitespace() || c == ',' || c == ';').filter(|t| !t.is_empty()).take(2).filter(|t| t.parse::<f64>().is_ok()).count() == 2;
+        let quoted = numeric || (self.name.starts_with('"') && self.name.ends_with('"') && self.name.len() >= 2);
+        let mut s = if quoted { format!("\"{}\"\n", self.name) } else { format!("{}\n", self.name) };
         for (x, y) in self.x.iter().zip(&self.y) {
             s.push_str(&format!("{:10.6} {:10.6}\n", x, y));
         }
@@ -608,6 +613,18 @@ mod tests {
         let m = Foil::interpolate(&f, &Foil::naca("4412").unwrap(), 0.5, "mix").unwrap();
         assert!((m.props().camber - 0.02).abs() < 2e-3);
     }
+    #[test]
+    fn numeric_titles_round_trip_and_huge_counts_do_not_panic() {
+        let mut f = Foil::naca("2412").unwrap();
+        for name in ["10 10", "1.5, 2", "\"quoted\"", "NACA 2412"] {
+            f.name = name.into();
+            let g = Foil::from_dat(&f.to_dat(), "x").unwrap();
+            assert_eq!((g.name.as_str(), g.n()), (name, f.n()), "{name}");
+        }
+        let txt = "9223372036854775808 9223372036854775808\n0 0\n0.5 0.1\n1 0\n0.5 -0.1\n0 0\n0.2 0.05\n0.4 0.06\n0.6 0.05\n0.8 0.03\n1 0.01\n";
+        let _ = Foil::from_dat(txt, "x");
+    }
+
     #[test]
     fn lednicer() {
         let txt = "TEST\n3. 3.\n\n0 0\n0.5 0.1\n1 0\n\n0 0\n0.5 -0.1\n1 0\n";

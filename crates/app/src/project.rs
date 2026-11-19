@@ -299,7 +299,7 @@ impl Project {
                 // NACA designations can be generated
                 for name in pl.foil_names() {
                     if self.foil(&name).is_none() {
-                        if let Some(Ok(mut f)) = foiley_foil::gen::naca::strip_naca_prefix(&name).map(Foil::naca) {
+                        if let Some(Ok(mut f)) = foiley_foil::gen::naca::foil_from_name(&name) {
                             f.name = name.clone();
                             self.foils.push(f);
                             loaded.push(format!("{name} (generated)"));

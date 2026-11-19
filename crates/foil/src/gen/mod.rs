@@ -139,6 +139,12 @@ pub(crate) fn from_surfaces(name: impl Into<String>, upper: &[(f64, f64)], lower
 pub(crate) fn check_contour(f: &Foil, what: &str) -> Result<(), FoilError> {
     let n = f.n();
     let p = |i: usize| (f.x[i], f.y[i]);
+    // a counter-clockwise contour encloses a positive area; coincident or
+    // swapped surfaces enclose none (or a negative one)
+    let area: f64 = (0..n).map(|i| 0.5 * (f.y[i] + f.y[(i + 1) % n]) * (f.x[i] - f.x[(i + 1) % n])).sum();
+    if area.is_nan() || area <= 1e-7 {
+        return Err(FoilError::Geometry(format!("{what}: the section has no thickness (enclosed area {area:.2e})")));
+    }
     let closed = (f.x[0] - f.x[n - 1]).hypot(f.y[0] - f.y[n - 1]) < 1e-12;
     let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0);
     // segment boxes, to skip most pairs cheaply
@@ -157,6 +163,20 @@ pub(crate) fn check_contour(f: &Foil, what: &str) -> Result<(), FoilError> {
             if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
                 return Err(FoilError::Geometry(format!("{what}: the contour crosses itself near x/c {:.3}", 0.25 * (a.0 + b.0 + c.0 + d.0))));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Reject surfaces y_u(x), y_l(x) that touch or cross anywhere inside the
+/// chord, sampled densely (between the generation stations too).
+pub(crate) fn check_thickness(what: &str, thickness: impl Fn(f64) -> f64) -> Result<(), FoilError> {
+    let n = 4000;
+    for k in 1..n {
+        let x = k as f64 / n as f64;
+        let t = thickness(x);
+        if t.is_nan() || t <= 0.0 {
+            return Err(FoilError::Geometry(format!("{what}: the upper and lower surfaces meet or cross at x/c {x:.4} (thickness {t:.2e})")));
         }
     }
     Ok(())

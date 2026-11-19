@@ -27,6 +27,31 @@ pub fn num_u(ui: &mut Ui, label: &str, v: &mut f64, speed: f64, range: std::ops:
     r.changed()
 }
 
+/// `num` that never changes a value it is shown (a loaded recipe keeps
+/// values outside the drag range until the user edits them).
+pub fn num_keep(ui: &mut Ui, label: &str, v: &mut f64, speed: f64, range: std::ops::RangeInclusive<f64>, help: &str) -> bool {
+    let l = ui.label(label);
+    if !help.is_empty() {
+        l.on_hover_text(help);
+    }
+    let r = ui.add(egui::DragValue::new(v).speed(speed).range(range).clamp_existing_to_range(false).max_decimals(6));
+    let r = if help.is_empty() { r } else { r.on_hover_text(help) };
+    ui.end_row();
+    r.changed()
+}
+
+/// `int` that never changes a value it is shown.
+pub fn int_keep(ui: &mut Ui, label: &str, v: &mut usize, range: std::ops::RangeInclusive<usize>, help: &str) -> bool {
+    let l = ui.label(label);
+    if !help.is_empty() {
+        l.on_hover_text(help);
+    }
+    let r = ui.add(egui::DragValue::new(v).range(range).clamp_existing_to_range(false));
+    let r = if help.is_empty() { r } else { r.on_hover_text(help) };
+    ui.end_row();
+    r.changed()
+}
+
 pub fn int(ui: &mut Ui, label: &str, v: &mut usize, range: std::ops::RangeInclusive<usize>, help: &str) -> bool {
     let l = ui.label(label);
     if !help.is_empty() {

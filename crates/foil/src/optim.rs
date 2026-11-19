@@ -235,11 +235,15 @@ impl OptimSettings {
 
     /// Number of design variables.
     pub fn dimension(&self) -> usize {
-        2 * self.shape_variables_per_side() + usize::from(self.flap.is_some())
+        self.shape_variables_per_side().saturating_mul(2).saturating_add(usize::from(self.flap.is_some()))
     }
 
-    /// (min, max) of each design variable.
+    /// (min, max) of each design variable; empty for settings that fail
+    /// [`OptimSettings::validate`].
     pub fn bounds(&self) -> Vec<(f64, f64)> {
+        if self.validate().is_err() {
+            return Vec::new();
+        }
         let a = match self.parameterization {
             Parameterization::HicksHenne => self.max_amplitude.abs(),
             Parameterization::Cst => self.cst_max_delta.abs(),
@@ -430,6 +434,7 @@ fn self_intersects(f: &Foil) -> bool {
 /// Hicks-Henne bumps along the outward surface normal, CST weight changes
 /// as `dy = x^0.5 (1-x) sum dA_i B_i(x)` on each surface.
 pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil, FoilError> {
+    s.validate().map_err(FoilError::Geometry)?;
     let nb = s.shape_variables_per_side();
     if genes.len() != s.dimension() {
         return Err(FoilError::Geometry(format!("{} genes given, {} expected", genes.len(), s.dimension())));
@@ -934,10 +939,16 @@ mod tests {
         assert!(f.note.contains("CST"));
         // absurd orders and non-finite ranges are input errors, not panics
         let base0 = Foil::naca("0012").unwrap();
-        for bad in [OptimSettings { parameterization: Parameterization::Cst, cst_order: usize::MAX, ..Default::default() }, OptimSettings { parameterization: Parameterization::Cst, cst_max_delta: f64::NAN, ..Default::default() }] {
+        for order in [usize::MAX, usize::MAX / 2, 31] {
+            let bad = OptimSettings { parameterization: Parameterization::Cst, cst_order: order, ..Default::default() };
             assert!(matches!(optimise(&base0, &bad, &Progress::none(), &|_, _| {}), Err(FoilError::Geometry(_))));
-            assert!(apply_genes(&base0, &bad, &[0.0; 4]).is_err());
+            assert!(apply_genes(&base0, &bad, &[]).is_err());
+            assert!(bad.bounds().is_empty() && bad.neutral_genes().is_empty());
         }
+        // a NaN range is rejected even with a correctly sized gene vector
+        let nan = OptimSettings { parameterization: Parameterization::Cst, cst_order: 2, cst_max_delta: f64::NAN, ..Default::default() };
+        assert!(matches!(optimise(&base0, &nan, &Progress::none(), &|_, _| {}), Err(FoilError::Geometry(_))));
+        assert!(apply_genes(&base0, &nan, &[0.0; 6]).is_err());
         // settings written before CST existed still load as Hicks-Henne
         let old: OptimSettings = serde_json::from_str(r#"{"bumps_per_side": 4}"#).unwrap();
         assert_eq!((old.parameterization, old.bumps_per_side, old.dimension()), (Parameterization::HicksHenne, 4, 8));

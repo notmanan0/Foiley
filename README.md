@@ -173,7 +173,7 @@ the Jobs and Log panel is always visible at the bottom.
   * **Create** generates NACA 4/5-digit (standard, reflexed, any design CL,
     closed TE), 4-digit modified, 16-, 6- and 6A-series sections, CST,
     PARSEC, Kármán–Trefftz and cambered-plate foils with a live preview.
-    *Fit to selected foil* turns any foil into CST weights, and *Edit
+    *Fit to selected foil* fits CST weights to a foil, and *Edit
     parameters* reopens the recipe of a generated foil.
   * Every geometric operation is previewed as an overlay before you apply it
     or save it as a new foil: flap, thickness and camber, max-point positions,

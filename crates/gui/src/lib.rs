@@ -53,7 +53,8 @@ pub enum Pending {
     AutoPolarsThen(Box<(Plane, PlanePolarDef, PolarTarget)>),
     Mesh(u64),
     BaseMeshHash,
-    Inverse,
+    /// an inverse-design job for this foil and node hash
+    Inverse { foil: String, hash: u64 },
     Optimise,
     /// apply an imported CAD body to the plane of this name
     CadImport { plane: String },
@@ -633,11 +634,12 @@ impl App {
                 self.project.add_plane_polar(pol);
                 self.notify(msg, false);
             }
-            (Pending::Inverse, JobOutput::Inverse(foil, d)) => {
-                // drop results for a foil that was reshaped while the job ran
-                let current = self.fui.inv_geom.as_ref().and_then(|(n, h)| self.project.foil(n).map(|f| foiley_foil::foil::node_hash(&f.x, &f.y) == *h));
-                if current != Some(true) {
-                    self.notify(format!("{title}: discarded, the foil changed while it ran"), false);
+            (Pending::Inverse { foil: name, hash }, JobOutput::Inverse(foil, d)) => {
+                // accept only for the foil the job was computed for, still
+                // selected and unchanged
+                let current = self.sel_foil.as_deref() == Some(name.as_str()) && self.project.foil(&name).is_some_and(|f| foiley_foil::foil::node_hash(&f.x, &f.y) == hash);
+                if !current {
+                    self.notify(format!("{title}: discarded, the foil changed or is no longer selected"), false);
                     return;
                 }
                 match foil {
@@ -645,7 +647,11 @@ impl App {
                         self.fui.preview = Some(f);
                         self.notify(format!("{title}: new foil ready (orange preview) - CL {:.3}", d.cl), false);
                     }
-                    None => self.fui.qdist = Some(d),
+                    None => {
+                        self.fui.qdist = Some(d);
+                        self.fui.inv_target = None;
+                        self.fui.inv_geom = Some((name, hash));
+                    }
                 }
             }
             (Pending::Optimise, JobOutput::Optimise(r)) => {

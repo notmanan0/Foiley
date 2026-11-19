@@ -12,7 +12,7 @@
 //! A0 sets the leading-edge radius (r = A0^2 / 2), A_n the trailing-edge
 //! wedge angle, and dz the trailing-edge offset of that surface.
 
-use super::{check_contour, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
+use super::{check_contour, check_thickness, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
 use crate::{Foil, FoilError};
 use foiley_core::linalg::{lstsq, DenseMatrix};
 use serde::{Deserialize, Serialize};
@@ -119,6 +119,7 @@ impl Cst {
         if surfaces_cross(&up, &lo) {
             return Err(FoilError::Geometry("CST: the upper surface dips below the lower one".into()));
         }
+        check_thickness("CST", |x| surface(&self.upper, self.n1, self.n2, self.te_upper, x) - surface(&self.lower, self.n1, self.n2, self.te_lower, x))?;
         let mut f = from_surfaces(name, &up, &lo)?;
         check_contour(&f, "CST")?;
         f.note = format!("CST order {}", self.order());
@@ -236,12 +237,20 @@ mod tests {
     }
 
     #[test]
-    fn every_fit_that_succeeds_regenerates() {
+    fn a_fit_that_would_cross_is_refused_and_lower_orders_regenerate() {
         let f = Foil::naca("63A210").unwrap();
-        for order in [4, 8, 12, 20, 30] {
-            if let Ok((c, _)) = Cst::fit(&f, order) {
-                c.generate("x").unwrap_or_else(|e| panic!("order {order}: {e}"));
-            }
+        assert!(Cst::fit(&f, 30).is_err(), "the order-30 fit of 63A210 oscillates through itself");
+        for order in [4, 8, 12] {
+            let (c, _) = Cst::fit(&f, order).unwrap_or_else(|e| panic!("order {order}: {e}"));
+            c.generate("x").unwrap_or_else(|e| panic!("order {order}: {e}"));
         }
+    }
+
+    #[test]
+    fn coincident_and_between_station_crossings_are_rejected() {
+        assert!(Cst { upper: vec![0.0], lower: vec![0.0], te_upper: 0.0, te_lower: 0.0, ..Cst::default() }.generate("x").is_err());
+        let up = vec![0.249975, -0.250025, 0.249975];
+        let c = Cst { lower: up.iter().map(|v| -v).collect(), upper: up, te_upper: 0.0, te_lower: 0.0, ..Cst::default() };
+        assert!(c.generate("x").is_err());
     }
 }
