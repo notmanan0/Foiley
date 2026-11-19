@@ -7,6 +7,7 @@ use crate::geom::{Inertia, Plane};
 use crate::linear_panel::LinearPanelSystem;
 use crate::mesh::{build, Mesh, MeshOptions, Strip};
 use crate::panel::PanelSystem;
+use crate::provenance::RenamedLabels;
 use crate::stability::{self, StabilityModel, StabilityResult};
 use crate::vlm::VlmSystem;
 use crate::PlaneError;
@@ -777,9 +778,10 @@ impl PlaneOpp {
 pub struct PlanePolar {
     pub name: String,
     pub plane: String,
-    /// Original plane name used by the manifest after the plane is renamed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub geometry_name: Option<String>,
+    /// Labels of the plane renamed since the run, under the names the
+    /// manifest hashed (see [`PlanePolar::matches_plane_geometry`]).
+    #[serde(default, skip_serializing_if = "RenamedLabels::is_empty")]
+    pub renamed: RenamedLabels,
     pub def: Option<PlanePolarDef>,
     pub points: Vec<PlaneOpp>,
     pub failed: Vec<String>,
@@ -793,27 +795,53 @@ pub struct PlanePolar {
 }
 
 impl PlanePolar {
-    pub fn rename_plane(&mut self, name: &str) {
-        if self.plane != name {
-            let previous = std::mem::replace(&mut self.plane, name.to_owned());
-            if self.manifest.is_some() {
-                self.geometry_name.get_or_insert(previous);
-            }
+    /// Follow an edit of this polar's plane from `before` to `after`: the
+    /// polar moves with a plane rename, and renamed labels are recorded so
+    /// that they do not make the results look out of date.
+    pub fn follow_plane_edit(&mut self, before: &Plane, after: &Plane) {
+        self.plane.clone_from(&after.name);
+        if self.manifest.is_some() {
+            self.renamed.follow_plane_edit(before, after);
         }
     }
 
+    /// Move the polar to its plane's new name.
+    pub fn rename_plane(&mut self, name: &str) {
+        if self.manifest.is_some() {
+            self.renamed.follow_plane_rename(&self.plane, name);
+        }
+        name.clone_into(&mut self.plane);
+    }
+
+    /// Follow foil renames (old name -> new name) made in every plane.
+    pub fn follow_foil_renames(&mut self, renames: &HashMap<String, String>) {
+        if self.manifest.is_some() {
+            self.renamed.follow_foil_renames(renames);
+        }
+    }
+
+    /// Whether `plane` has the geometry this polar ran on: its manifest's
+    /// plane hash, with renamed labels put back first.
     pub fn matches_plane_geometry(&self, plane: &Plane) -> bool {
         let Some(manifest) = &self.manifest else { return false; };
         if self.plane != plane.name {
             return false;
         }
-        if let Some(name) = self.geometry_name.as_ref().filter(|name| *name != &plane.name) {
-            let mut original = plane.clone();
-            original.name.clone_from(name);
-            manifest.geometry_hash == crate::provenance::plane_hash(&original)
+        let hash = if self.renamed.is_empty() {
+            crate::provenance::plane_hash(plane)
         } else {
-            manifest.geometry_hash == crate::provenance::plane_hash(plane)
-        }
+            match self.renamed.restore(plane) {
+                Some(original) => crate::provenance::plane_hash(&original),
+                None => return false,
+            }
+        };
+        manifest.geometry_hash == hash
+    }
+
+    /// Hash of `mesh`, a mesh of this polar's plane, comparable with the
+    /// manifest's mesh hash: renamed foils are hashed under their run-time names.
+    pub fn mesh_hash(&self, mesh: &Mesh) -> foiley_core::hash::Hash32 {
+        crate::provenance::mesh_hash_as(mesh, &self.renamed.foils)
     }
 
     /// Neutral point estimate x_NP = dX_cp*CL / dCL (first to last point).

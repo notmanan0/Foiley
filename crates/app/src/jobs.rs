@@ -17,6 +17,7 @@ use foiley_foil::{analyze, AnalysisSettings, Foil, FoilPolar, Sweep};
 use foiley_plane::mesh::{build, Mesh, MeshOptions};
 use foiley_plane::cad::Tri;
 use foiley_plane::{run_polar, FoilDb, Fuse, Plane, PlaneOpp, PlanePolar, PlanePolarDef};
+use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,7 +39,9 @@ pub enum JobKind {
     AutoPolars { batches: Vec<crate::auto::AutoBatch> },
     PlanePolar { plane: Plane, db: FoilDb, def: PlanePolarDef },
     Mesh { plane: Plane, db: FoilDb, options: MeshOptions },
-    MeshHash { plane: Plane, db: FoilDb, options: MeshOptions },
+    /// Hash a mesh for comparison with a 3D polar's manifest; `foils` maps
+    /// renamed foils to the names the polar ran with.
+    MeshHash { plane: Plane, db: FoilDb, options: MeshOptions, foils: BTreeMap<String, String> },
     Optimise { foil: Foil, settings: foiley_foil::optim::OptimSettings },
     Inverse { foil: Foil, alpha: f64, mode: foiley_foil::inverse::InverseMode, paneling: foiley_foil::foil::Paneling, target: Option<InverseTarget>, iterations: usize },
     /// Read and tessellate an STL / STEP body (F024).
@@ -154,13 +157,19 @@ impl JobKind {
             JobKind::CadImport(_) => "CAD import",
         }
     }
+
+    /// Work the interface starts and supersedes on its own (meshes for the
+    /// 3D view): a cancelled one is not reported.
+    pub fn is_background(&self) -> bool {
+        matches!(self, JobKind::Mesh { .. } | JobKind::MeshHash { .. })
+    }
 }
 
 pub enum JobOutput {
     FoilPolar { polar: FoilPolar, details: Vec<PointDetail> },
     FoilPoint(Option<PointDetail>),
     Batch(Vec<FoilPolar>),
-    PlanePolar(PlanePolar),
+    PlanePolar(Box<PlanePolar>),
     Mesh { mesh: Mesh, hash: Hash32 },
     MeshHash(Hash32),
     Optimise(foiley_foil::optim::OptimResult),
@@ -196,6 +205,8 @@ pub struct Job {
     pub id: JobId,
     pub title: String,
     pub kind: &'static str,
+    /// see [`JobKind::is_background`]
+    pub background: bool,
     pub progress: Progress,
     status: Mutex<JobStatus>,
     output: Mutex<Option<JobOutput>>,
@@ -278,6 +289,7 @@ impl JobManager {
             id: self.next,
             title: title.into(),
             kind: kind.kind_label(),
+            background: kind.is_background(),
             progress,
             status: Mutex::new(JobStatus::Running),
             output: Mutex::new(None),
@@ -315,7 +327,7 @@ impl JobManager {
                 };
                 match &status {
                     JobStatus::Failed(e) => j.progress.error(e.clone()),
-                    JobStatus::Cancelled => j.progress.warn("cancelled"),
+                    JobStatus::Cancelled if !j.background => j.progress.warn("cancelled"),
                     _ => {}
                 }
                 *j.finished.lock().unwrap() = Some(j.started.elapsed());
@@ -407,7 +419,7 @@ fn execute(job: &Job, kind: JobKind, notify: &Notify) -> Result<JobOutput, Strin
             })
             .map_err(|e| e.to_string())?;
             p.info(format!("{}: {} points ({} unknowns), {} failed", pol.name, pol.points.len(), pol.unknowns, pol.failed.len()));
-            Ok(JobOutput::PlanePolar(pol))
+            Ok(JobOutput::PlanePolar(Box::new(pol)))
         }
         JobKind::Optimise { foil, settings } => {
             let r = foiley_foil::optim::optimise(&foil, &settings, p, &|_, res| {
@@ -446,10 +458,10 @@ fn execute(job: &Job, kind: JobKind, notify: &Notify) -> Result<JobOutput, Strin
             p.set(1.0);
             Ok(JobOutput::Mesh { mesh, hash })
         }
-        JobKind::MeshHash { plane, db, options } => {
+        JobKind::MeshHash { plane, db, options, foils } => {
             p.stage("Verifying base mesh");
             let mesh = build(&plane, &db, &options).map_err(|e| e.to_string())?;
-            let hash = foiley_plane::provenance::mesh_hash(&mesh);
+            let hash = foiley_plane::provenance::mesh_hash_as(&mesh, &foils);
             p.set(1.0);
             Ok(JobOutput::MeshHash(hash))
         }
@@ -459,6 +471,25 @@ fn execute(job: &Job, kind: JobKind, notify: &Notify) -> Result<JobOutput, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_foreground_jobs_report_cancellation() {
+        let mut m = JobManager::new(1);
+        let foil = Foil::naca("0012").unwrap();
+        // the long polar holds the one compute thread, so both are cancelled before they finish
+        let polar = m.submit("polar", JobKind::FoilPolar { foil, settings: AnalysisSettings::default(), sweep: Sweep::Alpha { from: -10.0, to: 15.0, step: 0.05 } });
+        let p = crate::Project::starter();
+        let mesh = m.submit("mesh", JobKind::MeshHash { plane: p.planes[0].clone(), db: p.foil_db(), options: MeshOptions::default(), foils: BTreeMap::new() });
+        m.cancel_all();
+        assert!(mesh.background && !polar.background);
+        for job in [&polar, &mesh] {
+            assert_eq!(m.wait(job.id, |_| {}), JobStatus::Cancelled);
+        }
+        let logged = |job: &Job| job.progress.drain_log().iter().any(|line| line.text == "cancelled");
+        assert!(logged(&polar));
+        assert!(!logged(&mesh), "a superseded background job was reported");
+        assert!(mesh.has_output(), "the mesh hash is complete even though it was cancelled");
+    }
+
     #[test]
     fn jobs_finish_cancel_and_survive_errors() {
         let mut m = JobManager::new(2);

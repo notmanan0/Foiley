@@ -38,7 +38,7 @@ pub struct SnapArgs {
     /// Show the ground grid. Use --grid=false to hide it
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     grid: Option<bool>,
-    /// Output directory (defaults to target/snap/<timestamp>)
+    /// Output directory (defaults to a new target/snap/<timestamp>)
     #[arg(long)]
     out: Option<PathBuf>,
     /// Script file with one step per line

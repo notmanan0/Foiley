@@ -261,11 +261,16 @@ pub fn run(mut options: Options) -> Result<Vec<PathBuf>, SnapError> {
             )))
         }
     };
-    let out = options.out.clone().unwrap_or_else(default_output);
-    let out = std::path::absolute(out).map_err(SnapError::output)?;
     let (renderer, adapter) = renderer()?;
     eprintln!("foiley snap uses the CPU 3D viewport with wgpu ({adapter}).");
-    std::fs::create_dir_all(&out).map_err(SnapError::output)?;
+    let out = match options.out.clone() {
+        Some(out) => {
+            std::fs::create_dir_all(&out).map_err(SnapError::output)?;
+            out
+        }
+        None => new_output_dir(Path::new("target").join("snap"))?,
+    };
+    let out = std::path::absolute(out).map_err(SnapError::output)?;
     let arguments = serde_json::json!({
         "files": options.launch.files,
         "module": options.launch.module.map(module_name),
@@ -390,14 +395,30 @@ pub fn run(mut options: Options) -> Result<Vec<PathBuf>, SnapError> {
     Ok(runner.files)
 }
 
-fn default_output() -> PathBuf {
+/// A new directory `<parent>/<UTC timestamp>`.  It is created here, so two
+/// runs started in the same second never share one: the second one gets
+/// `<timestamp>-2`, and so on.
+fn new_output_dir(parent: PathBuf) -> Result<PathBuf, SnapError> {
     let time = foiley_core::provenance::now_rfc3339();
     let stamp = format!(
         "{}-{}",
         time[..10].replace('-', ""),
         time[11..19].replace(':', "")
     );
-    Path::new("target").join("snap").join(stamp)
+    std::fs::create_dir_all(&parent).map_err(SnapError::output)?;
+    let mut n = 1;
+    loop {
+        let dir = if n == 1 {
+            parent.join(&stamp)
+        } else {
+            parent.join(format!("{stamp}-{n}"))
+        };
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(error) => return Err(SnapError::output(format!("{}: {error}", dir.display()))),
+        }
+    }
 }
 
 impl Runner<'_> {
@@ -873,12 +894,14 @@ impl Runner<'_> {
             .mesh
             .as_ref()
             .ok_or_else(|| SnapError::Settle("no viewport mesh".into()))?;
-        let wings = &app.project.planes[app.sel_plane].wings;
-        let main = wings
-            .iter()
-            .position(|wing| wing.kind == foiley_plane::geom::WingKind::Main)
-            .unwrap_or(0);
-        let goal = wings[main].planform_span() / 4.0;
+        let plane = app
+            .project
+            .planes
+            .get(app.sel_plane)
+            .ok_or_else(|| SnapError::Input("the project has no plane".into()))?;
+        // the mesh on screen may still be another plane's
+        let (main, wing) = main_wing(plane)?;
+        let goal = wing.planform_span() / 4.0;
         let cam = &app.pui.cam;
         let forward = cam.basis().forward;
         mesh.panels
@@ -906,11 +929,49 @@ impl Runner<'_> {
     }
 }
 
+/// The main wing of `plane` (else its first wing) and its index, for the
+/// presets that aim at its mid-span.
+fn main_wing(plane: &foiley_plane::Plane) -> Result<(usize, &foiley_plane::geom::Wing), SnapError> {
+    let wings = &plane.wings;
+    let main = wings
+        .iter()
+        .position(|wing| wing.kind == foiley_plane::geom::WingKind::Main)
+        .unwrap_or(0);
+    wings
+        .get(main)
+        .map(|wing| (main, wing))
+        .ok_or_else(|| SnapError::Input("this preset needs a plane with a wing".into()))
+}
+
 fn mouse(pos: Pos2, button: PointerButton, pressed: bool, modifiers: Modifiers) -> Event {
     Event::PointerButton {
         pos,
         button,
         pressed,
         modifiers,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plane_without_wings_has_no_mid_span_to_aim_at() {
+        let mut plane = foiley_plane::Plane::default_plane("NACA 2412", "NACA 0009");
+        assert_eq!(main_wing(&plane).unwrap().0, 0);
+        plane.wings.rotate_left(1);
+        assert_eq!(main_wing(&plane).unwrap().0, 2, "the main wing is found wherever it is");
+        plane.wings.clear();
+        assert!(matches!(main_wing(&plane), Err(SnapError::Input(reason)) if reason.contains("wing")));
+    }
+
+    #[test]
+    fn runs_started_in_the_same_second_get_their_own_directories() {
+        let parent = std::env::temp_dir().join(format!("foiley-snap-out-{}", std::process::id()));
+        let dirs: Vec<_> = (0..3).map(|_| new_output_dir(parent.clone()).unwrap()).collect();
+        assert!(dirs.iter().all(|dir| dir.is_dir() && dir.parent() == Some(parent.as_path())));
+        assert!(dirs[0] != dirs[1] && dirs[1] != dirs[2] && dirs[0] != dirs[2], "{dirs:?}");
+        std::fs::remove_dir_all(parent).unwrap();
     }
 }

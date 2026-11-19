@@ -140,6 +140,32 @@ impl Project {
         self.foil_polars.retain(|p| p.foil != name);
     }
 
+    /// Rename the foil `old` to `new` in the foil list, its 2D polars and
+    /// every wing section that uses it.  3D polars record the rename, so
+    /// that their results still match the (unchanged) plane geometry.
+    pub fn rename_foil(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if let Some(f) = self.foils.iter_mut().find(|f| f.name == old) {
+            new.clone_into(&mut f.name);
+        }
+        for p in self.foil_polars.iter_mut().filter(|p| p.foil == old) {
+            new.clone_into(&mut p.foil);
+        }
+        for section in self.planes.iter_mut().flat_map(|pl| &mut pl.wings).flat_map(|w| &mut w.sections) {
+            for foil in [&mut section.foil_left, &mut section.foil_right] {
+                if foil == old {
+                    new.clone_into(foil);
+                }
+            }
+        }
+        let renames = std::collections::HashMap::from([(old.to_owned(), new.to_owned())]);
+        for p in &mut self.plane_polars {
+            p.follow_foil_renames(&renames);
+        }
+    }
+
     /// Add or merge a 2D polar (same geometry and analysis settings). A
     /// polar without a geometry hash gets its foil's.
     pub fn add_foil_polar(&mut self, p: FoilPolar) -> (String, String) {
@@ -332,6 +358,7 @@ impl Project {
                 }
                 for mut p in other.plane_polars {
                     if let Some(name) = plane_names.get(&p.plane) { p.rename_plane(name); }
+                    p.follow_foil_renames(&foil_names);
                     self.add_plane_polar(p);
                 }
                 Ok(msg)

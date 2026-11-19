@@ -3,7 +3,7 @@
 use crate::body_list::{self, BodyAction};
 use crate::view3d::{self, Camera, ColorField, FieldRevision, MeshCache, Overlay, SelectionHighlight, ViewportInput};
 use crate::widgets::{self, check, heading, hint, int, num, num_u, section, series_color};
-use crate::{App, Pending};
+use crate::{App, Pending, PolarTarget};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points};
 use foiley_app::{auto, CadFormat, CadImport, JobId, JobKind, JobManager};
@@ -15,7 +15,7 @@ use foiley_plane::geom::{FuseFrame, PointMass, Wing, WingKind, WingSection};
 use foiley_plane::mesh::{Mesh, MeshOptions};
 use foiley_plane::stability::{modal_initial_state, time_response};
 use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 pub struct PlaneUi {
@@ -109,6 +109,8 @@ struct AnalysisOverlayKey {
 struct BaseMeshHash {
     plane: usize,
     options: MeshOptions,
+    /// renamed foils hashed under their run-time names (`RenamedLabels::foils`)
+    foils: BTreeMap<String, String>,
     job: Option<JobId>,
     result: Result<Hash32, &'static str>,
 }
@@ -139,10 +141,18 @@ impl PlaneUi {
         }
     }
 
-    pub(super) fn finish_base_mesh_hash(&mut self, job: JobId, result: Option<Hash32>) {
-        if let Some(base) = self.base_mesh_hash.as_mut().filter(|base| base.job == Some(job)) {
-            base.job = None;
-            base.result = result.ok_or("could not verify the base mesh");
+    /// Store the outcome of verification job `job`; `None` (cancelled before
+    /// it finished) forgets it, so that the next frame asks again.
+    pub(super) fn finish_base_mesh_hash(&mut self, job: JobId, outcome: Option<Result<Hash32, &'static str>>) {
+        if self.base_mesh_hash.as_ref().is_some_and(|base| base.job == Some(job)) {
+            match outcome {
+                Some(result) => {
+                    let base = self.base_mesh_hash.as_mut().unwrap();
+                    base.job = None;
+                    base.result = result;
+                }
+                None => self.base_mesh_hash = None,
+            }
         }
     }
 }
@@ -320,7 +330,13 @@ fn verify_analysis_mesh_match(
     let Some(expected_hash) = manifest.mesh_hash else {
         return Err("polar has no mesh hash — geometry-only view");
     };
-    if base_mesh_hash.unwrap_or(Ok(mesh_hash))? != expected_hash {
+    let actual = match base_mesh_hash {
+        Some(base) => base?,
+        // renamed foils are hashed under the names the polar ran with
+        None if !polar.renamed.foils.is_empty() => polar.mesh_hash(mesh),
+        None => mesh_hash,
+    };
+    if actual != expected_hash {
         return Err("mesh or foils changed since this polar ran — geometry-only view");
     }
     if !opp.cp.is_empty() && opp.cp.len() != mesh.panels.len() {
@@ -454,11 +470,16 @@ fn format_panel_hover(plane: &Plane, mesh: &Mesh, panel_idx: usize, verified_opp
 }
 
 impl App {
-    fn ensure_base_mesh_hash(&mut self, options: MeshOptions) -> Result<Hash32, &'static str> {
+    /// Hash of the undeflected mesh of the active plane for a deflected T6/T7
+    /// point, built in the background; `foils` are the polar's renamed foils.
+    fn ensure_base_mesh_hash(&mut self, options: MeshOptions, foils: &BTreeMap<String, String>) -> Result<Hash32, &'static str> {
         let plane = self.sel_plane;
         let options = MeshOptions { allow_missing_foils: true, ..options };
-        if let Some(base) = self.pui.base_mesh_hash.as_ref().filter(|base| base.plane == plane && base.options == options) {
-            return base.result;
+        if let Some(base) = self.pui.base_mesh_hash.as_ref().filter(|base| base.plane == plane && base.options == options && base.foils == *foils) {
+            // a job removed before its result was collected is asked for again
+            if base.job.is_none_or(|id| self.jobs.get(id).is_some()) {
+                return base.result;
+            }
         }
         self.pui.cancel_base_mesh_hash(&self.jobs);
         let db = self.foil_db();
@@ -467,25 +488,28 @@ impl App {
             plane: plane_data.clone(),
             db: (*db).clone(),
             options: options.clone(),
+            foils: foils.clone(),
         });
         self.track_job(job.id, Pending::BaseMeshHash);
         let result = Err("verifying base mesh…");
-        self.pui.base_mesh_hash = Some(BaseMeshHash { plane, options, job: Some(job.id), result });
+        self.pui.base_mesh_hash = Some(BaseMeshHash { plane, options, foils: foils.clone(), job: Some(job.id), result });
         result
     }
 
     fn edit_active_plane(&mut self, edited: Plane) {
-        let before = &self.project.planes[self.sel_plane];
-        if edited == *before {
+        if edited == self.project.planes[self.sel_plane] {
             return;
         }
         if let Err(error) = edited.validate() {
             self.toast = Some((error, std::time::Instant::now(), true));
         }
-        let old_name = before.name.clone();
         self.snapshot_plane_geometry();
-        if edited.name != old_name {
-            for polar in self.project.plane_polars.iter_mut().filter(|polar| polar.plane == old_name) {
+        let before = &self.project.planes[self.sel_plane];
+        let old_name = &before.name;
+        // 3D polars of this plane, finished or running, follow a rename and
+        // record renamed labels so that their results still show.
+        for polar in self.project.plane_polars.iter_mut().filter(|polar| polar.plane == *old_name) {
+            if edited.name != *old_name {
                 let old_key = (old_name.clone(), polar.name.clone());
                 let new_key = (edited.name.clone(), polar.name.clone());
                 if self.pui.visible.remove(&old_key) {
@@ -494,7 +518,17 @@ impl App {
                 if self.pui.sel_polar.as_ref() == Some(&old_key) {
                     self.pui.sel_polar = Some(new_key);
                 }
-                polar.rename_plane(&edited.name);
+            }
+            polar.follow_plane_edit(before, &edited);
+        }
+        for target in crate::polar_targets(&mut self.pending).filter(|target| target.plane == *old_name) {
+            target.follow_plane_edit(before, &edited);
+        }
+        for pending in &mut self.pending {
+            if let Pending::CadImport { plane } = &mut pending.action {
+                if plane == old_name {
+                    plane.clone_from(&edited.name);
+                }
             }
         }
         self.project.planes[self.sel_plane] = edited;
@@ -1040,7 +1074,7 @@ impl App {
             match auto::plan(plane, &self.project.foils, &db, &def, self.pui.auto_polars) {
                 Ok(plan) if !plan.is_empty() => {
                     self.notify(format!("computing {} first", plan.describe()), false);
-                    self.submit(format!("2D polars for {}", plane.name), JobKind::AutoPolars { batches: plan.batches }, Pending::AutoPolarsThen(Box::new((plane.clone(), def))));
+                    self.submit(format!("2D polars for {}", plane.name), JobKind::AutoPolars { batches: plan.batches }, Pending::AutoPolarsThen(Box::new((plane.clone(), def, PolarTarget::new(plane)))));
                     return;
                 }
                 Ok(_) => {}
@@ -1050,7 +1084,7 @@ impl App {
                 }
             }
         }
-        self.submit(title, JobKind::PlanePolar { plane: plane.clone(), db: (*db).clone(), def }, Pending::PlanePolar);
+        self.submit(title, JobKind::PlanePolar { plane: plane.clone(), db: (*db).clone(), def }, Pending::PlanePolar(PolarTarget::new(plane)));
     }
 
     fn analysis_preview(&mut self, selected: Option<usize>) -> AnalysisPreview {
@@ -1058,7 +1092,9 @@ impl App {
         let polar = selected.map(|i| &self.project.plane_polars[i]);
         let def = polar.and_then(|p| p.def.as_ref()).unwrap_or(&self.pui.def);
         let method = def.method;
-        let point = polar.filter(|p| p.plane == plane.name).and_then(|p| p.points.get(self.pui.sel_point));
+        let polar = polar.filter(|p| p.plane == plane.name);
+        let point = polar.and_then(|p| p.points.get(self.pui.sel_point));
+        let foils = polar.map(|p| p.renamed.foils.clone()).unwrap_or_default();
         let base_options = foiley_plane::analysis::mesh_options(def, &HashMap::new(), &HashMap::new());
         let (options, baseline) = if let Some(point) = point {
             let (options, deflected) = point_mesh_options(def, point.ctrl);
@@ -1067,7 +1103,7 @@ impl App {
             (base_options, None)
         };
         let mesh_key = self.ensure_mesh(options);
-        let base_mesh_hash = baseline.map(|options| self.ensure_base_mesh_hash(options));
+        let base_mesh_hash = baseline.map(|options| self.ensure_base_mesh_hash(options, &foils));
         AnalysisPreview { mesh_key, method, base_mesh_hash }
     }
 
@@ -2244,21 +2280,21 @@ mod view3d_analysis_regressions {
         project.planes.push(plane);
         let mut app = App::from_project(project, JobManager::new(1), true);
         let options = MeshOptions::default();
-        assert_eq!(app.ensure_base_mesh_hash(options.clone()), Err("verifying base mesh…"));
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &BTreeMap::new()), Err("verifying base mesh…"));
         let old = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
         app.jobs.wait(old, |_| {});
         let mut plane = app.project.planes[0].clone();
         plane.wings[0].sections[0].twist = 3.0;
         app.edit_active_plane(plane);
-        assert_eq!(app.ensure_base_mesh_hash(options.clone()), Err("verifying base mesh…"));
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &BTreeMap::new()), Err("verifying base mesh…"));
         let new = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
         assert_ne!(old, new);
         app.jobs.wait(new, |_| {});
         app.process_jobs();
-        let first = app.ensure_base_mesh_hash(options.clone()).unwrap();
+        let first = app.ensure_base_mesh_hash(options.clone(), &BTreeMap::new()).unwrap();
         let expected = foiley_plane::mesh::build(&app.project.planes[0], &app.project.foil_db(), &options).unwrap();
         assert_eq!(first, mesh_hash(&expected));
-        assert_eq!(app.ensure_base_mesh_hash(options), Ok(first));
+        assert_eq!(app.ensure_base_mesh_hash(options, &BTreeMap::new()), Ok(first));
         assert_eq!(app.jobs.jobs().len(), 2);
     }
 
@@ -2277,5 +2313,155 @@ mod view3d_analysis_regressions {
         assert!(!app.view3d_prefs.perspective);
         assert!(!app.view3d_prefs.show_grid);
         assert!(app.pui.cam.needs_fit, "new project must auto-fit its aircraft");
+    }
+
+    fn inviscid_vlm() -> PlanePolarDef {
+        PlanePolarDef { method: Method::Vlm2, viscous: false, range: Range { from: 2.0, to: 2.0, step: 1.0 }, ..Default::default() }
+    }
+
+    /// The coarse plane with one inviscid VLM polar, open in Studio.
+    fn app_with_polar() -> App {
+        let (plane, db, foil) = coarse_plane_and_db();
+        let polar = run_polar(&plane, &db, &inviscid_vlm(), &Progress::none(), &|_| {}).unwrap();
+        let mut project = Project::new("renames");
+        project.foils.push(foil);
+        project.planes.push(plane);
+        project.add_plane_polar(polar);
+        App::from_project(project, JobManager::new(1), true)
+    }
+
+    /// Verify the first polar's first point against a fresh mesh of its plane.
+    fn overlay_check(app: &App) -> Result<(), &'static str> {
+        let polar = &app.project.plane_polars[0];
+        let plane = app.project.planes.iter().find(|p| p.name == polar.plane).ok_or("no such plane")?;
+        let options = foiley_plane::analysis::mesh_options(polar.def.as_ref().unwrap(), &HashMap::new(), &HashMap::new());
+        let mesh = foiley_plane::mesh::build(plane, &app.project.foil_db(), &options).unwrap();
+        verify_analysis_mesh_match(plane, polar, &polar.points[0], &mesh, mesh_hash(&mesh), None)
+    }
+
+    #[test]
+    fn cancelling_a_base_mesh_verification_does_not_hide_the_overlay() {
+        let (plane, _, foil) = coarse_plane_and_db();
+        let mut project = Project::new("mesh");
+        project.foils.push(foil);
+        project.planes.push(plane);
+        let mut app = App::from_project(project, JobManager::new(1), true);
+        let options = MeshOptions::default();
+        let none = BTreeMap::new();
+        let expected = mesh_hash(&foiley_plane::mesh::build(&app.project.planes[0], &app.project.foil_db(), &options).unwrap());
+
+        // "Cancel all" to stop a long analysis while the verification waits
+        // for the one compute thread: the mesh is still built, and its hash used
+        let sweep = foiley_foil::Sweep::Alpha { from: -10.0, to: 15.0, step: 0.05 };
+        let long = app.jobs.submit("long polar", JobKind::FoilPolar { foil: Foil::naca("0012").unwrap(), settings: Default::default(), sweep });
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &none), Err("verifying base mesh…"));
+        let job = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        app.jobs.cancel_all();
+        assert_eq!(app.jobs.wait(long.id, |_| {}), foiley_app::JobStatus::Cancelled);
+        assert_eq!(app.jobs.wait(job, |_| {}), foiley_app::JobStatus::Cancelled);
+        app.process_jobs();
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &none), Ok(expected));
+
+        // cancelled without a result: asked for again, not cached as a failure
+        app.pui.invalidate_mesh_key(&app.jobs);
+        assert!(app.ensure_base_mesh_hash(options.clone(), &none).is_err());
+        let job = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        app.pui.finish_base_mesh_hash(job, None);
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &none), Err("verifying base mesh…"));
+        let again = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        assert_ne!(job, again);
+
+        // removed from the job list ("Clear finished") before it was collected
+        app.jobs.wait(again, |_| {});
+        app.jobs.get(again).unwrap().take_output();
+        app.jobs.clear_finished();
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &none), Err("verifying base mesh…"));
+        let last = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        assert_ne!(last, again);
+        app.jobs.wait(last, |_| {});
+        app.process_jobs();
+        assert!(app.pending.is_empty(), "a vanished job left its pending entry behind");
+        assert_eq!(app.ensure_base_mesh_hash(options, &none), Ok(expected));
+    }
+
+    #[test]
+    fn renaming_a_foil_or_wing_keeps_the_analysis_overlay() {
+        let mut app = app_with_polar();
+        assert_eq!(overlay_check(&app), Ok(()));
+        let foil = app.project.foils[0].name.clone();
+        app.rename_foil(&foil, "Root");
+        assert_eq!(overlay_check(&app), Ok(()), "a foil rename hid the overlay");
+
+        // a deflected point verifies the undeflected mesh in the background
+        let polar = &app.project.plane_polars[0];
+        let expected = polar.manifest.as_ref().unwrap().mesh_hash;
+        let options = foiley_plane::analysis::mesh_options(polar.def.as_ref().unwrap(), &HashMap::new(), &HashMap::new());
+        let foils = polar.renamed.foils.clone();
+        assert!(!foils.is_empty());
+        assert!(app.ensure_base_mesh_hash(options.clone(), &foils).is_err());
+        let job = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        app.jobs.wait(job, |_| {});
+        app.process_jobs();
+        assert_eq!(app.ensure_base_mesh_hash(options, &foils).ok(), expected);
+
+        let mut plane = app.project.planes[0].clone();
+        plane.wings[0].name = "Main wing".into();
+        app.edit_active_plane(plane);
+        assert_eq!(overlay_check(&app), Ok(()), "a wing rename hid the overlay");
+        let mut plane = app.project.planes[0].clone();
+        plane.wings[0].sections[0].twist += 3.0;
+        app.edit_active_plane(plane);
+        assert!(overlay_check(&app).is_err(), "a geometry edit kept the overlay");
+    }
+
+    #[test]
+    fn a_polar_that_finishes_after_a_rename_lands_on_the_renamed_plane() {
+        let (plane, db, foil) = coarse_plane_and_db();
+        let mut project = Project::new("running");
+        project.foils.push(foil.clone());
+        project.planes.push(plane.clone());
+        let mut app = App::from_project(project.clone(), JobManager::new(1), true);
+        let polar = run_polar(&plane, &db, &inviscid_vlm(), &Progress::none(), &|_| {}).unwrap();
+        let finish = |app: &mut App| {
+            let crate::PendingJob { generation, action, .. } = app.pending.remove(0);
+            app.apply_output(generation, "3D polar", action, foiley_app::JobOutput::PlanePolar(Box::new(polar.clone())));
+        };
+
+        // the plane, a wing and a foil renamed while it ran
+        app.track_job(1001, Pending::PlanePolar(PolarTarget::new(&plane)));
+        let mut edited = plane.clone();
+        edited.name = "Glider".into();
+        edited.wings[0].name = "Main wing".into();
+        app.edit_active_plane(edited);
+        app.rename_foil(&foil.name, "Root");
+        finish(&mut app);
+        let arrived = &app.project.plane_polars[0];
+        assert_eq!(arrived.plane, "Glider");
+        assert_eq!(app.pui.sel_polar, Some(("Glider".to_string(), arrived.name.clone())));
+        assert_eq!(overlay_check(&app), Ok(()));
+
+        // a rename undone while it ran: the polar stays on the original name
+        let mut app = App::from_project(project, JobManager::new(1), true);
+        app.track_job(1002, Pending::PlanePolar(PolarTarget::new(&plane)));
+        let mut edited = plane.clone();
+        edited.name = "Renamed".into();
+        app.edit_active_plane(edited);
+        app.undo();
+        finish(&mut app);
+        assert_eq!(app.project.plane_polars[0].plane, plane.name);
+        assert_eq!(overlay_check(&app), Ok(()));
+
+        // the chained run after automatic 2D polars carries the rename along
+        let mut app = App::from_project(Project::starter(), JobManager::new(1), true);
+        let plane = app.project.planes[0].clone();
+        app.track_job(1003, Pending::AutoPolarsThen(Box::new((plane.clone(), inviscid_vlm(), PolarTarget::new(&plane)))));
+        let mut edited = plane.clone();
+        edited.name = "Chained".into();
+        app.edit_active_plane(edited);
+        let crate::PendingJob { generation, action, .. } = app.pending.remove(0);
+        app.apply_output(generation, "2D polars", action, foiley_app::JobOutput::Batch(vec![]));
+        let chained = app.pending.last().unwrap();
+        assert!(matches!(&chained.action, Pending::PlanePolar(target) if target.plane == "Chained"));
+        app.jobs.cancel_all();
     }
 }

@@ -51,9 +51,14 @@ pub fn paint_cpu(
     order.sort_by(|a, b| b.0.total_cmp(&a.0));
 
     let line_width = 1.0 / painter.ctx().pixels_per_point();
-    let edge_stroke = Stroke::new(line_width, edge_color);
+    // egui feathers shapes by one physical pixel
+    let feather = line_width;
+    let draw_edges = show_edges && mesh.panels.len() < MAX_EDGE_PANELS;
+    let hover_color = Color32::from_rgb(255, 240, 120);
 
-    let mut shapes: Vec<Shape> = Vec::with_capacity(order.len() / 2 + 8);
+    // Faces and their edges go into one mesh, in painter order, so that back
+    // edges stay hidden behind nearer panels; it is split every 60k vertices.
+    let mut shapes: Vec<Shape> = Vec::new();
     let mut emesh = egui::Mesh::default();
 
     for &(_, idx) in &order {
@@ -88,22 +93,23 @@ pub fn paint_cpu(
         let col = shade_color(base, p.normal, view_dir, key_dir, fill_dir);
 
         let hovered = hovered_panel == Some(idx);
-        if show_edges || hovered {
-            // Draw filled face then its own perimeter edge in painter order so back
-            // edges stay hidden behind nearer panels.
-            let mut face_mesh = egui::Mesh::default();
-            for &q in &pts {
-                face_mesh.colored_vertex(q, col);
-            }
-            for k in 1..(pts.len() as u32 - 1) {
-                face_mesh.add_triangle(0, k, k + 1);
-            }
-            shapes.push(Shape::mesh(face_mesh));
-            let stroke = if hovered {
-                Stroke::new(line_width, Color32::from_rgb(255, 240, 120))
-            } else {
-                edge_stroke
-            };
+        let outline = if hovered {
+            Some(hover_color)
+        } else {
+            draw_edges.then_some(edge_color)
+        };
+        let needed = pts.len() + if outline.is_some() { vcount * LINE_VERTICES } else { 0 };
+        if emesh.vertices.len() + needed > 60_000 {
+            shapes.push(Shape::mesh(std::mem::take(&mut emesh)));
+        }
+        let i0 = emesh.vertices.len() as u32;
+        for &q in &pts {
+            emesh.colored_vertex(q, col);
+        }
+        for k in 1..(pts.len() as u32 - 1) {
+            emesh.add_triangle(i0, i0 + k, i0 + k + 1);
+        }
+        if let Some(color) = outline {
             // Clip the original perimeter. The new edge made by clipping the
             // filled polygon is not a mesh edge.
             for i in 0..vcount {
@@ -111,20 +117,9 @@ pub fn paint_cpu(
                 let b = eye_verts[(i + 1) % vcount];
                 if let Some(points) = project_eye_segment(cam, a, b, rect, near, perspective) {
                     if points[0].distance_sq(points[1]) > 0.01 * line_width * line_width {
-                        shapes.push(Shape::line_segment(points, stroke));
+                        add_line(&mut emesh, points, line_width, feather, color);
                     }
                 }
-            }
-        } else {
-            if emesh.vertices.len() + pts.len() > 60_000 {
-                shapes.push(Shape::mesh(std::mem::take(&mut emesh)));
-            }
-            let i0 = emesh.vertices.len() as u32;
-            for &q in &pts {
-                emesh.colored_vertex(q, col);
-            }
-            for k in 1..(pts.len() as u32 - 1) {
-                emesh.add_triangle(i0, i0 + k, i0 + k + 1);
             }
         }
     }
@@ -138,6 +133,53 @@ pub fn paint_cpu(
     for &(a, b, col) in overlay_lines {
         if let Some((sa, sb)) = project_segment(cam, a, b, rect, near, perspective) {
             painter.line_segment([sa, sb], Stroke::new(line_width, col));
+        }
+    }
+}
+
+/// Above this many panels the CPU renderer draws no panel edges, as v1.0 did:
+/// they would cost more than the faces and blur into a solid colour anyway.
+/// The hovered panel's outline is still drawn.
+pub const MAX_EDGE_PANELS: usize = 20_000;
+
+/// Vertices [`add_line`] adds at most.
+const LINE_VERTICES: usize = 8;
+
+/// Append an antialiased line segment to `mesh` the way egui's tessellator
+/// strokes one: a solid core with a `feather`-wide fringe fading to
+/// transparent; a line thinner than the fringe is drawn fainter instead.
+fn add_line(mesh: &mut egui::Mesh, [a, b]: [Pos2; 2], width: f32, feather: f32, color: Color32) {
+    let along = b - a;
+    let length = along.length();
+    if !(length > 0.0 && length.is_finite()) {
+        return;
+    }
+    let normal = egui::vec2(-along.y, along.x) / length;
+    let clear = Color32::TRANSPARENT;
+    let i0 = mesh.vertices.len() as u32;
+    if width <= feather {
+        let color = color.gamma_multiply(width / feather);
+        for p in [a, b] {
+            mesh.colored_vertex(p - normal * feather, clear);
+            mesh.colored_vertex(p, color);
+            mesh.colored_vertex(p + normal * feather, clear);
+        }
+        for k in 0..2 {
+            mesh.add_triangle(i0 + k, i0 + k + 1, i0 + k + 3);
+            mesh.add_triangle(i0 + k + 1, i0 + k + 4, i0 + k + 3);
+        }
+    } else {
+        let core = 0.5 * (width - feather);
+        let outer = core + feather;
+        for p in [a, b] {
+            mesh.colored_vertex(p - normal * outer, clear);
+            mesh.colored_vertex(p - normal * core, color);
+            mesh.colored_vertex(p + normal * core, color);
+            mesh.colored_vertex(p + normal * outer, clear);
+        }
+        for k in 0..3 {
+            mesh.add_triangle(i0 + k, i0 + k + 1, i0 + k + 4);
+            mesh.add_triangle(i0 + k + 1, i0 + k + 5, i0 + k + 4);
         }
     }
 }
@@ -257,4 +299,46 @@ fn project_eye_segment(
         project_eye(cam, ea, rect, perspective),
         project_eye(cam, eb, rect, perspective),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_line_is_a_feathered_strip_within_its_vertex_budget() {
+        let mut mesh = egui::Mesh::default();
+        let ends = [Pos2::new(0.0, 0.0), Pos2::new(10.0, 0.0)];
+        // one pixel wide: a faded core between two transparent fringes
+        add_line(&mut mesh, ends, 1.0, 1.0, Color32::WHITE);
+        assert_eq!((mesh.vertices.len(), mesh.indices.len()), (6, 12));
+        assert_eq!(mesh.vertices[0].color, Color32::TRANSPARENT);
+        assert_eq!((mesh.vertices[1].pos, mesh.vertices[1].color), (ends[0], Color32::WHITE));
+        // wider: a solid core and the fringes
+        add_line(&mut mesh, ends, 3.0, 1.0, Color32::WHITE);
+        assert_eq!((mesh.vertices.len(), mesh.indices.len()), (14, 30));
+        assert!(mesh.vertices.len() <= 2 * LINE_VERTICES);
+        assert!(mesh.indices.iter().all(|&i| (i as usize) < mesh.vertices.len()));
+        // a degenerate segment adds nothing
+        add_line(&mut mesh, [ends[0], ends[0]], 1.0, 1.0, Color32::WHITE);
+        assert_eq!(mesh.vertices.len(), 14);
+    }
+
+    #[test]
+    fn panel_edges_are_batched_with_the_faces() {
+        let project = foiley_app::Project::starter();
+        let mesh = foiley_plane::mesh::build(&project.planes[0], &project.foil_db(), &Default::default()).unwrap();
+        assert!(mesh.panels.len() > 100);
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let cam = Camera::default();
+        for edges in [false, true] {
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                paint_cpu(&painter, rect, &cam, true, 0.01, &mesh, None, SelectionHighlight::None, edges, Color32::BLACK, &[], &[], Some(0));
+            });
+            // one shape per 60k vertices, not one per panel and edge
+            assert!(output.shapes.len() <= 2, "edges {edges}: {} shapes for {} panels", output.shapes.len(), mesh.panels.len());
+        }
+    }
 }

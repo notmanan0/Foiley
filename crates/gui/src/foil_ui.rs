@@ -476,27 +476,7 @@ impl App {
                     let mut name = foil.name.clone();
                     if ui.add(egui::TextEdit::singleline(&mut name).desired_width(120.0)).on_hover_text("rename (updates polars and wings using it)").lost_focus() && name != foil.name && !name.trim().is_empty() && self.project.foil(&name).is_none() {
                         self.snapshot_foil_geometry();
-                        let old = foil.name.clone();
-                        if let Some(f) = self.project.foils.iter_mut().find(|f| f.name == old) {
-                            f.name = name.clone();
-                        }
-                        for p in &mut self.project.foil_polars {
-                            if p.foil == old {
-                                p.foil = name.clone();
-                            }
-                        }
-                        for pl in &mut self.project.planes {
-                            for w in &mut pl.wings {
-                                for s in &mut w.sections {
-                                    if s.foil_left == old {
-                                        s.foil_left = name.clone();
-                                    }
-                                    if s.foil_right == old {
-                                        s.foil_right = name.clone();
-                                    }
-                                }
-                            }
-                        }
+                        self.rename_foil(&foil.name, &name);
                         self.sel_foil = Some(name);
                     }
                 });

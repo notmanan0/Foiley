@@ -101,3 +101,38 @@ fn starter_views_show_the_aircraft_inside_the_canvas() {
     }
     std::fs::remove_dir(out).unwrap();
 }
+
+#[test]
+fn a_preset_that_needs_a_wing_reports_a_plane_without_one() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("foiley-wingless-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut plane = foiley_plane::Plane::default_plane("NACA 0009", "NACA 0009");
+    plane.wings.clear();
+    plane.fuses.push(foiley_plane::geom::Fuse::default_pod());
+    let mut project = foiley_app::Project::new("body only");
+    project.planes.push(plane);
+    let file = dir.join("body_only.foiley");
+    project.save(&file).unwrap();
+    let result = snap::run(Options {
+        launch: foiley_gui::Launch {
+            files: vec![file],
+            ..Default::default()
+        },
+        preset: Some(Preset::Narrow),
+        out: Some(dir.join("out")),
+        ..Options::default()
+    });
+    std::fs::remove_dir_all(&dir).ok();
+    match result {
+        Err(SnapError::Adapter(error)) if !cfg!(windows) => {
+            eprintln!("Skipping wingless snap: {error}");
+        }
+        // reported as an input error (exit status 1), never a panic
+        Err(SnapError::Input(reason)) => assert!(reason.contains("wing"), "{reason}"),
+        other => panic!("expected an input error, got {other:?}"),
+    }
+}
