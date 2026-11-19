@@ -668,7 +668,7 @@ fn draw_backdrop(painter: &Painter, rect: Rect, dark: bool) {
         rect,
         CornerRadius::same(4),
         Stroke::new(
-            1.0,
+            1.0_f32,
             if dark {
                 Color32::from_rgb(42, 49, 62)
             } else {
@@ -829,7 +829,7 @@ fn draw_pill_badge(
         text_rect,
         CornerRadius::same(4),
         Stroke::new(
-            0.8,
+            0.8_f32,
             Color32::from_rgba_unmultiplied(text_col.r(), text_col.g(), text_col.b(), 110),
         ),
         egui::StrokeKind::Inside,
@@ -868,7 +868,7 @@ fn draw_legend(painter: &Painter, rect: Rect, f: &ColorField<'_>, text_col: Colo
     painter.rect_stroke(
         r,
         0.0,
-        Stroke::new(0.8, Color32::from_white_alpha(60)),
+        Stroke::new(0.8_f32, Color32::from_white_alpha(60)),
         egui::StrokeKind::Inside,
     );
     painter.text(
@@ -924,7 +924,7 @@ fn draw_orientation_gizmo(
         painter.circle_stroke(
             center,
             radius + 9.0,
-            Stroke::new(1.0, Color32::from_white_alpha(45)),
+            Stroke::new(1.0_f32, Color32::from_white_alpha(45)),
         );
     }
 
@@ -1023,11 +1023,11 @@ fn draw_orientation_gizmo(
         let alpha = if n.depth >= -0.05 { 245 } else { 145 };
         let cap_col = Color32::from_rgba_unmultiplied(n.col.r(), n.col.g(), n.col.b(), alpha);
         if n.pos_axis {
-            painter.line_segment([center, n.screen], Stroke::new(2.0, cap_col));
+            painter.line_segment([center, n.screen], Stroke::new(2.0_f32, cap_col));
             let cap_r = if is_hov { 9.5 } else { 8.0 };
             painter.circle_filled(n.screen, cap_r, cap_col);
             if is_hov {
-                painter.circle_stroke(n.screen, cap_r + 1.0, Stroke::new(1.5, Color32::WHITE));
+                painter.circle_stroke(n.screen, cap_r + 1.0, Stroke::new(1.5_f32, Color32::WHITE));
             }
             painter.text(
                 n.screen,
@@ -1041,7 +1041,7 @@ fn draw_orientation_gizmo(
                 painter.line_segment(
                     [center, n.screen],
                     Stroke::new(
-                        1.0,
+                        1.0_f32,
                         Color32::from_rgba_unmultiplied(n.col.r(), n.col.g(), n.col.b(), 80),
                     ),
                 );
@@ -1055,7 +1055,7 @@ fn draw_orientation_gizmo(
             painter.circle_stroke(
                 n.screen,
                 cap_r,
-                Stroke::new(1.4, if is_hov { Color32::WHITE } else { cap_col }),
+                Stroke::new(1.4_f32, if is_hov { Color32::WHITE } else { cap_col }),
             );
             if is_hov {
                 painter.text(
@@ -1107,7 +1107,7 @@ fn draw_hud_toolbar(
 
     let inner = egui::Frame::new()
         .fill(Color32::from_rgba_unmultiplied(16, 20, 28, 200))
-        .stroke(Stroke::new(0.8, Color32::from_white_alpha(35)))
+        .stroke(Stroke::new(0.8_f32, Color32::from_white_alpha(35)))
         .corner_radius(CornerRadius::same(5))
         .inner_margin(egui::Margin::symmetric(6, 3))
         .show(&mut child, |ui| {

@@ -32,7 +32,7 @@ pub fn paint_cpu(
     // 1) Reference grid (behind geometry)
     for &(a, b, col) in grid_lines {
         if let Some((sa, sb)) = project_segment(cam, a, b, rect, near, perspective) {
-            painter.line_segment([sa, sb], Stroke::new(1.0, col));
+            painter.line_segment([sa, sb], Stroke::new(1.0_f32, col));
         }
     }
 
