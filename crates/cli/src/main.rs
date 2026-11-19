@@ -145,6 +145,14 @@ struct Out {
     format: Format,
 }
 
+impl FoilSrc {
+    /// The foil argument when it names a file on disk (an input to protect).
+    fn foil_file(&self) -> Option<PathBuf> {
+        let p = PathBuf::from(&self.foil);
+        p.is_file().then_some(p)
+    }
+}
+
 #[derive(Args, Clone)]
 struct FoilSrc {
     /// airfoil: a .dat file, "NACA 2412" / "naca4412", or a foil name in --project
@@ -1218,7 +1226,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Polar { src, x, ptype, alpha, cl, re_sweep, flap_sweep, at_alpha, hinge, details: details_dir, out } => {
-                guard_paths(&[&out.out], &[&src.project])?;
+                guard_paths(&[&out.out], &[&src.project, &src.foil_file()])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let mut st = x.settings()?;
@@ -1271,7 +1279,7 @@ fn real_main() -> Result<(), String> {
                         Format::Json => serde_json::to_string_pretty(&polar).unwrap(),
                         Format::Xfoil => polar.to_xfoil_text(),
                     };
-                    write_out(&out, &text, &[&src.project])?;
+                    write_out(&out, &text, &[&src.project, &src.foil_file()])?;
                     if let Some(dir) = &details_dir {
                         let n = write_point_details(dir, &polar, &details)?;
                         eprintln!("  wrote {n} point files to {}", dir.display());
@@ -1279,7 +1287,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Point { src, x, alpha, cl, out } => {
-                guard_paths(&[&out.out], &[&src.project])?;
+                guard_paths(&[&out.out], &[&src.project, &src.foil_file()])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let st = x.settings()?;
@@ -1308,7 +1316,7 @@ fn real_main() -> Result<(), String> {
                             s
                         }
                     };
-                    write_out(&out, &text, &[&src.project])?;
+                    write_out(&out, &text, &[&src.project, &src.foil_file()])?;
                 }
             }
             FoilCmd::Batch { foils, project, re, mach, ncrit, alpha, x, out_dir, save } => {
@@ -1363,7 +1371,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Optimize { src, x, alpha, objectives, algorithm, population, iterations, shape, bumps, amplitude, cst_order, cst_delta, flap, seed, out, pareto } => {
-                guard_paths(&[&out, &pareto], &[&src.project])?;
+                guard_paths(&[&out, &pareto], &[&src.project, &src.foil_file()])?;
                 use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings, Parameterization};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
@@ -1426,18 +1434,18 @@ fn real_main() -> Result<(), String> {
                         for (i, c) in r.pareto.iter().enumerate() {
                             s.push_str(&format!("{i},{:.5},{:.6},{:.3},{:.5},{:.4}\n", c.cl, c.cd, c.cl / c.cd.max(1e-12), c.cm, c.cpmin));
                         }
-                        publish(&p, s.as_bytes(), &[&src.project, &out])?;
+                        publish(&p, s.as_bytes(), &[&src.project, &src.foil_file(), &out])?;
                     }
                     let mut f = best.foil.clone();
                     f.name = format!("{} opt", foil.name);
                     match &out {
-                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project])?,
+                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project, &src.foil_file()])?,
                         None => print!("{}", f.to_dat()),
                     }
                 }
             }
             FoilCmd::Inverse { src, alpha, mode, segment, scale, bump, smooth, iterations, speed_csv, out } => {
-                guard_paths(&[&out, &speed_csv], &[&src.project])?;
+                guard_paths(&[&out, &speed_csv], &[&src.project, &src.foil_file()])?;
                 use foiley_foil::inverse::{modify, InverseMode, ModKind, Modification};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
@@ -1471,10 +1479,10 @@ fn real_main() -> Result<(), String> {
                         for (i, q) in d0.q.iter().enumerate() {
                             s.push_str(&format!("{:.6},{:.6},{:.6},{:.6}\n", d0.x[i], d0.s[i], q, t[i]));
                         }
-                        publish(&path, s.as_bytes(), &[&src.project, &out])?;
+                        publish(&path, s.as_bytes(), &[&src.project, &src.foil_file(), &out])?;
                     }
                     match &out {
-                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project])?,
+                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project, &src.foil_file()])?,
                         None => print!("{}", f.to_dat()),
                     }
                 }
@@ -1509,7 +1517,7 @@ fn real_main() -> Result<(), String> {
                 emit_foil(&f, &out, &[&save, &json_in])?;
             }
             FoilCmd::FitCst { src, order, json, out } => {
-                guard_paths(&[&out], &[&src.project])?;
+                guard_paths(&[&out], &[&src.project, &src.foil_file()])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let (cst, fit) = foiley_foil::gen::cst::Cst::fit(&foil, order).map_err(|e| e.to_string())?;
@@ -1525,11 +1533,11 @@ fn real_main() -> Result<(), String> {
                 }
                 if out.is_some() {
                     let f = Foil::from_recipe(&recipe, Some(&format!("{} CST{order}", foil.name))).map_err(|e| e.to_string())?;
-                    emit_foil(&f, &out, &[&src.project])?;
+                    emit_foil(&f, &out, &[&src.project, &src.foil_file()])?;
                 }
             }
             FoilCmd::Design { src, flap, te_gap, le_radius, thickness, camber, high_points, repanel, normalize, mix, name, out } => {
-                guard_paths(&[&out], &[&src.project])?;
+                guard_paths(&[&out], &[&src.project, &src.foil_file()])?;
                 let proj = load_project(&src.project)?;
                 let mut f = resolve_foil(&src.foil, &proj)?;
                 let e = |r: Result<Foil, foiley_foil::FoilError>| r.map_err(|e| e.to_string());
@@ -1576,7 +1584,7 @@ fn real_main() -> Result<(), String> {
                 let p = f.props();
                 eprintln!("  {}: {} points, t/c {:.2}% at {:.3}, camber {:.2}% at {:.3}", f.name, p.points, p.thickness * 100.0, p.x_thickness, p.camber * 100.0, p.x_camber);
                 match &out {
-                    Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project])?,
+                    Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project, &src.foil_file()])?,
                     None => print!("{}", f.to_dat()),
                 }
             }
@@ -1611,26 +1619,28 @@ fn real_main() -> Result<(), String> {
                 println!("  foils: {}", plane.foil_names().join(", "));
             }
             PlaneCmd::Export { src, avl, mass, stl, thin, xml } => {
+                let plane_in = Some(src.plane.clone());
+                guard_paths(&[&avl, &mass, &stl, &xml], &[&plane_in])?;
                 let (proj, plane) = load_plane(&src)?;
                 let db = proj.foil_db();
-                if let Some(p) = avl {
-                    std::fs::write(&p, foiley_plane::export::avl(&plane, &db, 0.0)).map_err(|e| e.to_string())?;
+                if let Some(p) = &avl {
+                    publish(p, foiley_plane::export::avl(&plane, &db, 0.0).as_bytes(), &[&plane_in])?;
                     let dir = p.parent().unwrap_or(Path::new("."));
                     for (name, text) in foiley_plane::export::avl_foil_files(&plane, &proj.foils) {
-                        std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
+                        publish(&dir.join(name), text.as_bytes(), &[&plane_in, &avl, &mass, &stl, &xml])?;
                     }
                     eprintln!("  wrote {}", p.display());
                 }
-                if let Some(p) = mass {
-                    std::fs::write(&p, foiley_plane::export::avl_mass(&plane, &db)).map_err(|e| e.to_string())?;
+                if let Some(p) = &mass {
+                    publish(p, foiley_plane::export::avl_mass(&plane, &db).as_bytes(), &[&plane_in])?;
                     eprintln!("  wrote {}", p.display());
                 }
-                if let Some(p) = stl {
-                    std::fs::write(&p, foiley_plane::export::stl_mesh(&plane, &db, !thin).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                if let Some(p) = &stl {
+                    publish(p, &foiley_plane::export::stl_mesh(&plane, &db, !thin).map_err(|e| e.to_string())?, &[&plane_in])?;
                     eprintln!("  wrote {}", p.display());
                 }
-                if let Some(p) = xml {
-                    std::fs::write(&p, foiley_plane::xml::write_plane(&plane)).map_err(|e| e.to_string())?;
+                if let Some(p) = &xml {
+                    publish(p, foiley_plane::xml::write_plane(&plane).as_bytes(), &[&plane_in])?;
                     eprintln!("  wrote {}", p.display());
                 }
             }
@@ -1661,6 +1671,10 @@ fn real_main() -> Result<(), String> {
                 eprintln!("  saved {}", save.display());
             }
             PlaneCmd::Analyze { src, ptype, method, free_wake, wake_nseg, wake_relax, wake_tol, response, response_amp, response_time, response_out, range, speed, alpha, beta, list, inviscid, altitude, water, mass, cog, ground, derivatives, strict_envelope, flaps, gains, reference, auto_polars, llt_stations, strips, save, out } => {
+                // --save may name the input project (the polar is added to it);
+                // the other outputs may not overwrite either
+                let plane_in = Some(src.plane.clone());
+                guard_paths(&[&out.out, &response_out, &strips], &[&plane_in, &save])?;
                 let (mut proj, plane) = load_plane(&src)?;
                 let kind = match ptype.to_lowercase().trim_start_matches('t') {
                     "1" => PolarKind::FixedSpeed,
@@ -1764,7 +1778,7 @@ fn real_main() -> Result<(), String> {
                         Format::Csv => pol.to_csv(),
                         Format::Json => serde_json::to_string_pretty(&pol).unwrap(),
                     };
-                    write_out(&out, &text, &[])?;
+                    write_out(&out, &text, &[&plane_in, &save])?;
                     if let Some(spec) = &response {
                         use foiley_plane::stability::{forced_response, ControlInput};
                         let (kind, arg) = spec.split_once(':').unwrap_or((spec.as_str(), "0.5"));
@@ -1789,12 +1803,12 @@ fn real_main() -> Result<(), String> {
                             csv.push_str(&format!("{t:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4}\n", a[0], a[1], a[2] * r2d, a[3] * r2d, b[0], b[1] * r2d, b[2] * r2d, b[3] * r2d, response_amp * input.value(*t)));
                         }
                         match &response_out {
-                            Some(p) => std::fs::write(p, csv).map_err(|e| e.to_string())?,
+                            Some(p) => publish(p, csv.as_bytes(), &[&plane_in, &save, &out.out])?,
                             None => print!("{csv}"),
                         }
                     }
-                    if let Some(sp) = strips {
-                        std::fs::write(&sp, strips_csv(&pol)).map_err(|e| e.to_string())?;
+                    if let Some(sp) = &strips {
+                        publish(sp, strips_csv(&pol).as_bytes(), &[&plane_in, &save, &out.out, &response_out])?;
                     }
                     if let Some(path) = save {
                         if proj.planes.iter().all(|p| p.name != plane.name) {

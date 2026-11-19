@@ -206,7 +206,10 @@ mod tests {
         // crests at x/c 0.99 let the surfaces run away to ~1e5 chords
         let p = Parsec { x_up: 0.99, x_lo: 0.99, ..Default::default() };
         assert!(p.generate("p").is_err());
-        // but a trailing edge below the lower crest is a legitimate shape
+        // but a trailing edge below the lower crest is a legitimate shape,
+        // and so is a closed, cusped trailing edge
         assert!(Parsec { z_te: -0.07, ..Default::default() }.generate("p").is_ok());
+        assert!(Parsec { dz_te: 0.0, alpha_te: 0.0, beta_te: 0.0, z_te: 0.0, ..Default::default() }.generate("p").is_ok());
+        assert!(Parsec { dz_te: 0.0, beta_te: 1e-10, ..Default::default() }.generate("p").is_ok());
     }
 }

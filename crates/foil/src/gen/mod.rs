@@ -169,30 +169,28 @@ pub(crate) fn check_contour(f: &Foil, what: &str) -> Result<(), FoilError> {
 }
 
 /// Whether the polynomial with Bernstein coefficients `c` on [0, 1] is
-/// positive on [0, 1) and non-negative at 1.  Exact: the coefficients
-/// bound the polynomial on their interval (convex hull), and intervals
-/// whose coefficients are not all positive are split by de Casteljau until
-/// they are, or until an end value (which the polynomial takes exactly) is
-/// not positive.  An interval still undecided after 2^-48 holds a zero of
-/// the polynomial (the surfaces touch), and counts as not positive.
+/// positive on [0, 1) (it may be zero at 1: a closed or cusped trailing
+/// edge).  Exact:
+/// * zeros at 1 are divided out first, P(t) = (1 - t) Q(t) with
+///   Q's coefficients b_i n / (n - i), as often as the end value vanishes;
+/// * then the coefficients bound the polynomial on their interval (convex
+///   hull), and intervals whose coefficients are not all positive are split
+///   by de Casteljau until they are, or until an end value (which the
+///   polynomial takes exactly) is not positive.
+///
+/// An interval still undecided after 2^-48 holds a zero (the surfaces
+/// touch) and counts as not positive.  "Positive" means above rounding,
+/// 1e-12 of the coefficient scale (about 1e-13 of chord for a thickness).
 pub(crate) fn bernstein_positive(c: &[f64]) -> bool {
-    // "positive" means above rounding: 1e-12 of the coefficient scale
-    // (about 1e-13 of chord for a section's thickness)
-    fn rec(c: &[f64], tol: f64, right_end: bool, depth: u32) -> bool {
+    fn rec(c: &[f64], tol: f64, depth: u32) -> bool {
         let n = c.len() - 1;
-        if n == 0 {
-            return c[0] > tol;
-        }
-        let end_ok = if right_end { c[n] >= -tol } else { c[n] > tol };
-        if c[0] <= tol || !end_ok {
+        if c[0] <= tol || c[n] <= tol {
             return false;
         }
-        if c[1..n].iter().all(|&v| v > tol) {
+        if c.iter().all(|&v| v > tol) {
             return true;
         }
         if depth == 0 {
-            // still not provably positive on a 2^-48 interval: the
-            // polynomial touches zero there (a double root)
             return false;
         }
         let mut w = c.to_vec();
@@ -207,13 +205,18 @@ pub(crate) fn bernstein_positive(c: &[f64]) -> bool {
             left[k] = w[0];
             right[n - k] = w[n - k];
         }
-        rec(&left, tol, false, depth - 1) && rec(&right, tol, right_end, depth - 1)
+        rec(&left, tol, depth - 1) && rec(&right, tol, depth - 1)
     }
     if c.is_empty() || c.iter().any(|v| !v.is_finite()) {
         return false;
     }
     let tol = 1e-12 * c.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    rec(c, tol, true, 48)
+    let mut b = c.to_vec();
+    while b.len() > 1 && b[b.len() - 1].abs() <= tol {
+        let n = b.len() - 1;
+        b = (0..n).map(|i| b[i] * n as f64 / (n - i) as f64).collect();
+    }
+    rec(&b, tol, 48)
 }
 
 /// Bernstein coefficients on [0, 1] of the polynomial sum_k d_k x^k.
@@ -270,6 +273,10 @@ mod tests {
         assert!(bernstein_positive(&power_to_bernstein(&[1.0, -1.0])));
         assert!(!bernstein_positive(&power_to_bernstein(&[-1e-12, 1.0])));
         assert!(bernstein_positive(&[0.3]));
+        // a double zero at the trailing edge (cusp) is allowed, one inside is not
+        assert!(bernstein_positive(&power_to_bernstein(&[1.0, -2.0, 1.0])));
+        assert!(bernstein_positive(&power_to_bernstein(&[1.0, -3.0, 3.0, -1.0])));
+        assert!(!bernstein_positive(&power_to_bernstein(&[-1.0, 3.0, -2.0])));
     }
 
     #[test]

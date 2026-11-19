@@ -61,7 +61,7 @@ pub struct GenUi {
     pub closed_te: bool,
     pub cst: Cst,
     pub fit_order: usize,
-    pub fit: Option<(String, CstFit)>,
+    pub fit: Option<Result<(String, CstFit), String>>,
     pub parsec: Parsec,
     pub kt: KarmanTrefftz,
     pub kt_alpha: f64,
@@ -333,9 +333,9 @@ impl App {
                                 match Cst::fit(f, g.fit_order) {
                                     Ok((c, fit)) => {
                                         g.cst = c;
-                                        g.fit = Some((f.name.clone(), fit));
+                                        g.fit = Some(Ok((f.name.clone(), fit)));
                                     }
-                                    Err(e) => g.fit = Some((format!("{}: {e}", f.name), CstFit::default())),
+                                    Err(e) => g.fit = Some(Err(format!("{}: {e}", f.name))),
                                 }
                             }
                         }
@@ -343,8 +343,12 @@ impl App {
                     ui.label("order");
                     ui.add(egui::DragValue::new(&mut g.fit_order).range(0..=30).clamp_existing_to_range(false));
                 });
-                if let Some((n, fit)) = &g.fit {
-                    hint(ui, &format!("fit of {n}: rms {:.1e}, max {:.1e} (chord fractions)", fit.rms, fit.max));
+                match &g.fit {
+                    Some(Ok((n, fit))) => hint(ui, &format!("fit of {n}: rms {:.1e}, max {:.1e} (chord fractions)", fit.rms, fit.max)),
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(format!("fit failed: {e}")).color(Color32::from_rgb(230, 80, 70)));
+                    }
+                    None => {}
                 }
             }
             2 => {

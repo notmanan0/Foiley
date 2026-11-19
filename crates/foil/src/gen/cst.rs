@@ -279,6 +279,8 @@ mod tests {
         let up = vec![0.249975, -0.250025, 0.249975];
         let c = Cst { lower: up.iter().map(|v| -v).collect(), upper: up, te_upper: 0.0, te_lower: 0.0, ..Cst::default() };
         assert!(c.generate("x").is_err());
+        // a cusped closed trailing edge (last two weight differences zero) is fine
+        assert!(Cst { upper: vec![0.2, 0.1, 0.0, 0.0], lower: vec![-0.2, -0.1, 0.0, 0.0], te_upper: 0.0, te_lower: 0.0, ..Cst::default() }.generate("c").is_ok());
         // a crossing near the nose, between any sampling stations
         let c = Cst { upper: vec![-0.00002, 0.1], lower: vec![0.0, -0.1], n1: 0.01, n2: 1.0, te_upper: 0.0, te_lower: 0.0 };
         assert!(c.generate("x").is_err());

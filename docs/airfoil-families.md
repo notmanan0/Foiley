@@ -178,6 +178,8 @@ control the shape:
   when the Bernstein polynomial of the weight differences is positive. Foiley
   proves this exactly, by subdividing until the Bernstein coefficients
   (which bound the polynomial) are all positive, rather than by sampling.
+  * Zeros at the trailing edge are divided out first, so a closed or cusped
+    edge is accepted.
   * The condition is sufficient, not necessary. A blunt-edged section whose
     last weight difference is negative, but whose gap keeps it thick, is
     refused too.

@@ -178,10 +178,9 @@ pub(crate) fn legacy_digits(code: &str) -> Option<String> {
 ///   5-digit mean line
 /// * `16-212` - 16-series: design CL in tenths, t/c percent
 /// * `63-206`, `64(2)-415`, `64₂-415`, `65_2-415`, `652-415`,
-///   `63-412 a=0.5`, `65(318)-217` - 6-series (the low-drag-range subscript
-///   is kept in the name only; in the older `(318)` notation the last two
-///   digits give the thickness of the form scaled linearly to the final
-///   t/c; default mean line a = 1.0)
+///   `63-412 a=0.5` - 6-series (the low-drag-range subscript is kept in the
+///   name only; default mean line a = 1.0).  Report 824's older scaled
+///   notation `65(318)-217` is refused.
 /// * `64A010`, `63A210`, `64(2)A215` - 6A-series with the modified a=0.8
 ///   mean line
 ///
