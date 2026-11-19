@@ -204,7 +204,7 @@ impl App {
                     if ui.button("Add").clicked() {
                         match Foil::naca(&self.fui.naca) {
                             Ok(mut f) => {
-                                self.snapshot();
+                                self.snapshot_foil_geometry();
                                 f.name = self.project.unique_foil_name(&f.name);
                                 self.sel_foil = Some(f.name.clone());
                                 self.project.foils.push(f);
@@ -215,7 +215,7 @@ impl App {
                 });
                 if ui.button("Load .dat files...").on_hover_text("Selig or Lednicer coordinate files; clockwise files are reordered automatically").clicked() {
                     if let Some(files) = rfd::FileDialog::new().add_filter("Airfoil", &["dat", "txt"]).pick_files() {
-                        self.snapshot();
+                        self.snapshot_foil_geometry();
                         for p in files {
                             match Foil::load(&p) {
                                 Ok(mut f) => {
@@ -444,7 +444,7 @@ impl App {
                     ui.label(RichText::new(format!("Preview: {}", pv.note)).color(Color32::from_rgb(255, 160, 60)));
                     ui.horizontal(|ui| {
                         if ui.button("Replace foil").clicked() {
-                            self.snapshot();
+                            self.snapshot_foil_geometry();
                             let mut f = pv.clone();
                             f.name = foil.name.clone();
                             self.project.upsert_foil(f);
@@ -452,7 +452,7 @@ impl App {
                         }
                         ui.add(egui::TextEdit::singleline(&mut self.fui.new_name).desired_width(110.0));
                         if ui.button("Save as new").clicked() {
-                            self.snapshot();
+                            self.snapshot_foil_geometry();
                             let mut f = pv.clone();
                             f.name = self.project.unique_foil_name(&self.fui.new_name);
                             self.sel_foil = Some(f.name.clone());
@@ -475,7 +475,7 @@ impl App {
                     }
                     let mut name = foil.name.clone();
                     if ui.add(egui::TextEdit::singleline(&mut name).desired_width(120.0)).on_hover_text("rename (updates polars and wings using it)").lost_focus() && name != foil.name && !name.trim().is_empty() && self.project.foil(&name).is_none() {
-                        self.snapshot();
+                        self.snapshot_foil_geometry();
                         let old = foil.name.clone();
                         if let Some(f) = self.project.foils.iter_mut().find(|f| f.name == old) {
                             f.name = name.clone();
@@ -807,7 +807,7 @@ impl App {
                     });
                 }
                 if let Some(i) = del {
-                    self.snapshot();
+                    self.snapshot_foil_polars();
                     self.project.foil_polars.remove(i);
                     labels.remove(i);
                 }

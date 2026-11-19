@@ -32,6 +32,7 @@ pub struct PlaneUi {
     pub plots: [(usize, usize); 4],
     pub span_var: usize,
     pub cam: Camera,
+    mesh_key: Option<CachedMeshKey>,
     pub mesh: Option<(u64, Mesh)>,
     pub mesh_job: Option<(JobId, u64)>,
     pub view_thick: bool,
@@ -64,6 +65,7 @@ impl Default for PlaneUi {
             plots: [(0, 4), (5, 4), (0, 9), (0, 13)],
             span_var: 0,
             cam: Camera::default(),
+            mesh_key: None,
             mesh: None,
             mesh_job: None,
             view_thick: false,
@@ -78,6 +80,18 @@ impl Default for PlaneUi {
             resp_amp: 0.2,
             resp_arg: 0.5,
         }
+    }
+}
+
+struct CachedMeshKey {
+    plane: usize,
+    options: MeshOptions,
+    key: u64,
+}
+
+impl PlaneUi {
+    pub(super) fn invalidate_mesh_key(&mut self) {
+        self.mesh_key = None;
     }
 }
 
@@ -137,23 +151,30 @@ fn plane_key(p: &Plane, o: &MeshOptions, project: &foiley_app::Project) -> u64 {
     names.sort();
     for name in names {
         name.hash(&mut h);
-        // Missing -> loaded, same-name geometry replacement and hinge edits
-        // all change the mesh even though Plane still names the same foil.
-        if let Some(foil) = project.foil(&name) {
-            Some(foil.geom_hash()).hash(&mut h);
-            foil.hinge.map(|(x, y)| (x.to_bits(), y.to_bits())).hash(&mut h);
-        } else {
-            None::<foiley_core::hash::Hash32>.hash(&mut h);
-        }
+        // The database uses the last foil with this name. Use the exact
+        // nodes here because the polar geometry hash quantizes coordinates.
+        project.foils.iter().rfind(|foil| foil.name == name).map(|foil| {
+            (foiley_foil::foil::node_hash(&foil.x, &foil.y), foil.hinge.map(|(x, y)| (x.to_bits(), y.to_bits())))
+        }).hash(&mut h);
     }
     h.finish()
 }
 
 impl App {
-    /// Ask for a mesh of `plane` (built in the background).
-    fn ensure_mesh(&mut self, plane: &Plane, opts: MeshOptions) -> u64 {
+    fn preview_mesh_key(&mut self, options: &MeshOptions) -> u64 {
+        let plane = self.sel_plane;
+        if let Some(cached) = self.pui.mesh_key.as_ref().filter(|c| c.plane == plane && c.options == *options) {
+            return cached.key;
+        }
+        let key = plane_key(&self.project.planes[plane], options, &self.project);
+        self.pui.mesh_key = Some(CachedMeshKey { plane, options: options.clone(), key });
+        key
+    }
+
+    /// Ask for a mesh of the active plane (built in the background).
+    fn ensure_mesh(&mut self, opts: MeshOptions) -> u64 {
         let opts = MeshOptions { allow_missing_foils: true, ..opts };
-        let key = plane_key(plane, &opts, &self.project);
+        let key = self.preview_mesh_key(&opts);
         if self.pui.mesh.as_ref().map(|m| m.0) == Some(key) {
             if let Some((id, _)) = self.pui.mesh_job.take() {
                 if let Some(job) = self.jobs.get(id) { job.cancel(); }
@@ -167,12 +188,13 @@ impl App {
             }
             self.pui.mesh_job = None;
         }
-        let db = self.project.foil_db();
+        let db = self.foil_db();
+        let plane = &self.project.planes[self.sel_plane];
         let missing: Vec<String> = plane.foil_names().into_iter().filter(|n| !db.has_foil(n)).collect();
         if !missing.is_empty() {
             self.toast = Some((format!("foils not loaded: {} (drawn as flat plates)", missing.join(", ")), std::time::Instant::now(), true));
         }
-        let j = self.jobs.submit(format!("mesh {}", plane.name), JobKind::Mesh { plane: plane.clone(), db, options: opts });
+        let j = self.jobs.submit(format!("mesh {}", plane.name), JobKind::Mesh { plane: plane.clone(), db: (*db).clone(), options: opts });
         self.pui.mesh_job = Some((j.id, key));
         self.track_job(j.id, Pending::Mesh(key));
         key
@@ -207,9 +229,8 @@ impl App {
         }
         self.sel_plane = self.sel_plane.min(self.project.planes.len() - 1);
         let foil_names: Vec<String> = self.project.foils.iter().map(|f| f.name.clone()).collect();
-        let before = self.project.planes[self.sel_plane].clone();
-        let mut edited = before.clone();
-        let db = self.project.foil_db();
+        let mut edited = self.project.planes[self.sel_plane].clone();
+        let db = self.foil_db();
         let mut cad_request = None;
         egui::SidePanel::left("plane_left").resizable(true).default_width(560.0).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -236,7 +257,8 @@ impl App {
         if let Some((path, scale, body)) = cad_request {
             self.import_cad_body(self.sel_plane, body, &path, scale);
         }
-        if edited != before {
+        let before = &self.project.planes[self.sel_plane];
+        if edited != *before {
             if let Err(e) = edited.validate() {
                 self.toast = Some((e, std::time::Instant::now(), true));
             }
@@ -248,16 +270,15 @@ impl App {
                     }
                 }
             }
-            self.snapshot();
-            self.project.planes[self.sel_plane] = edited.clone();
+            self.snapshot_plane_geometry();
+            self.project.planes[self.sel_plane] = edited;
         }
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.pui.view_thick, "thick surfaces (panel-method mesh)");
                 ui.checkbox(&mut self.pui.edges, "panel edges");
-                let plane_now = self.project.planes[self.sel_plane].clone();
                 ui.menu_button("Export", |ui| {
-                    let db = self.project.foil_db();
+                    let plane_now = self.project.planes[self.sel_plane].clone();
                     if ui.button("AVL geometry (.avl + foil files)").clicked() {
                         if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.avl", plane_now.name)).save_file() {
                             let mut ok = std::fs::write(&path, foiley_plane::export::avl(&plane_now, &db, 0.0)).is_ok();
@@ -295,11 +316,11 @@ impl App {
                 });
                 hint(ui, "orange = control surfaces; the mesh is rebuilt in the background after each edit");
             });
-            let plane = self.project.planes[self.sel_plane].clone();
             let opts = MeshOptions { thick: self.pui.view_thick, include_fuse: true, fuse_in_thin: true, ..Default::default() };
-            let key = self.ensure_mesh(&plane, opts);
+            let key = self.ensure_mesh(opts);
+            let plane = &self.project.planes[self.sel_plane];
             let mesh = self.pui.mesh.as_ref().filter(|m| m.0 == key).map(|m| &m.1);
-            let inertia = plane.inertia(&self.project.foil_db());
+            let inertia = plane.inertia(&db);
             let mut ov = Overlay { lines: vec![], points: vec![] };
             if inertia.mass > 0.0 {
                 ov.points.push((inertia.cog, Color32::YELLOW, format!("CoG {:.3} kg", inertia.mass)));
@@ -651,7 +672,7 @@ impl App {
             self.notify(e, true);
             return;
         }
-        let db = self.project.foil_db();
+        let db = self.foil_db();
         let missing: Vec<String> = plane.foil_names().into_iter().filter(|n| !db.has_foil(n)).collect();
         if !missing.is_empty() {
             self.notify(format!("load these foils first: {}", missing.join(", ")), true);
@@ -672,7 +693,7 @@ impl App {
                 }
             }
         }
-        self.submit(title, JobKind::PlanePolar { plane: plane.clone(), db, def }, Pending::PlanePolar);
+        self.submit(title, JobKind::PlanePolar { plane: plane.clone(), db: (*db).clone(), def }, Pending::PlanePolar);
     }
 
     fn results_3d(&mut self, ui: &mut egui::Ui, plane: &Plane) {
@@ -817,7 +838,7 @@ impl App {
                     });
                     let def = sel.as_ref().and_then(|p| p.def.clone()).unwrap_or_else(|| self.pui.def.clone());
                     let opts = foiley_plane::analysis::mesh_options(&def, &Default::default(), &Default::default());
-                    let key = self.ensure_mesh(plane, opts);
+                    let key = self.ensure_mesh(opts);
                     let mesh = self.pui.mesh.as_ref().filter(|m| m.0 == key).map(|m| &m.1);
                     let mut ov = Overlay { lines: vec![], points: vec![] };
                     let mut cpv: Vec<f32> = vec![];
@@ -1509,8 +1530,9 @@ fn summary(ui: &mut egui::Ui, p: &Plane, db: &foiley_plane::FoilDb) {
 #[cfg(test)]
 mod mesh_cache_regressions {
     use super::*;
-    use foiley_app::{JobManager, Project};
-    use foiley_foil::Foil;
+    use foiley_app::{JobManager, JobOutput, Project};
+    use foiley_foil::{Foil, FoilPoint, FoilPolar};
+    use std::sync::Arc;
 
     #[test]
     fn mesh_key_tracks_referenced_geometry_hinge_missing_foil_and_options() {
@@ -1532,9 +1554,15 @@ mod mesh_cache_regressions {
         let hinged = plane_key(&plane, &opts, &project);
         assert_ne!(replaced, hinged);
         same_name.hinge = Some((0.8, 0.5));
-        project.upsert_foil(same_name);
+        project.upsert_foil(same_name.clone());
         assert_ne!(hinged, plane_key(&plane, &opts, &project));
+        let before_small_edit = plane_key(&plane, &opts, &project);
+        let polar_hash = same_name.geom_hash();
+        same_name.y[20] += 1e-12;
+        assert_eq!(same_name.geom_hash(), polar_hash);
+        project.upsert_foil(same_name);
         let unchanged = plane_key(&plane, &opts, &project);
+        assert_ne!(unchanged, before_small_edit);
         project.foils[0].note = "documentation only".into();
         project.upsert_foil(Foil::naca("4412").unwrap());
         assert_eq!(unchanged, plane_key(&plane, &opts, &project), "unreferenced foils and notes do not affect a mesh");
@@ -1549,6 +1577,48 @@ mod mesh_cache_regressions {
     }
 
     #[test]
+    fn preview_caches_follow_geometry_edits_and_completed_foil_polars() {
+        let mut app = App::from_project(Project::starter(), JobManager::new(1), true);
+        let opts = MeshOptions::default();
+        let db = app.foil_db();
+        let key = app.preview_mesh_key(&opts);
+        assert!(Arc::ptr_eq(&db, &app.foil_db()));
+        assert_eq!(key, app.preview_mesh_key(&opts));
+
+        app.snapshot_plane_geometry();
+        app.project.planes[0].wings[0].sections[0].chord *= 1.2;
+        let edited = app.preview_mesh_key(&opts);
+        assert_ne!(key, edited);
+        assert!(Arc::ptr_eq(&db, &app.foil_db()));
+
+        let polar = FoilPolar {
+            foil: app.project.foils[0].name.clone(),
+            re: 300_000.0,
+            viscous: true,
+            points: vec![FoilPoint::default(), FoilPoint { alpha: 2.0, cl: 0.2, ..Default::default() }],
+            ..Default::default()
+        };
+        app.apply_output(app.job_generation, "batch", Pending::Batch, JobOutput::Batch(vec![polar]));
+        let new_db = app.foil_db();
+        assert!(!Arc::ptr_eq(&db, &new_db));
+        assert_eq!(new_db.families().len(), 1);
+        assert_eq!(app.pui.mesh_key.as_ref().unwrap().key, edited);
+        app.undo();
+        assert!(app.foil_db().families().is_empty());
+        assert_eq!(app.preview_mesh_key(&opts), edited);
+        app.undo();
+        assert_eq!(app.preview_mesh_key(&opts), key);
+        app.redo();
+        assert_eq!(app.preview_mesh_key(&opts), edited);
+
+        let thick = MeshOptions { thick: true, ..Default::default() };
+        assert_ne!(app.preview_mesh_key(&thick), edited);
+        app.project.planes.push(Plane::default_plane("NACA 0009", "NACA 2412"));
+        app.sel_plane = 1;
+        assert_ne!(app.preview_mesh_key(&opts), edited);
+    }
+
+    #[test]
     fn same_name_replacement_rebuilds_mesh_and_rejects_obsolete_completion() {
         let mut project = Project::new("mesh");
         let foil = Foil::naca("0012").unwrap();
@@ -1557,24 +1627,27 @@ mod mesh_cache_regressions {
             for section in &mut wing.sections { section.nx = 3; section.ny = 3; }
         }
         project.foils.push(foil.clone());
+        project.planes.push(plane);
         let mut app = App::from_project(project, JobManager::new(1), true);
-        app.ensure_mesh(&plane, MeshOptions::default());
+        app.ensure_mesh(MeshOptions::default());
         let old = app.pui.mesh_job.unwrap();
         app.jobs.wait(old.0, |_| {});
         app.process_jobs();
         let old_centres: Vec<_> = app.pui.mesh.as_ref().unwrap().1.panels.iter().map(|p| p.centre).collect();
         let mut cambered = Foil::naca("2412").unwrap();
         cambered.name = foil.name;
+        app.snapshot_foil_geometry();
         app.project.upsert_foil(cambered.clone());
-        app.ensure_mesh(&plane, MeshOptions::default());
+        app.ensure_mesh(MeshOptions::default());
         let obsolete = app.pui.mesh_job.unwrap();
         assert_ne!(old.1, obsolete.1);
         app.jobs.wait(obsolete.0, |_| {});
         // Change the hinge before collecting the old completion. Its result
         // must not overwrite the new request or clear its pending handle.
         cambered.hinge = Some((0.7, 0.5));
+        app.snapshot_foil_geometry();
         app.project.upsert_foil(cambered);
-        app.ensure_mesh(&plane, MeshOptions::default());
+        app.ensure_mesh(MeshOptions::default());
         let latest = app.pui.mesh_job.unwrap();
         assert_ne!(obsolete.1, latest.1);
         app.jobs.wait(latest.0, |_| {});

@@ -201,7 +201,7 @@ pub struct Mesh {
 }
 
 /// Options for mesh generation.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeshOptions {
     pub thick: bool,
     pub include_fuse: bool,

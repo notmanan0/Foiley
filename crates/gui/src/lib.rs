@@ -16,10 +16,10 @@ use eframe::egui::{self, Color32, RichText};
 use foiley_app::{JobId, JobKind, JobManager, JobOutput, JobStatus, Project};
 use foiley_core::progress::LogLevel;
 use foiley_foil::analysis::PointDetail;
-use foiley_plane::{Plane, PlanePolarDef};
+use foiley_plane::{FoilDb, Plane, PlanePolarDef};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,6 +85,7 @@ pub struct LogLine {
 
 pub struct App {
     pub project: Project,
+    foil_db: Option<Arc<FoilDb>>,
     pub path: Option<PathBuf>,
     pub dirty: bool,
     pub jobs: JobManager,
@@ -175,6 +176,7 @@ impl App {
         let sel_foil = project.foils.first().map(|f| f.name.clone());
         App {
             project,
+            foil_db: None,
             path: None,
             dirty: false,
             jobs,
@@ -204,6 +206,7 @@ impl App {
     }
 
     /// Record the project state before a modification (undo).
+    /// Use the input-specific helpers for edits affecting the preview caches.
     pub fn snapshot(&mut self) {
         self.undo.push(self.project.clone());
         if self.undo.len() > 40 {
@@ -213,9 +216,35 @@ impl App {
         self.version.revision += 1;
         self.dirty = true;
     }
+
+    fn foil_db(&mut self) -> Arc<FoilDb> {
+        Arc::clone(self.foil_db.get_or_insert_with(|| Arc::new(self.project.foil_db())))
+    }
+
+    fn snapshot_foil_polars(&mut self) {
+        self.snapshot();
+        self.foil_db = None;
+    }
+
+    fn snapshot_foil_geometry(&mut self) {
+        self.snapshot();
+        self.invalidate_preview_inputs();
+    }
+
+    fn snapshot_plane_geometry(&mut self) {
+        self.snapshot();
+        self.pui.invalidate_mesh_key();
+    }
+
+    fn invalidate_preview_inputs(&mut self) {
+        self.foil_db = None;
+        self.pui.invalidate_mesh_key();
+    }
+
     fn undo(&mut self) {
         if let Some(p) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.project, p));
+            self.invalidate_preview_inputs();
             self.version.revision += 1;
             self.dirty = true;
             self.notify("undone", false);
@@ -224,6 +253,7 @@ impl App {
     fn redo(&mut self) {
         if let Some(p) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.project, p));
+            self.invalidate_preview_inputs();
             self.version.revision += 1;
             self.dirty = true;
         }
@@ -269,6 +299,7 @@ impl App {
         self.version.project += 1;
         self.version.revision = 0;
         self.project = project;
+        self.foil_db = None;
         self.path = path;
         self.dirty = dirty;
         self.undo.clear();
@@ -374,7 +405,7 @@ impl App {
             .add_filter("XFoil polar", &["txt", "pol"])
             .pick_files()
         {
-            self.snapshot();
+            self.snapshot_foil_geometry();
             for f in files {
                 match import_file(&mut self.project, &f) {
                     Ok(m) => {
@@ -430,7 +461,7 @@ impl App {
         match (what, out) {
             (Pending::FoilPolar, JobOutput::FoilPolar { polar, details }) => {
                 let msg = format!("{}: {} points{}", polar.name, polar.points.len(), if polar.failed.is_empty() { String::new() } else { format!(", {} not converged", polar.failed.len()) });
-                self.snapshot();
+                self.snapshot_foil_polars();
                 let key = self.project.add_foil_polar(polar);
                 if !details.is_empty() {
                     let stored = self.details.entry(key.clone()).or_default();
@@ -450,7 +481,7 @@ impl App {
                 None => self.notify(format!("{title}: did not converge - try a different alpha, Re, or Ncrit"), true),
             },
             (Pending::Batch, JobOutput::Batch(pols)) => {
-                self.snapshot();
+                self.snapshot_foil_polars();
                 let n = pols.len();
                 for p in pols {
                     let key = self.project.add_foil_polar(p);
@@ -459,14 +490,14 @@ impl App {
                 self.notify(format!("{title}: {n} polars added"), false);
             }
             (Pending::AutoPolarsThen(b), JobOutput::Batch(pols)) => {
-                self.snapshot();
+                self.snapshot_foil_polars();
                 for p in pols {
                     self.project.add_foil_polar(p);
                 }
                 let (plane, def) = *b;
-                let db = self.project.foil_db();
+                let db = self.foil_db();
                 let t = format!("{} - {}", plane.name, def.name);
-                self.submit(t, JobKind::PlanePolar { plane, db, def }, Pending::PlanePolar);
+                self.submit(t, JobKind::PlanePolar { plane, db: (*db).clone(), def }, Pending::PlanePolar);
             }
             (Pending::PlanePolar, JobOutput::PlanePolar(pol)) => {
                 self.snapshot();
@@ -500,7 +531,7 @@ impl App {
                     let mut edited = self.project.planes[i].clone();
                     match r.apply(&mut edited) {
                         Ok(msg) => {
-                            self.snapshot();
+                            self.snapshot_plane_geometry();
                             self.project.planes[i] = edited;
                             self.notify(format!("{title}: {msg}"), false);
                         }
@@ -549,7 +580,7 @@ impl App {
                     r.context_menu(|ui| {
                         if ui.button("Duplicate").clicked() {
                             if let Some(f) = self.project.foil(&n).cloned() {
-                                self.snapshot();
+                                self.snapshot_foil_geometry();
                                 let mut g = f;
                                 g.name = self.project.unique_foil_name(&g.name);
                                 self.sel_foil = Some(g.name.clone());
@@ -558,7 +589,7 @@ impl App {
                             ui.close();
                         }
                         if ui.button("Delete (with its polars)").clicked() {
-                            self.snapshot();
+                            self.snapshot_foil_geometry();
                             self.project.remove_foil(&n);
                             ui.close();
                         }
@@ -592,7 +623,7 @@ impl App {
                     });
                 }
                 if let Some(i) = del {
-                    self.snapshot();
+                    self.snapshot_plane_geometry();
                     let name = self.project.planes[i].name.clone();
                     self.project.planes.remove(i);
                     self.project.plane_polars.retain(|p| p.plane != name);
