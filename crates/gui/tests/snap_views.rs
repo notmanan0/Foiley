@@ -131,8 +131,12 @@ fn a_preset_that_needs_a_wing_reports_a_plane_without_one() {
         Err(SnapError::Adapter(error)) if !cfg!(windows) => {
             eprintln!("Skipping wingless snap: {error}");
         }
-        // reported as an input error (exit status 1), never a panic
-        Err(SnapError::Input(reason)) => assert!(reason.contains("wing"), "{reason}"),
-        other => panic!("expected an input error, got {other:?}"),
+        // An error, never a panic.  The plane cannot be meshed either, and
+        // whether that failure is seen before the preset starts (input) or
+        // while it settles depends on timing.
+        Err(SnapError::Input(reason) | SnapError::Settle(reason)) => {
+            assert!(reason.contains("wing"), "{reason}")
+        }
+        other => panic!("expected an error about the wing, got {other:?}"),
     }
 }
