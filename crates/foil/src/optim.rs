@@ -1,8 +1,10 @@
 //! Airfoil shape optimisation (equivalent of xflr5's Optim2d).
 //!
-//! The design variables change the shape of the base foil, measured along
-//! its chord (normalised coordinates) but applied in the foil's own frame,
-//! so the design angle of attack is the one the base foil is analysed at:
+//! The design variables change the shape of the base foil.  As in 1.1 the
+//! foil is first moved and scaled to unit chord with its leading edge at the
+//! origin (the flap hinge and the analysis work in x/c), but it is not
+//! rotated, so the design angle of attack is the one the base foil is
+//! analysed at:
 //! either the amplitudes of Hicks-Henne bump functions added along the local
 //! surface normal, or changes of the weights of a CST (class-shape
 //! transformation) representation added to each surface, which move the
@@ -450,23 +452,29 @@ pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil
         return Err(FoilError::Geometry("non-finite design variable".into()));
     }
     base.validate()?;
-    // shapes are measured on the normalised foil (x/c, surface normals) but
-    // the changes are applied in the base foil's own frame: zero genes give
-    // the base foil itself, at the same angle of attack
+    // Shapes are measured on the normalised foil (x/c, surface normals).
+    // The candidate is the base foil moved and scaled to unit chord with its
+    // leading edge at the origin, as in 1.1 (the flap hinge and the analysis
+    // work in x/c), but not rotated: zero genes keep the base foil's angle
+    // of attack.  The changes are rotated back into that frame.
     let b = base.normalized();
     let n = b.n();
     let ile = b.le_index();
+    let (xl, yl) = (base.x[ile], base.y[ile]);
     let (ang, ch) = {
-        let (xl, yl) = (base.x[ile], base.y[ile]);
         let (xt, yt) = (0.5 * (base.x[0] + base.x[n - 1]), 0.5 * (base.y[0] + base.y[n - 1]));
         ((yt - yl).atan2(xt - xl), ((xt - xl).powi(2) + (yt - yl).powi(2)).sqrt().max(1e-12))
     };
     let (sa, ca) = ang.sin_cos();
     let mut f = base.clone();
     f.recipe = None;
+    for i in 0..n {
+        f.x[i] = (base.x[i] - xl) / ch;
+        f.y[i] = (base.y[i] - yl) / ch;
+    }
     let mut displace = |i: usize, dxn: f64, dyn_: f64| {
-        f.x[i] += ch * (ca * dxn - sa * dyn_);
-        f.y[i] += ch * (sa * dxn + ca * dyn_);
+        f.x[i] += ca * dxn - sa * dyn_;
+        f.y[i] += sa * dxn + ca * dyn_;
     };
     if nb > 0 {
         for i in 1..n - 1 {
@@ -969,12 +977,35 @@ mod tests {
         let nan = OptimSettings { parameterization: Parameterization::Cst, cst_order: 2, cst_max_delta: f64::NAN, ..Default::default() };
         assert!(matches!(optimise(&base0, &nan, &Progress::none(), &|_, _| {}), Err(FoilError::Geometry(_))));
         assert!(apply_genes(&base0, &nan, &[0.0; 6]).is_err());
-        // zero genes keep a cambered generated foil in its own frame (its
-        // LE is not the leftmost point), so the design angle is unchanged
+        // zero genes keep a cambered generated foil's angle (its LE is not
+        // its leftmost point), and any base is brought to unit chord with
+        // the LE at the origin, as in 1.1: shifted or dimensional
+        // coordinates give the same candidate
         let tilted = Foil::naca("23112").unwrap();
         let z = OptimSettings { parameterization: Parameterization::Cst, cst_order: 3, ..Default::default() };
         let g = apply_genes(&tilted, &z, &z.neutral_genes()).unwrap();
-        assert_eq!((&g.x, &g.y), (&tilted.x, &tilted.y));
+        let chord_angle = |f: &Foil| {
+            let (i, n) = (f.le_index(), f.n());
+            (0.5 * (f.y[0] + f.y[n - 1]) - f.y[i]).atan2(0.5 * (f.x[0] + f.x[n - 1]) - f.x[i])
+        };
+        assert!((chord_angle(&g) - chord_angle(&tilted)).abs() < 1e-14);
+        let (gn, tn) = (g.normalized(), tilted.normalized());
+        assert!(gn.x.iter().zip(&tn.x).chain(gn.y.iter().zip(&tn.y)).all(|(a, b)| (a - b).abs() < 1e-12), "same shape");
+        let mut moved = tilted.clone();
+        for v in moved.x.iter_mut() {
+            *v = 100.0 * *v + 300.0;
+        }
+        for v in moved.y.iter_mut() {
+            *v *= 100.0;
+        }
+        let mut genes = z.neutral_genes();
+        genes[1] = 0.02;
+        let (a, b) = (apply_genes(&tilted, &z, &genes).unwrap(), apply_genes(&moved, &z, &genes).unwrap());
+        assert!(a.x.iter().zip(&b.x).chain(a.y.iter().zip(&b.y)).all(|(p, q)| (p - q).abs() < 1e-12));
+        let flapped = OptimSettings { flap: Some((-5.0, 10.0)), ..z.clone() };
+        let mut fg = flapped.neutral_genes();
+        fg[z.dimension()] = 8.0;
+        apply_genes(&moved, &flapped, &fg).unwrap();
         // 1.1 accepted more than 50 bumps; huge workloads are refused
         assert!(OptimSettings { bumps_per_side: 51, ..Default::default() }.validate().is_ok());
         assert!(OptimSettings { iterations: usize::MAX, ..Default::default() }.validate().is_err());

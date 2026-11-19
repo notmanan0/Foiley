@@ -164,11 +164,7 @@ impl Foil {
     /// of those digits.  Trailing words are not dropped: "2412 mod" is an
     /// error, not NACA 2412.
     pub fn naca(code: &str) -> Result<Foil, FoilError> {
-        let code = crate::gen::naca::strip_naca_prefix(code).unwrap_or(code);
-        Recipe::Naca { designation: code.to_string() }.generate(None).or_else(|e| match crate::gen::naca::legacy_digits(code) {
-            Some(d) if d != code.trim() => Recipe::Naca { designation: d }.generate(None).map_err(|_| e),
-            _ => Err(e),
-        })
+        Recipe::Naca { designation: code.to_string() }.generate(None)
     }
 
     /// Generate a foil from a recipe, named `name` (a NACA section keeps its

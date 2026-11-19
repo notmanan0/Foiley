@@ -523,7 +523,7 @@ enum GenFamily {
         /// position of maximum camber (parabolic only)
         #[arg(long, default_value_t = 0.5)]
         x_camber: f64,
-        /// trailing edge: square (blunt, cut vertically at x/c = 1; XFoil can analyse it) or round (geometry only)
+        /// trailing edge: square (blunt, cut square to the plate; XFoil can analyse it) or round (geometry only)
         #[arg(long, default_value = "square")]
         te: String,
     },
@@ -664,6 +664,15 @@ fn publish(path: &Path, bytes: &[u8], protected: &[&Option<PathBuf>]) -> Result<
         if same_file(path, p) {
             return Err(format!("the output {} is the input file {}: it would be overwritten", path.display(), p.display()));
         }
+    }
+    // a device or pipe (NUL, /dev/null, /dev/stdout) cannot be replaced
+    // by a rename: write to it directly
+    let windows_device = cfg!(windows)
+        && path.file_stem().map(|n| n.to_string_lossy().to_ascii_uppercase()).is_some_and(|n| {
+            matches!(n.as_str(), "NUL" | "CON" | "PRN" | "AUX") || ((n.starts_with("COM") || n.starts_with("LPT")) && n.len() == 4 && n.as_bytes()[3].is_ascii_digit())
+        });
+    if windows_device || std::fs::metadata(path).is_ok_and(|m| !m.is_file() && !m.is_dir()) {
+        return std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()));
     }
     let name = path.file_name().ok_or_else(|| format!("{}: not a file name", path.display()))?;
     let tmp = path.with_file_name(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));

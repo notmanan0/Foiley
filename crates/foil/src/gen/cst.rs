@@ -100,8 +100,10 @@ impl Cst {
         if self.upper.iter().chain(&self.lower).chain([&self.te_upper, &self.te_lower, &self.n1, &self.n2]).any(|v| !v.is_finite()) {
             return Err(FoilError::Geometry("CST: non-finite parameter".into()));
         }
-        if self.upper.iter().chain(&self.lower).any(|v| v.abs() > 10.0) || self.te_upper.abs() > 1.0 || self.te_lower.abs() > 1.0 {
-            return Err(FoilError::Geometry("CST: weights must be within +-10 and trailing-edge heights within +-1 chord".into()));
+        // high-order fits of ordinary sections reach weights of tens or
+        // hundreds; the bound only keeps the sums far from overflow
+        if self.upper.iter().chain(&self.lower).any(|v| v.abs() > 1e4) || self.te_upper.abs() > 1.0 || self.te_lower.abs() > 1.0 {
+            return Err(FoilError::Geometry("CST: weights must be within +-10000 and trailing-edge heights within +-1 chord".into()));
         }
         if self.te_upper < self.te_lower {
             return Err(FoilError::Geometry(format!("CST: the upper trailing edge ({}) is below the lower one ({})", self.te_upper, self.te_lower)));
@@ -243,6 +245,22 @@ mod tests {
         assert!(Cst { upper: vec![0.1, 0.2], lower: vec![-0.1], ..Cst::default() }.validate().is_err());
         // order 0 is a valid (if crude) section
         assert!(Cst { upper: vec![0.15], lower: vec![-0.15], ..Cst::default() }.generate("x").is_ok());
+    }
+
+    #[test]
+    fn high_order_fits_of_ordinary_sections_regenerate() {
+        for code in ["2412", "0012", "64(2)-415", "23012"] {
+            let f = Foil::naca(code).unwrap();
+            for order in [16, 18, 20] {
+                if let Ok((c, _)) = Cst::fit(&f, order) {
+                    c.generate("x").unwrap_or_else(|e| panic!("{code} order {order}: {e}"));
+                } else {
+                    // a refusal must be about crossing surfaces, not the weight bound
+                    let e = Cst::fit(&f, order).unwrap_err().to_string();
+                    assert!(!e.contains("10000"), "{code} order {order}: {e}");
+                }
+            }
+        }
     }
 
     #[test]

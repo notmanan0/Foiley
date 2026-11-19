@@ -171,13 +171,16 @@ control the shape:
 **Limits.**
 * N1 and N2 must be greater than zero, since the surfaces must meet at the
   nose and the tail.
-* The weights must lie within ±10, and the trailing-edge heights within ±1
-  chord.
+* The weights must lie within ±10,000, and the trailing-edge heights
+  within ±1 chord.
 * The upper trailing edge may not lie below the lower one.
 * The upper surface must stay above the lower one everywhere. That holds
   when the Bernstein polynomial of the weight differences is positive. Foiley
   proves this exactly, by subdividing until the Bernstein coefficients
   (which bound the polynomial) are all positive, rather than by sampling.
+  * The condition is sufficient, not necessary. A blunt-edged section whose
+    last weight difference is negative, but whose gap keeps it thick, is
+    refused too.
 
 **Fitting.** *Fit* (`Cst::fit`, `foiley foil fit-cst`) normalises the foil
 and solves for the weights of each surface by least squares (QR). It
@@ -193,10 +196,11 @@ suggestion to use a lower order.
 `foiley foil optimize --shape cst --cst-order 5 --cst-delta 0.05`. The genes
 are changes of the weights, added to the base foil as
 `dy = x^0.5 (1−x) Σ ΔAᵢ Bᵢ(x)`.
-* **Frame.** The changes are measured along the normalised chord but
-  applied in the base foil's own frame (both CST and Hicks–Henne). Zero
-  genes therefore reproduce the base foil exactly, at the angle of attack
-  you asked for, even when its leading edge is not its leftmost point.
+* **Frame.** As in 1.1, the base foil is moved and scaled to unit chord
+  with its leading edge at the origin, because the flap hinge and the
+  analysis work in x/c. Unlike 1.1, it is no longer rotated, for both CST
+  and Hicks–Henne genes. Zero genes therefore keep the base foil's angle of
+  attack, even when its leading edge is not its leftmost point.
 * **Fit error.** It never enters the first design.
 * **Shape.** Each gene moves thickness, camber or the LE radius over the
   whole chord, without the local waviness of Hicks–Henne bumps.

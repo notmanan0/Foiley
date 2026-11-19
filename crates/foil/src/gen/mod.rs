@@ -61,7 +61,7 @@ impl Recipe {
     pub fn generate(&self, name: Option<&str>) -> Result<Foil, FoilError> {
         // every family's generator attaches its own recipe
         let mut f = match self {
-            Recipe::Naca { designation } => naca::parse(designation)?.generate()?,
+            Recipe::Naca { designation } => naca::parse_with_legacy(designation)?.generate()?,
             Recipe::Cst(c) => c.generate(name.unwrap_or("CST"))?,
             Recipe::Parsec(p) => p.generate(name.unwrap_or("PARSEC"))?,
             Recipe::KarmanTrefftz(k) => k.generate(name.unwrap_or("Karman-Trefftz"))?,
@@ -77,7 +77,7 @@ impl Recipe {
     /// recipe).
     pub fn validate(&self) -> Result<(), FoilError> {
         match self {
-            Recipe::Naca { designation } => naca::parse(designation).map(|_| ()),
+            Recipe::Naca { designation } => naca::parse_with_legacy(designation).map(|_| ()),
             Recipe::Cst(c) => c.validate(),
             Recipe::Parsec(p) => p.validate(),
             Recipe::KarmanTrefftz(k) => k.validate(),

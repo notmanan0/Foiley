@@ -404,7 +404,7 @@ impl App {
                         num_keep(ui, "x of max camber", &mut p.x_camber, 0.01, 0.1..=0.9, "");
                     }
                     let mut te = usize::from(p.trailing_edge == PlateEdge::Round);
-                    ui.label("trailing edge").on_hover_text("square: blunt, cut vertically at x/c = 1 (XFoil can analyse it); round: a semicircle, geometry only (XFoil's viscous solution does not converge on it)");
+                    ui.label("trailing edge").on_hover_text("square: blunt, cut square to the plate (XFoil can analyse it); round: a semicircle, geometry only (XFoil's viscous solution does not converge on it)");
                     if widgets::pick(ui, "platete", &mut te, &["square", "round"]) {
                         p.trailing_edge = if te == 1 { PlateEdge::Round } else { PlateEdge::Square };
                     }

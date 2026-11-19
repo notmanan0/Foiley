@@ -147,6 +147,18 @@ pub fn foil_from_name(name: &str) -> Option<Result<crate::Foil, FoilError>> {
     strip_naca_prefix(name).map(crate::Foil::naca)
 }
 
+/// [`parse`], falling back to Foiley 1.1's reading of digits joined by
+/// separators ([`legacy_digits`]) when the code does not parse.
+pub fn parse_with_legacy(code: &str) -> Result<NacaSection, FoilError> {
+    parse(code).or_else(|e| {
+        let bare = strip_naca_prefix(code).unwrap_or(code);
+        match legacy_digits(bare) {
+            Some(d) if d != bare.trim() => parse(&d).map_err(|_| e),
+            _ => Err(e),
+        }
+    })
+}
+
 /// Foiley 1.1 read a NACA code by keeping only its digits.  When a code
 /// does not parse, the same digits are tried if nothing but separators
 /// (no letters) surrounds them: "24-12", "23-012", "24_12", "24/12".
