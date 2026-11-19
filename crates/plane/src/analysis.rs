@@ -777,6 +777,9 @@ impl PlaneOpp {
 pub struct PlanePolar {
     pub name: String,
     pub plane: String,
+    /// Original plane name used by the manifest after the plane is renamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_name: Option<String>,
     pub def: Option<PlanePolarDef>,
     pub points: Vec<PlaneOpp>,
     pub failed: Vec<String>,
@@ -790,6 +793,29 @@ pub struct PlanePolar {
 }
 
 impl PlanePolar {
+    pub fn rename_plane(&mut self, name: &str) {
+        if self.plane != name {
+            let previous = std::mem::replace(&mut self.plane, name.to_owned());
+            if self.manifest.is_some() {
+                self.geometry_name.get_or_insert(previous);
+            }
+        }
+    }
+
+    pub fn matches_plane_geometry(&self, plane: &Plane) -> bool {
+        let Some(manifest) = &self.manifest else { return false; };
+        if self.plane != plane.name {
+            return false;
+        }
+        if let Some(name) = self.geometry_name.as_ref().filter(|name| *name != &plane.name) {
+            let mut original = plane.clone();
+            original.name.clone_from(name);
+            manifest.geometry_hash == crate::provenance::plane_hash(&original)
+        } else {
+            manifest.geometry_hash == crate::provenance::plane_hash(plane)
+        }
+    }
+
     /// Neutral point estimate x_NP = dX_cp*CL / dCL (first to last point).
     pub fn neutral_point(&self) -> Option<f64> {
         let a = self.points.first()?;

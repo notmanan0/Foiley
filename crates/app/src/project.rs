@@ -331,7 +331,7 @@ impl Project {
                     self.planes.push(plane);
                 }
                 for mut p in other.plane_polars {
-                    if let Some(name) = plane_names.get(&p.plane) { p.plane = name.clone(); }
+                    if let Some(name) = plane_names.get(&p.plane) { p.rename_plane(name); }
                     self.add_plane_polar(p);
                 }
                 Ok(msg)

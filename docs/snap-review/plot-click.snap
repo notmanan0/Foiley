@@ -1,0 +1,7 @@
+settle
+snap initial-point viewport
+trace plot-click
+click 716,101
+settle
+end
+snap changed-point viewport

@@ -12,6 +12,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod launch;
 mod legacy;
 mod progress_ui;
+#[cfg(feature = "snap")]
+mod snap;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use foiley_app::{auto, JobKind, JobManager, JobOutput, Project};
@@ -88,6 +90,9 @@ enum Cmd {
         #[arg(long)]
         run: bool,
     },
+    /// Capture Foiley Studio images and motion traces without opening a window
+    #[cfg(feature = "snap")]
+    Snap(snap::SnapArgs),
 }
 
 #[cfg(feature = "gui")]
@@ -840,7 +845,14 @@ fn real_main() -> Result<(), String> {
     let mut args: Vec<OsString> = std::env::args_os().collect();
     #[cfg(feature = "gui")]
     launch::route(&mut args, &command_names());
-    let cli = Cli::parse_from(args);
+    let cli = Cli::try_parse_from(&args).unwrap_or_else(|error| {
+        #[cfg(feature = "snap")]
+        if error.use_stderr() && args.iter().skip(1).any(|arg| arg == "snap") {
+            let _ = error.print();
+            std::process::exit(1);
+        }
+        error.exit()
+    });
     let Some(cmd) = cli.cmd else {
         if !std::io::stdin().is_terminal() {
             legacy::run(None, cli.verbose);
@@ -853,6 +865,11 @@ fn real_main() -> Result<(), String> {
     #[cfg(feature = "gui")]
     let cmd = match cmd {
         Cmd::Studio { files, module, run } => return launch::studio(foiley_gui::Launch { files, module: module.map(Into::into), run, threads: cli.threads }),
+        #[cfg(feature = "snap")]
+        Cmd::Snap(snap) => {
+            snap.run(cli.threads);
+            return Ok(());
+        }
         cmd => cmd,
     };
     let mut mgr = JobManager::new(cli.threads);
@@ -1440,6 +1457,8 @@ fn real_main() -> Result<(), String> {
         Cmd::Run { script } => run_script(&mut mgr, &mut ui, &script)?,
         #[cfg(feature = "gui")]
         Cmd::Studio { .. } => unreachable!("Studio returned above"),
+        #[cfg(feature = "snap")]
+        Cmd::Snap(_) => unreachable!("snap returned above"),
     }
     Ok(())
 }

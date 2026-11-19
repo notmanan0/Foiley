@@ -10,7 +10,7 @@
 //!   nothing here ever blocks the caller: the UI polls `jobs()` each frame;
 //! * partial results (finished points / polars) are published as they come.
 
-use foiley_core::Progress;
+use foiley_core::{hash::Hash32, Progress};
 use foiley_foil::analysis::{analyze_point, PointDetail};
 use foiley_foil::batch::{run_batch, BatchCase};
 use foiley_foil::{analyze, AnalysisSettings, Foil, FoilPolar, Sweep};
@@ -38,6 +38,7 @@ pub enum JobKind {
     AutoPolars { batches: Vec<crate::auto::AutoBatch> },
     PlanePolar { plane: Plane, db: FoilDb, def: PlanePolarDef },
     Mesh { plane: Plane, db: FoilDb, options: MeshOptions },
+    MeshHash { plane: Plane, db: FoilDb, options: MeshOptions },
     Optimise { foil: Foil, settings: foiley_foil::optim::OptimSettings },
     Inverse { foil: Foil, alpha: f64, mode: foiley_foil::inverse::InverseMode, paneling: foiley_foil::foil::Paneling, target: Option<InverseTarget>, iterations: usize },
     /// Read and tessellate an STL / STEP body (F024).
@@ -147,6 +148,7 @@ impl JobKind {
             JobKind::Batch { .. } | JobKind::AutoPolars { .. } => "2D batch",
             JobKind::PlanePolar { .. } => "3D polar",
             JobKind::Mesh { .. } => "mesh",
+            JobKind::MeshHash { .. } => "mesh verification",
             JobKind::Optimise { .. } => "optimiser",
             JobKind::Inverse { .. } => "inverse design",
             JobKind::CadImport(_) => "CAD import",
@@ -159,7 +161,8 @@ pub enum JobOutput {
     FoilPoint(Option<PointDetail>),
     Batch(Vec<FoilPolar>),
     PlanePolar(PlanePolar),
-    Mesh(Mesh),
+    Mesh { mesh: Mesh, hash: Hash32 },
+    MeshHash(Hash32),
     Optimise(foiley_foil::optim::OptimResult),
     /// (new foil if a target was given, speed distribution)
     Inverse(Option<Foil>, foiley_foil::inverse::SpeedDist),
@@ -438,9 +441,17 @@ fn execute(job: &Job, kind: JobKind, notify: &Notify) -> Result<JobOutput, Strin
         }
         JobKind::Mesh { plane, db, options } => {
             p.stage("Meshing");
-            let m = build(&plane, &db, &options).map_err(|e| e.to_string())?;
+            let mesh = build(&plane, &db, &options).map_err(|e| e.to_string())?;
+            let hash = foiley_plane::provenance::mesh_hash(&mesh);
             p.set(1.0);
-            Ok(JobOutput::Mesh(m))
+            Ok(JobOutput::Mesh { mesh, hash })
+        }
+        JobKind::MeshHash { plane, db, options } => {
+            p.stage("Verifying base mesh");
+            let mesh = build(&plane, &db, &options).map_err(|e| e.to_string())?;
+            let hash = foiley_plane::provenance::mesh_hash(&mesh);
+            p.set(1.0);
+            Ok(JobOutput::MeshHash(hash))
         }
     }
 }

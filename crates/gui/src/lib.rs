@@ -9,6 +9,8 @@
 mod body_list;
 mod foil_ui;
 mod plane_ui;
+#[cfg(feature = "snap")]
+pub mod snap;
 mod view3d;
 mod widgets;
 
@@ -19,10 +21,10 @@ use foiley_foil::analysis::PointDetail;
 use foiley_plane::{FoilDb, Plane, PlanePolarDef};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Module {
     FoilDesign,
     FoilAnalysis,
@@ -49,6 +51,7 @@ pub enum Pending {
     /// compute the missing 2D polars, then run this 3D analysis
     AutoPolarsThen(Box<(Plane, PlanePolarDef)>),
     Mesh(u64),
+    BaseMeshHash,
     Inverse,
     Optimise,
     /// apply an imported CAD body to the plane of this name
@@ -111,6 +114,11 @@ pub struct App {
     pub details: HashMap<(String, String), Vec<PointDetail>>,
     pub point_detail: Option<PointDetail>,
     bottom_tab: usize,
+    headless: bool,
+    /// Persisted 3D viewport preferences (preserved across project replacements).
+    pub view3d_prefs: view3d::ViewPrefs,
+    /// App-owned OpenGL 3D renderer (explicitly destroyed in `on_exit`).
+    pub view3d_gl: Arc<Mutex<view3d::GlRenderer>>,
 }
 
 impl App {
@@ -127,6 +135,23 @@ impl App {
         });
         let project = Project::starter();
         let mut app = Self::from_project(project, jobs, dark);
+        if let Some(s) = cc.storage {
+            if let Some(v) = s.get_string("view3d_nav_preset") {
+                app.view3d_prefs.nav_preset = view3d::NavPreset::from_str(&v);
+            }
+            if let Some(v) = s.get_string("view3d_orbit_mode") {
+                app.view3d_prefs.orbit_mode = view3d::OrbitMode::from_str(&v);
+            }
+            if let Some(v) = s.get_string("view3d_perspective") {
+                app.view3d_prefs.perspective = v == "1";
+            }
+            if let Some(v) = s.get_string("view3d_show_grid") {
+                app.view3d_prefs.show_grid = v == "1";
+            }
+        }
+        if let Some(gl) = cc.gl.as_ref() {
+            app.view3d_gl.lock().unwrap().init(gl);
+        }
         app.module = module.unwrap_or(Module::FoilDesign);
         for f in files {
             let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -155,14 +180,7 @@ impl App {
             }
         }
         if run_now && !app.project.planes.is_empty() {
-            // start the current 3D analysis definition of the first plane (fine panel mesh)
-            let mut plane = app.project.planes[0].clone();
-            for w in &mut plane.wings {
-                for s in &mut w.sections {
-                    s.nx = s.nx.max(20);
-                    s.ny = s.ny.max(30);
-                }
-            }
+            let plane = app.project.planes[0].clone();
             app.pui.def.method = foiley_plane::analysis::Method::Panel;
             app.pui.def.viscous = false;
             app.module = Module::PlaneAnalysis;
@@ -202,6 +220,9 @@ impl App {
             details: HashMap::new(),
             point_detail: None,
             bottom_tab: 0,
+            headless: false,
+            view3d_prefs: view3d::ViewPrefs::default(),
+            view3d_gl: Arc::new(Mutex::new(view3d::GlRenderer::default())),
         }
     }
 
@@ -233,12 +254,12 @@ impl App {
 
     fn snapshot_plane_geometry(&mut self) {
         self.snapshot();
-        self.pui.invalidate_mesh_key();
+        self.pui.invalidate_mesh_key(&self.jobs);
     }
 
     fn invalidate_preview_inputs(&mut self) {
         self.foil_db = None;
-        self.pui.invalidate_mesh_key();
+        self.pui.invalidate_mesh_key(&self.jobs);
     }
 
     fn undo(&mut self) {
@@ -319,6 +340,7 @@ impl App {
     }
 
     fn open_dialog(&mut self) {
+        if self.headless { return; }
         if let Some(p) = rfd::FileDialog::new().add_filter("Foiley project", &["foiley", "json"]).pick_file() {
             self.load_async(p);
         }
@@ -330,6 +352,7 @@ impl App {
     }
 
     fn save(&mut self, as_new: bool) {
+        if self.headless { return; }
         let path = if as_new || self.path.is_none() {
             match rfd::FileDialog::new().add_filter("Foiley project", &["foiley"]).set_file_name(format!("{}.foiley", self.project.name)).save_file() {
                 Some(p) => p,
@@ -396,6 +419,7 @@ impl App {
     }
 
     fn import_dialog(&mut self) {
+        if self.headless { return; }
         if let Some(files) = rfd::FileDialog::new()
             .add_filter("All supported", &["dat", "txt", "xml", "pol", "foiley", "json", "xfl", "fl5", "plr", "avl"])
             .add_filter("xflr5 / flow5 projects and polars", &["xfl", "fl5", "plr"])
@@ -447,6 +471,14 @@ impl App {
             let st = job.status();
             let out = job.take_output();
             if generation != self.job_generation { continue; }
+            if matches!(what, Pending::BaseMeshHash) {
+                let hash = match out {
+                    Some(JobOutput::MeshHash(hash)) if st == JobStatus::Done => Some(hash),
+                    _ => None,
+                };
+                self.pui.finish_base_mesh_hash(id, hash);
+                continue;
+            }
             match (st, out) {
                 (JobStatus::Done, Some(out)) | (JobStatus::Cancelled, Some(out)) => self.apply_output(generation, &job.title, what, out),
                 (JobStatus::Failed(e), _) => self.notify(format!("{} failed: {e}", job.title), true),
@@ -540,8 +572,9 @@ impl App {
                 }
                 None => self.notify(format!("{title}: plane '{plane}' no longer exists"), true),
             },
-            (Pending::Mesh(key), JobOutput::Mesh(m)) if self.pui.mesh_job.map(|(_, pending_key)| pending_key) == Some(key) => {
-                self.pui.mesh = Some((key, m));
+            (Pending::Mesh(key), JobOutput::Mesh { mesh, hash }) if self.pui.mesh_job.map(|(_, pending_key)| pending_key) == Some(key) => {
+                self.pui.mesh = Some((key, mesh));
+                self.pui.mesh_hash = Some(hash);
                 self.pui.mesh_job = None;
             }
             _ => {}
@@ -627,6 +660,14 @@ impl App {
                     let name = self.project.planes[i].name.clone();
                     self.project.planes.remove(i);
                     self.project.plane_polars.retain(|p| p.plane != name);
+                    if i < self.sel_plane {
+                        self.sel_plane -= 1;
+                    }
+                    self.pui.cam.fitted_plane = self.pui.cam.fitted_plane.and_then(|fitted| match fitted.cmp(&i) {
+                        std::cmp::Ordering::Less => Some(fitted),
+                        std::cmp::Ordering::Equal => None,
+                        std::cmp::Ordering::Greater => Some(fitted - 1),
+                    });
                     self.sel_plane = self.sel_plane.min(self.project.planes.len().saturating_sub(1));
                 }
                 if ui.button("+ New plane").on_hover_text("Default glider: wing, elevator, fin").clicked() {
@@ -740,7 +781,7 @@ impl eframe::App for App {
         }
         self.process_jobs();
         // crash safety: autosave every 3 minutes when modified
-        if self.dirty && self.autosave_at.elapsed() > Duration::from_secs(180) && !self.io_busy {
+        if !self.headless && self.dirty && self.autosave_at.elapsed() > Duration::from_secs(180) && !self.io_busy {
             self.autosave_at = Instant::now();
             self.save_to(std::env::temp_dir().join("foiley_autosave.foiley"), true);
         }
@@ -758,8 +799,10 @@ impl eframe::App for App {
         if y && !ctx.wants_keyboard_input() {
             self.redo();
         }
-        let title = format!("Foiley Studio - {}{}", self.path.as_ref().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone()), if self.dirty { " *" } else { "" });
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if !self.headless {
+            let title = format!("Foiley Studio - {}{}", self.path.as_ref().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone()), if self.dirty { " *" } else { "" });
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -786,7 +829,7 @@ impl eframe::App for App {
                         self.import_dialog();
                     }
                     let recovery = std::env::temp_dir().join("foiley_autosave.foiley");
-                    if recovery.exists() && ui.button("Recover autosave").clicked() {
+                    if !self.headless && recovery.exists() && ui.button("Recover autosave").clicked() {
                         ui.close();
                         self.load_async(recovery);
                     }
@@ -856,10 +899,19 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("dark", if self.dark { "1".into() } else { "0".into() });
+        storage.set_string("view3d_nav_preset", self.view3d_prefs.nav_preset.as_str().into());
+        storage.set_string("view3d_orbit_mode", self.view3d_prefs.orbit_mode.as_str().into());
+        storage.set_string("view3d_perspective", if self.view3d_prefs.perspective { "1".into() } else { "0".into() });
+        storage.set_string("view3d_show_grid", if self.view3d_prefs.show_grid { "1".into() } else { "0".into() });
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         self.jobs.cancel_all();
+        if let Some(gl) = gl {
+            if let Ok(mut renderer) = self.view3d_gl.lock() {
+                renderer.destroy(gl);
+            }
+        }
     }
 }
 
@@ -891,6 +943,11 @@ pub fn run(launch: Launch) -> Result<(), String> {
 /// there is no terminal to print it on.
 pub fn error_dialog(text: &str) {
     rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Foiley").set_description(text).set_buttons(rfd::MessageButtons::Ok).show();
+}
+
+fn file_dialog(ctx: &egui::Context) -> Option<rfd::FileDialog> {
+    let headless = ctx.data(|data| data.get_temp::<bool>(egui::Id::new("foiley_snap"))).unwrap_or_default();
+    (!headless).then(rfd::FileDialog::new)
 }
 
 /// Import a file into the project.  xflr5 / flow5 projects, .plr polars and
