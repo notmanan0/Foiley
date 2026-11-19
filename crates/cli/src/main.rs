@@ -645,10 +645,22 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// A device or pipe rather than a file: `NUL`, `NUL:`, `CON` (on Windows,
+/// the bare reserved names; Windows 11 treats `nul.dat` as a file) or
+/// anything on disk that is neither a file nor a directory (`/dev/null`).
+fn is_device(path: &Path) -> bool {
+    let reserved = cfg!(windows)
+        && path.file_name().map(|n| n.to_string_lossy().trim_end_matches(':').to_ascii_uppercase()).is_some_and(|n| {
+            matches!(n.as_str(), "NUL" | "CON" | "PRN" | "AUX") || ((n.starts_with("COM") || n.starts_with("LPT")) && n.len() == 4 && n.as_bytes()[3].is_ascii_digit())
+        });
+    reserved || std::fs::metadata(path).is_ok_and(|m| !m.is_file() && !m.is_dir())
+}
+
 /// Refuse outputs that are an input file or each other (checked again by
-/// [`publish`] when each is written).
+/// [`publish`] when each is written).  Devices are not files: two outputs
+/// to `NUL` are fine.
 fn guard_paths(outputs: &[&Option<PathBuf>], inputs: &[&Option<PathBuf>]) -> Result<(), String> {
-    let outs: Vec<&PathBuf> = outputs.iter().filter_map(|p| p.as_ref()).collect();
+    let outs: Vec<&PathBuf> = outputs.iter().filter_map(|p| p.as_ref()).filter(|p| !is_device(p)).collect();
     for (i, o) in outs.iter().enumerate() {
         for p in inputs.iter().filter_map(|p| p.as_ref()) {
             if same_file(o, p) {
@@ -668,19 +680,15 @@ fn guard_paths(outputs: &[&Option<PathBuf>], inputs: &[&Option<PathBuf>]) -> Res
 /// again that it is none of `protected`: a link or junction created while
 /// the command ran, or a hard link, cannot redirect it onto an input.
 fn publish(path: &Path, bytes: &[u8], protected: &[&Option<PathBuf>]) -> Result<(), String> {
+    // a device or pipe (NUL, /dev/null, /dev/stdout) holds no file to
+    // overwrite and cannot be replaced by a rename: write to it directly
+    if is_device(path) {
+        return std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()));
+    }
     for p in protected.iter().filter_map(|p| p.as_ref()) {
         if same_file(path, p) {
             return Err(format!("the output {} is the input file {}: it would be overwritten", path.display(), p.display()));
         }
-    }
-    // a device or pipe (NUL, /dev/null, /dev/stdout) cannot be replaced
-    // by a rename: write to it directly
-    let windows_device = cfg!(windows)
-        && path.file_stem().map(|n| n.to_string_lossy().to_ascii_uppercase()).is_some_and(|n| {
-            matches!(n.as_str(), "NUL" | "CON" | "PRN" | "AUX") || ((n.starts_with("COM") || n.starts_with("LPT")) && n.len() == 4 && n.as_bytes()[3].is_ascii_digit())
-        });
-    if windows_device || std::fs::metadata(path).is_ok_and(|m| !m.is_file() && !m.is_dir()) {
-        return std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()));
     }
     let name = path.file_name().ok_or_else(|| format!("{}: not a file name", path.display()))?;
     let tmp = path.with_file_name(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));

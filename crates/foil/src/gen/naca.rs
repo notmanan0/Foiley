@@ -148,12 +148,15 @@ pub fn foil_from_name(name: &str) -> Option<Result<crate::Foil, FoilError>> {
 }
 
 /// [`parse`], falling back to Foiley 1.1's reading of digits joined by
-/// separators ([`legacy_digits`]) when the code does not parse.
+/// separators ([`legacy_digits`]) when the code does not parse.  The
+/// fallback only gives sections 1.1 itself generated (XFoil's 4-digit and
+/// 210xx-250xx codes): a malformed new-family code such as `64_012` or
+/// `2412-6` must not turn into some 1.2 5-digit section silently.
 pub fn parse_with_legacy(code: &str) -> Result<NacaSection, FoilError> {
     parse(code).or_else(|e| {
         let bare = strip_naca_prefix(code).unwrap_or(code);
         match legacy_digits(bare) {
-            Some(d) if d != bare.trim() => parse(&d).map_err(|_| e),
+            Some(d) if d != bare.trim() => parse(&d).ok().filter(|s| s.is_xfoil_section()).ok_or(e),
             _ => Err(e),
         }
     })
@@ -895,6 +898,11 @@ mod tests {
         }
         // trailing words are not dropped any more: "NACA 2412 mod" is not NACA 2412
         assert!(crate::Foil::naca("2412 mod").is_err());
+        // and malformed codes 1.1 refused do not become new 5-digit sections
+        for code in ["64_012", "64.012", "64/012", "64-0-12", "63(1)-12", "64(1)-12", "2412-6", "2412-4"] {
+            assert!(crate::Foil::naca(code).is_err(), "{code}");
+            assert!(crate::gen::Recipe::Naca { designation: code.into() }.validate().is_err(), "{code}");
+        }
         assert!(foil_from_name("NACA 0012 (tail)").unwrap().is_err());
     }
 
