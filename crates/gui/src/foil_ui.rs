@@ -38,6 +38,18 @@ fn polar_labels(polars: &[FoilPolar]) -> Vec<PolarLabel> {
     labels
 }
 
+/// What an inverse-design result was computed from: the foil (name and
+/// node hash) and the solver settings.  A speed distribution is shown and
+/// solved only while all of them still hold.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InvKey {
+    pub foil: String,
+    pub hash: u64,
+    pub mode: InverseMode,
+    pub alpha: f64,
+    pub paneling: Paneling,
+}
+
 pub const GEN_FAMILIES: [&str; 5] = ["NACA", "CST (Kulfan)", "PARSEC", "Karman-Trefftz", "cambered plate"];
 
 const NACA_HELP: &str = "4-digit 2412 \u{2022} 5-digit 23012, reflexed 23112, any design CL 43012 \u{2022} 4-digit modified 0012-64 \u{2022} 16-series 16-212 \u{2022} 6-series 63-206, 64(2)-415, 65-415 a=0.5 \u{2022} 6A-series 64A010";
@@ -170,8 +182,10 @@ pub struct FoilUi {
     pub inv_kind: usize,
     pub inv_val: [f64; 2],
     pub inv_iter: usize,
-    /// Name and node hash of the foil the speed distribution was computed for.
-    pub inv_geom: Option<(String, u64)>,
+    /// What the speed distribution was computed from.
+    pub inv_src: Option<InvKey>,
+    /// Name and node hash of the foil the preview was made from.
+    pub preview_for: Option<(String, u64)>,
     pub opt: OptimSettings,
     pub opt_job: Option<JobId>,
     pub opt_result: Option<OptimResult>,
@@ -217,7 +231,8 @@ impl Default for FoilUi {
             inv_kind: 0,
             inv_val: [0.97, 0.02],
             inv_iter: 10,
-            inv_geom: None,
+            inv_src: None,
+            preview_for: None,
             opt: OptimSettings::default(),
             opt_job: None,
             opt_result: None,
@@ -447,9 +462,10 @@ impl App {
             f.hinge = sel.hinge;
             self.project.upsert_foil(f);
             self.fui.preview = None;
+            self.fui.preview_for = None;
             self.fui.qdist = None;
             self.fui.inv_target = None;
-            self.fui.inv_geom = None;
+            self.fui.inv_src = None;
         }
     }
 
@@ -459,14 +475,21 @@ impl App {
                 heading(ui, "Foil");
                 self.foil_picker(ui);
                 let foil = self.selected_foil();
-                // a speed distribution belongs to the foil and geometry it was
-                // computed for: drop it as soon as either changes, before any
-                // panel or plot shows it
+                // a preview and a speed distribution belong to the foil and
+                // geometry they were made from (and a distribution to its
+                // solver settings): drop them as soon as any of that changes
+                // (another foil selected or added, an edit, undo, redo),
+                // before any panel or plot shows or applies them
                 let geom = foil.as_ref().map(|f| (f.name.clone(), node_hash(&f.x, &f.y)));
-                if self.fui.inv_geom.is_some() && self.fui.inv_geom != geom {
+                if self.fui.preview.is_some() && self.fui.preview_for != geom {
+                    self.fui.preview = None;
+                    self.fui.preview_for = None;
+                }
+                let key = geom.as_ref().map(|(n, h)| InvKey { foil: n.clone(), hash: *h, mode: self.fui.inv_mode, alpha: self.fui.inv_alpha, paneling: self.fui.repanel });
+                if self.fui.inv_src.is_some() && self.fui.inv_src != key {
                     self.fui.qdist = None;
                     self.fui.inv_target = None;
-                    self.fui.inv_geom = None;
+                    self.fui.inv_src = None;
                 }
                 if let Some(f) = &foil {
                     let p = f.props();
@@ -603,11 +626,11 @@ impl App {
                     egui::Grid::new("inv").num_columns(2).show(ui, |ui| {
                         num(ui, "alpha (deg)", &mut self.fui.inv_alpha, 0.1, -20.0..=20.0, "design angle of attack (inviscid speed distribution)");
                     });
-                    let geom = (foil.name.clone(), node_hash(&foil.x, &foil.y));
+                    let key = InvKey { foil: foil.name.clone(), hash: node_hash(&foil.x, &foil.y), mode: self.fui.inv_mode, alpha: self.fui.inv_alpha, paneling: self.fui.repanel };
                     if ui.button("Get speed distribution").clicked() {
                         self.fui.inv_target = None;
                         let k = JobKind::Inverse { foil: foil.clone(), alpha: self.fui.inv_alpha, mode: self.fui.inv_mode, paneling: self.fui.repanel, target: None, iterations: 0 };
-                        self.submit(format!("{} speed distribution", foil.name), k, Pending::Inverse { foil: geom.0.clone(), hash: geom.1 });
+                        self.submit(format!("{} speed distribution", foil.name), k, Pending::Inverse(key.clone()));
                     }
                     if let Some(d) = self.fui.qdist.clone() {
                         ui.horizontal(|ui| {
@@ -638,7 +661,7 @@ impl App {
                             ui.label(RichText::new("the segment contains fewer than 2 points").color(Color32::from_rgb(230, 80, 70)));
                         } else if ui.button("Solve for this target").clicked() {
                             let k = JobKind::Inverse { foil: foil.clone(), alpha: self.fui.inv_alpha, mode: self.fui.inv_mode, paneling: self.fui.repanel, target: Some((t, seg)), iterations: self.fui.inv_iter };
-                            self.submit(format!("{} inverse design", foil.name), k, Pending::Inverse { foil: geom.0.clone(), hash: geom.1 });
+                            self.submit(format!("{} inverse design", foil.name), k, Pending::Inverse(key.clone()));
                         }
                     }
                 });
@@ -726,6 +749,7 @@ impl App {
                         Ok(p) => {
                             self.fui.new_name = self.project.unique_foil_name(&format!("{} mod", foil.name));
                             self.fui.preview = Some(p);
+                            self.fui.preview_for = Some((foil.name.clone(), node_hash(&foil.x, &foil.y)));
                         }
                         Err(err) => self.notify(err, true),
                     }

@@ -174,7 +174,15 @@ fn avl_file_names(plane: &Plane) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let mut used = HashSet::new();
     for n in plane.foil_names() {
-        let base = n.replace(' ', "_");
+        // a flat, portable base name: no path separators or characters
+        // Windows or AVL's reader reject, and no device names
+        let mut base: String = n.chars().map(|c| if c.is_ascii_alphanumeric() || "._-()+".contains(c) { c } else { '_' }).collect();
+        base = base.trim_start_matches('.').to_string();
+        let stem = base.split('.').next().unwrap_or("").to_ascii_uppercase();
+        let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit());
+        if base.is_empty() || device {
+            base = format!("foil_{base}");
+        }
         let mut file = format!("{base}.dat");
         let mut k = 2;
         while !used.insert(file.to_lowercase()) {
@@ -908,18 +916,21 @@ mod tests {
             f.name = name.into();
             f
         };
-        let (a, b) = (mk("NACA 2412", 0.15), mk("NACA_2412", 0.2));
-        let mut db = FoilDb::new();
-        db.add_foil(&a);
-        db.add_foil(&b);
-        let p = Plane::default_plane("NACA 2412", "NACA_2412");
-        let t = avl(&p, &db, 0.0);
-        let files = avl_foil_files(&p, &[a.clone(), b.clone()]);
-        assert_eq!(files.len(), 2);
-        assert_ne!(files[0].0, files[1].0);
-        for (file, text) in &files {
-            assert!(t.contains(&format!("AFILE\n{file}\n")), "{file}");
-            assert!(*text == a.to_dat() || *text == b.to_dat());
+        for (n1, n2) in [("NACA 2412", "NACA_2412"), ("Root/Upper", "Root\\Upper"), ("CON", "c:on")] {
+            let (a, b) = (mk(n1, 0.15), mk(n2, 0.2));
+            let mut db = FoilDb::new();
+            db.add_foil(&a);
+            db.add_foil(&b);
+            let p = Plane::default_plane(n1, n2);
+            let t = avl(&p, &db, 0.0);
+            let files = avl_foil_files(&p, &[a.clone(), b.clone()]);
+            assert_eq!(files.len(), 2);
+            assert_ne!(files[0].0.to_lowercase(), files[1].0.to_lowercase());
+            for (file, text) in &files {
+                assert!(!file.contains(['/', '\\', ':']) && !file.to_uppercase().starts_with("CON."), "{file}");
+                assert!(t.contains(&format!("AFILE\n{file}\n")), "{file}");
+                assert!(*text == a.to_dat() || *text == b.to_dat());
+            }
         }
     }
 }

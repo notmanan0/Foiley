@@ -168,18 +168,59 @@ pub(crate) fn check_contour(f: &Foil, what: &str) -> Result<(), FoilError> {
     Ok(())
 }
 
-/// Reject surfaces y_u(x), y_l(x) that touch or cross anywhere inside the
-/// chord, sampled densely (between the generation stations too).
-pub(crate) fn check_thickness(what: &str, thickness: impl Fn(f64) -> f64) -> Result<(), FoilError> {
-    let n = 4000;
-    for k in 1..n {
-        let x = k as f64 / n as f64;
-        let t = thickness(x);
-        if t.is_nan() || t <= 0.0 {
-            return Err(FoilError::Geometry(format!("{what}: the upper and lower surfaces meet or cross at x/c {x:.4} (thickness {t:.2e})")));
+/// Whether the polynomial with Bernstein coefficients `c` on [0, 1] is
+/// positive on [0, 1) and non-negative at 1.  Exact: the coefficients
+/// bound the polynomial on their interval (convex hull), and intervals
+/// whose coefficients are not all positive are split by de Casteljau until
+/// they are, or until an end value (which the polynomial takes exactly) is
+/// not positive.  An interval still undecided after 2^-48 holds a zero of
+/// the polynomial (the surfaces touch), and counts as not positive.
+pub(crate) fn bernstein_positive(c: &[f64]) -> bool {
+    // "positive" means above rounding: 1e-12 of the coefficient scale
+    // (about 1e-13 of chord for a section's thickness)
+    fn rec(c: &[f64], tol: f64, right_end: bool, depth: u32) -> bool {
+        let n = c.len() - 1;
+        if n == 0 {
+            return c[0] > tol;
         }
+        let end_ok = if right_end { c[n] >= -tol } else { c[n] > tol };
+        if c[0] <= tol || !end_ok {
+            return false;
+        }
+        if c[1..n].iter().all(|&v| v > tol) {
+            return true;
+        }
+        if depth == 0 {
+            // still not provably positive on a 2^-48 interval: the
+            // polynomial touches zero there (a double root)
+            return false;
+        }
+        let mut w = c.to_vec();
+        let mut left = vec![0.0; n + 1];
+        let mut right = vec![0.0; n + 1];
+        left[0] = w[0];
+        right[n] = w[n];
+        for k in 1..=n {
+            for i in 0..=n - k {
+                w[i] = 0.5 * (w[i] + w[i + 1]);
+            }
+            left[k] = w[0];
+            right[n - k] = w[n - k];
+        }
+        rec(&left, tol, false, depth - 1) && rec(&right, tol, right_end, depth - 1)
     }
-    Ok(())
+    if c.is_empty() || c.iter().any(|v| !v.is_finite()) {
+        return false;
+    }
+    let tol = 1e-12 * c.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    rec(c, tol, true, 48)
+}
+
+/// Bernstein coefficients on [0, 1] of the polynomial sum_k d_k x^k.
+pub(crate) fn power_to_bernstein(d: &[f64]) -> Vec<f64> {
+    let n = d.len().saturating_sub(1);
+    let binom = |n: usize, k: usize| (0..k).fold(1.0, |acc, i| acc * (n - i) as f64 / (i + 1) as f64);
+    (0..=n).map(|j| (0..=j).map(|k| binom(j, k) / binom(n, k) * d[k]).sum()).collect()
 }
 
 /// Whether the upper surface stays above the lower one (sampled at the
@@ -217,6 +258,18 @@ mod tests {
         assert!(kt::KarmanTrefftz::default().generate("k").unwrap().recipe.is_some());
         assert!(plate::Plate::default().generate("p").unwrap().recipe.is_some());
         assert!(naca::parse("64A010").unwrap().generate().unwrap().recipe.is_some());
+    }
+
+    #[test]
+    fn bernstein_positivity_is_exact() {
+        // (x - 0.5)^2 + 1e-6 > 0, x (1 - x) touches 0 at the ends, (x - 0.3)^2 touches inside
+        assert!(bernstein_positive(&power_to_bernstein(&[0.25 + 1e-6, -1.0, 1.0])));
+        assert!(!bernstein_positive(&power_to_bernstein(&[0.09, -0.6, 1.0])));
+        assert!(!bernstein_positive(&power_to_bernstein(&[0.0, 1.0, -1.0])));
+        // zero at x = 1 only is allowed (a closed trailing edge)
+        assert!(bernstein_positive(&power_to_bernstein(&[1.0, -1.0])));
+        assert!(!bernstein_positive(&power_to_bernstein(&[-1e-12, 1.0])));
+        assert!(bernstein_positive(&[0.3]));
     }
 
     #[test]

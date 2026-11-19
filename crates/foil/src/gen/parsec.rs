@@ -6,7 +6,7 @@
 //! crest position, height and curvature, and the trailing-edge height and
 //! slope.
 
-use super::{check_contour, check_thickness, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
+use super::{bernstein_positive, check_contour, cosine_spacing, from_surfaces, power_to_bernstein, surfaces_cross, Recipe, Surfaces, NSIDE};
 use crate::{Foil, FoilError};
 use foiley_core::linalg::solve_dense;
 use serde::{Deserialize, Serialize};
@@ -120,22 +120,29 @@ impl Parsec {
         if surfaces_cross(&up, &lo) {
             return Err(FoilError::Geometry("PARSEC: the upper surface dips below the lower one".into()));
         }
-        // the crests must be the extreme points of their surfaces: the
-        // conditions only make them stationary, and far-off crests can let
-        // the polynomial run away elsewhere
+        // the conditions only make the crests stationary: crests placed far
+        // aft can let the polynomial run away elsewhere (to hundreds of
+        // chords).  Each surface must stay near the band spanned by the
+        // crests and the trailing edge, which may lie beyond a crest on an
+        // aft-loaded section.
         let (cu, cl) = self.coefficients()?;
+        let top = self.z_up.max(self.z_te + 0.5 * self.dz_te);
+        let bottom = self.z_lo.min(self.z_te - 0.5 * self.dz_te);
+        let margin = 0.5 * (top - bottom);
         for k in 0..=2000 {
             let x = k as f64 / 2000.0;
             let (zu, zl) = (eval(&cu, x), eval(&cl, x));
-            if zu > self.z_up + 1e-9 || zl < self.z_lo - 1e-9 {
-                return Err(FoilError::Geometry(format!(
-                    "PARSEC: the {} crest is not the extreme of its surface (it reaches {:.4} at x/c {x:.3})",
-                    if zu > self.z_up + 1e-9 { "upper" } else { "lower" },
-                    if zu > self.z_up + 1e-9 { zu } else { zl }
-                )));
+            if zu > top + margin || zl < bottom - margin {
+                let (side, z) = if zu > top + margin { ("upper", zu) } else { ("lower", zl) };
+                return Err(FoilError::Geometry(format!("PARSEC: the {side} surface runs away to {z:.4} at x/c {x:.3}, far outside its crests and trailing edge; move the crests forward or change their curvature")));
             }
         }
-        check_thickness("PARSEC", |x| eval(&cu, x) - eval(&cl, x))?;
+        // thickness = sqrt(x) P(x), P(x) = sum (au_k - al_k) x^k: positive
+        // inside the chord exactly when P is (P(1) is the TE thickness)
+        let diff: Vec<f64> = cu.iter().zip(&cl).map(|(u, l)| u - l).collect();
+        if !bernstein_positive(&power_to_bernstein(&diff)) {
+            return Err(FoilError::Geometry("PARSEC: the upper and lower surfaces meet or cross inside the chord".into()));
+        }
         let mut f = from_surfaces(name, &up, &lo)?;
         check_contour(&f, "PARSEC")?;
         f.note = "PARSEC".into();
@@ -199,5 +206,7 @@ mod tests {
         // crests at x/c 0.99 let the surfaces run away to ~1e5 chords
         let p = Parsec { x_up: 0.99, x_lo: 0.99, ..Default::default() };
         assert!(p.generate("p").is_err());
+        // but a trailing edge below the lower crest is a legitimate shape
+        assert!(Parsec { z_te: -0.07, ..Default::default() }.generate("p").is_ok());
     }
 }

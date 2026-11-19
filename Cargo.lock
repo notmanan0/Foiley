@@ -1521,6 +1521,7 @@ dependencies = [
  "foiley-gui",
  "foiley-plane",
  "mimalloc",
+ "same-file",
  "serde",
  "serde_json",
 ]

@@ -549,10 +549,17 @@ fn gen_recipe(family: &GenFamily) -> Result<foiley_foil::Recipe, String> {
         GenFamily::Cst { upper, lower, te, class, json } => {
             if let Some(path) = json {
                 let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-                return match serde_json::from_str::<Recipe>(&text) {
-                    Ok(r @ Recipe::Cst(_)) => Ok(r),
-                    Ok(_) => Err(format!("{}: not a CST recipe", path.display())),
-                    Err(_) => serde_json::from_str::<Cst>(&text).map(Recipe::Cst).map_err(|e| format!("{}: {e}", path.display())),
+                let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+                // a recipe with a "family" tag must be a CST recipe; untagged
+                // input is read as bare CST weights
+                return if v.get("family").is_some() {
+                    match serde_json::from_value::<Recipe>(v) {
+                        Ok(r @ Recipe::Cst(_)) => Ok(r),
+                        Ok(_) => Err(format!("{}: not a CST recipe", path.display())),
+                        Err(e) => Err(format!("{}: {e}", path.display())),
+                    }
+                } else {
+                    serde_json::from_value::<Cst>(v).map(Recipe::Cst).map_err(|e| format!("{}: {e}", path.display()))
                 };
             }
             let mut c = Cst::default();
@@ -605,10 +612,13 @@ fn gen_recipe(family: &GenFamily) -> Result<foiley_foil::Recipe, String> {
     })
 }
 
-/// Whether two paths name the same file, existing or not: an existing path
-/// is canonicalised, a new one through its existing parent (so links and
-/// junctions in the directory part are resolved).
+/// Whether two paths name the same file.  Existing files are compared by
+/// identity (hard links, junctions and links included); otherwise by path,
+/// a new file through its existing parent directory.
 fn same_file(a: &Path, b: &Path) -> bool {
+    if same_file::is_same_file(a, b).unwrap_or(false) {
+        return true;
+    }
     let full = |p: &Path| -> PathBuf {
         if let Ok(c) = std::fs::canonicalize(p) {
             return c;
@@ -627,24 +637,49 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// Refuse an output path that is also an input or a project being written.
-fn guard_out(out: &Option<PathBuf>, others: &[&Option<PathBuf>]) -> Result<(), String> {
-    if let Some(o) = out {
-        for p in others.iter().filter_map(|p| p.as_ref()) {
+/// Refuse outputs that are an input file or each other (checked again by
+/// [`publish`] when each is written).
+fn guard_paths(outputs: &[&Option<PathBuf>], inputs: &[&Option<PathBuf>]) -> Result<(), String> {
+    let outs: Vec<&PathBuf> = outputs.iter().filter_map(|p| p.as_ref()).collect();
+    for (i, o) in outs.iter().enumerate() {
+        for p in inputs.iter().filter_map(|p| p.as_ref()) {
             if same_file(o, p) {
-                return Err(format!("the output {} is also the project file {}: it would be overwritten", o.display(), p.display()));
+                return Err(format!("the output {} is the input file {}: it would be overwritten", o.display(), p.display()));
+            }
+        }
+        for q in &outs[i + 1..] {
+            if same_file(o, q) {
+                return Err(format!("two outputs name the same file: {} and {}", o.display(), q.display()));
             }
         }
     }
     Ok(())
 }
 
+/// Write a file through a temporary sibling and a rename, after checking
+/// again that it is none of `protected`: a link or junction created while
+/// the command ran, or a hard link, cannot redirect it onto an input.
+fn publish(path: &Path, bytes: &[u8], protected: &[&Option<PathBuf>]) -> Result<(), String> {
+    for p in protected.iter().filter_map(|p| p.as_ref()) {
+        if same_file(path, p) {
+            return Err(format!("the output {} is the input file {}: it would be overwritten", path.display(), p.display()));
+        }
+    }
+    let name = path.file_name().ok_or_else(|| format!("{}: not a file name", path.display()))?;
+    let tmp = path.with_file_name(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
 /// Print a one-line summary of a foil to stderr and write it.
-fn emit_foil(f: &Foil, out: &Option<PathBuf>) -> Result<(), String> {
+fn emit_foil(f: &Foil, out: &Option<PathBuf>, protected: &[&Option<PathBuf>]) -> Result<(), String> {
     let p = f.props();
     eprintln!("  {}: {} points, t/c {:.2}% at {:.3}, camber {:.2}% at {:.3}, LE radius {:.4}", f.name, p.points, p.thickness * 100.0, p.x_thickness, p.camber * 100.0, p.x_camber, p.le_radius);
     match out {
-        Some(o) => f.save(o).map_err(|e| e.to_string()),
+        Some(o) => publish(o, f.to_dat().as_bytes(), protected),
         None => {
             print!("{}", f.to_dat());
             Ok(())
@@ -856,9 +891,9 @@ fn resolve_foil(spec: &str, proj: &Project) -> Result<Foil, String> {
     Err(format!("'{spec}' is not a file, a NACA designation, or a foil in the project"))
 }
 
-fn write_out(out: &Out, text: &str) -> Result<(), String> {
+fn write_out(out: &Out, text: &str, protected: &[&Option<PathBuf>]) -> Result<(), String> {
     match &out.out {
-        Some(p) => std::fs::write(p, text).map_err(|e| format!("{}: {e}", p.display())),
+        Some(p) => publish(p, text.as_bytes(), protected),
         None => {
             print!("{text}");
             Ok(())
@@ -1174,6 +1209,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Polar { src, x, ptype, alpha, cl, re_sweep, flap_sweep, at_alpha, hinge, details: details_dir, out } => {
+                guard_paths(&[&out.out], &[&src.project])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let mut st = x.settings()?;
@@ -1226,7 +1262,7 @@ fn real_main() -> Result<(), String> {
                         Format::Json => serde_json::to_string_pretty(&polar).unwrap(),
                         Format::Xfoil => polar.to_xfoil_text(),
                     };
-                    write_out(&out, &text)?;
+                    write_out(&out, &text, &[&src.project])?;
                     if let Some(dir) = &details_dir {
                         let n = write_point_details(dir, &polar, &details)?;
                         eprintln!("  wrote {n} point files to {}", dir.display());
@@ -1234,6 +1270,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Point { src, x, alpha, cl, out } => {
+                guard_paths(&[&out.out], &[&src.project])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let st = x.settings()?;
@@ -1262,7 +1299,7 @@ fn real_main() -> Result<(), String> {
                             s
                         }
                     };
-                    write_out(&out, &text)?;
+                    write_out(&out, &text, &[&src.project])?;
                 }
             }
             FoilCmd::Batch { foils, project, re, mach, ncrit, alpha, x, out_dir, save } => {
@@ -1317,8 +1354,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Optimize { src, x, alpha, objectives, algorithm, population, iterations, shape, bumps, amplitude, cst_order, cst_delta, flap, seed, out, pareto } => {
-                guard_out(&out, &[&src.project])?;
-                guard_out(&pareto, &[&src.project])?;
+                guard_paths(&[&out, &pareto], &[&src.project])?;
                 use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings, Parameterization};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
@@ -1381,19 +1417,18 @@ fn real_main() -> Result<(), String> {
                         for (i, c) in r.pareto.iter().enumerate() {
                             s.push_str(&format!("{i},{:.5},{:.6},{:.3},{:.5},{:.4}\n", c.cl, c.cd, c.cl / c.cd.max(1e-12), c.cm, c.cpmin));
                         }
-                        std::fs::write(p, s).map_err(|e| e.to_string())?;
+                        publish(&p, s.as_bytes(), &[&src.project, &out])?;
                     }
                     let mut f = best.foil.clone();
                     f.name = format!("{} opt", foil.name);
-                    match out {
-                        Some(o) => f.save(&o).map_err(|e| e.to_string())?,
+                    match &out {
+                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project])?,
                         None => print!("{}", f.to_dat()),
                     }
                 }
             }
             FoilCmd::Inverse { src, alpha, mode, segment, scale, bump, smooth, iterations, speed_csv, out } => {
-                guard_out(&out, &[&src.project])?;
-                guard_out(&speed_csv, &[&src.project])?;
+                guard_paths(&[&out, &speed_csv], &[&src.project])?;
                 use foiley_foil::inverse::{modify, InverseMode, ModKind, Modification};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
@@ -1427,16 +1462,20 @@ fn real_main() -> Result<(), String> {
                         for (i, q) in d0.q.iter().enumerate() {
                             s.push_str(&format!("{:.6},{:.6},{:.6},{:.6}\n", d0.x[i], d0.s[i], q, t[i]));
                         }
-                        std::fs::write(path, s).map_err(|e| e.to_string())?;
+                        publish(&path, s.as_bytes(), &[&src.project, &out])?;
                     }
-                    match out {
-                        Some(o) => f.save(&o).map_err(|e| e.to_string())?,
+                    match &out {
+                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project])?,
                         None => print!("{}", f.to_dat()),
                     }
                 }
             }
-            FoilCmd::Generate { family, name, save, out } => {
-                guard_out(&out, &[&save])?;
+            FoilCmd::Generate { family, name, mut save, out } => {
+                let json_in = match &family {
+                    GenFamily::Cst { json, .. } => json.clone(),
+                    _ => None,
+                };
+                guard_paths(&[&out, &save], &[&json_in])?;
                 let recipe = gen_recipe(&family)?;
                 let f = Foil::from_recipe(&recipe, name.as_deref()).map_err(|e| e.to_string())?;
                 if let GenFamily::Kt { exact: Some(list), .. } = &family {
@@ -1448,20 +1487,20 @@ fn real_main() -> Result<(), String> {
                         }
                     }
                 }
-                if let Some(path) = save {
+                if let Some(path) = save.take() {
                     let mut proj = if path.exists() { Project::load(&path)? } else { Project::new("cli") };
                     let mut g = f.clone();
                     g.name = proj.unique_foil_name(&g.name);
                     eprintln!("  added {} to {}", g.name, path.display());
                     proj.foils.push(g);
                     proj.save(&path)?;
-                    // check again now the project file exists
-                    guard_out(&out, &[&Some(path)])?;
+                    save = Some(path);
                 }
-                emit_foil(&f, &out)?;
+                // publish checks again now the project file exists
+                emit_foil(&f, &out, &[&save, &json_in])?;
             }
             FoilCmd::FitCst { src, order, json, out } => {
-                guard_out(&out, &[&src.project])?;
+                guard_paths(&[&out], &[&src.project])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let (cst, fit) = foiley_foil::gen::cst::Cst::fit(&foil, order).map_err(|e| e.to_string())?;
@@ -1477,11 +1516,11 @@ fn real_main() -> Result<(), String> {
                 }
                 if out.is_some() {
                     let f = Foil::from_recipe(&recipe, Some(&format!("{} CST{order}", foil.name))).map_err(|e| e.to_string())?;
-                    emit_foil(&f, &out)?;
+                    emit_foil(&f, &out, &[&src.project])?;
                 }
             }
             FoilCmd::Design { src, flap, te_gap, le_radius, thickness, camber, high_points, repanel, normalize, mix, name, out } => {
-                guard_out(&out, &[&src.project])?;
+                guard_paths(&[&out], &[&src.project])?;
                 let proj = load_project(&src.project)?;
                 let mut f = resolve_foil(&src.foil, &proj)?;
                 let e = |r: Result<Foil, foiley_foil::FoilError>| r.map_err(|e| e.to_string());
@@ -1527,8 +1566,8 @@ fn real_main() -> Result<(), String> {
                 }
                 let p = f.props();
                 eprintln!("  {}: {} points, t/c {:.2}% at {:.3}, camber {:.2}% at {:.3}", f.name, p.points, p.thickness * 100.0, p.x_thickness, p.camber * 100.0, p.x_camber);
-                match out {
-                    Some(o) => f.save(&o).map_err(|e| e.to_string())?,
+                match &out {
+                    Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project])?,
                     None => print!("{}", f.to_dat()),
                 }
             }
@@ -1716,7 +1755,7 @@ fn real_main() -> Result<(), String> {
                         Format::Csv => pol.to_csv(),
                         Format::Json => serde_json::to_string_pretty(&pol).unwrap(),
                     };
-                    write_out(&out, &text)?;
+                    write_out(&out, &text, &[])?;
                     if let Some(spec) = &response {
                         use foiley_plane::stability::{forced_response, ControlInput};
                         let (kind, arg) = spec.split_once(':').unwrap_or((spec.as_str(), "0.5"));

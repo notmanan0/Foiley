@@ -20,7 +20,8 @@ pub(super) fn fmm_slopes(x: &[f64], y: &[f64]) -> Vec<f64> {
     if n == 3 {
         let d2 = dd[0] / (x[2] - x[0]);
         let d1 = delta[0] - d2 * dx[0];
-        return vec![d1, d1 + d2 * dx[0], d1 + d2 * (x[2] - x[0])];
+        // p'(x) = f[x0,x1] + f[x0,x1,x2] (2x - x0 - x1)
+        return vec![d1, d1 + 2.0 * d2 * dx[0], d1 + 2.0 * d2 * (x[2] - x[0])];
     }
     let mut alpha = vec![0.0; n];
     let mut beta = vec![0.0; n];
@@ -140,5 +141,10 @@ mod tests {
         }
         let u = solve(&x, &y, &yp, f(1.3)).unwrap();
         assert!((u - 1.3).abs() < 1e-12, "{u}");
+        // three knots: the quadratic through them
+        let (x, y) = ([0.0, 1.0, 2.0], [0.0, 1.0, 4.0]);
+        let yp = fmm_slopes(&x, &y);
+        assert_eq!(yp, vec![0.0, 2.0, 4.0]);
+        assert!((eval(&x, &y, &yp, 0.5).0 - 0.25).abs() < 1e-15);
     }
 }

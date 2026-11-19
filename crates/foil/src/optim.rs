@@ -1,6 +1,8 @@
 //! Airfoil shape optimisation (equivalent of xflr5's Optim2d).
 //!
-//! The design variables change the shape of the (normalised) base foil:
+//! The design variables change the shape of the base foil, measured along
+//! its chord (normalised coordinates) but applied in the foil's own frame,
+//! so the design angle of attack is the one the base foil is analysed at:
 //! either the amplitudes of Hicks-Henne bump functions added along the local
 //! surface normal, or changes of the weights of a CST (class-shape
 //! transformation) representation added to each surface, which move the
@@ -205,13 +207,18 @@ impl OptimSettings {
     }
 
     /// Check the shape-variable settings (the analysis settings are checked
-    /// separately): counts within reason and finite ranges.
+    /// separately): finite ranges, and counts small enough to allocate.
     pub fn validate(&self) -> Result<(), String> {
+        const MAX_VARIABLES: usize = 100_000;
+        if self.shape_variables_per_side() > MAX_VARIABLES {
+            return Err(format!("{} shape variables per side; at most {MAX_VARIABLES}", self.shape_variables_per_side()));
+        }
+        let evaluations = self.population.max(2).checked_mul(self.iterations.saturating_add(1));
+        if evaluations.is_none_or(|e| e > 1_000_000_000) {
+            return Err(format!("population {} x {} iterations is too many evaluations", self.population, self.iterations));
+        }
         match self.parameterization {
             Parameterization::HicksHenne => {
-                if self.bumps_per_side > 50 {
-                    return Err(format!("{} Hicks-Henne bumps per side; at most 50", self.bumps_per_side));
-                }
                 if !self.max_amplitude.is_finite() || !self.t1.is_finite() || !self.t2.is_finite() {
                     return Err("the Hicks-Henne amplitude and shape parameters must be finite".into());
                 }
@@ -443,10 +450,24 @@ pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil
         return Err(FoilError::Geometry("non-finite design variable".into()));
     }
     base.validate()?;
+    // shapes are measured on the normalised foil (x/c, surface normals) but
+    // the changes are applied in the base foil's own frame: zero genes give
+    // the base foil itself, at the same angle of attack
     let b = base.normalized();
     let n = b.n();
     let ile = b.le_index();
-    let mut f = b.clone();
+    let (ang, ch) = {
+        let (xl, yl) = (base.x[ile], base.y[ile]);
+        let (xt, yt) = (0.5 * (base.x[0] + base.x[n - 1]), 0.5 * (base.y[0] + base.y[n - 1]));
+        ((yt - yl).atan2(xt - xl), ((xt - xl).powi(2) + (yt - yl).powi(2)).sqrt().max(1e-12))
+    };
+    let (sa, ca) = ang.sin_cos();
+    let mut f = base.clone();
+    f.recipe = None;
+    let mut displace = |i: usize, dxn: f64, dyn_: f64| {
+        f.x[i] += ch * (ca * dxn - sa * dyn_);
+        f.y[i] += ch * (sa * dxn + ca * dyn_);
+    };
     if nb > 0 {
         for i in 1..n - 1 {
             if i == ile {
@@ -468,12 +489,11 @@ pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil
                         let t1 = s.t1 * (j + 1) as f64 / (2 * nb + 1) as f64;
                         h += hicks_henne(b.x[i], t1, s.t2) * genes[off + j];
                     }
-                    f.x[i] += nx * h;
-                    f.y[i] += ny * h;
+                    displace(i, nx * h, ny * h);
                 }
                 Parameterization::Cst => {
                     let basis = crate::gen::cst::basis(nb - 1, 0.5, 1.0, b.x[i]);
-                    f.y[i] += basis.iter().zip(&genes[off..off + nb]).map(|(p, g)| p * g).sum::<f64>();
+                    displace(i, 0.0, basis.iter().zip(&genes[off..off + nb]).map(|(p, g)| p * g).sum::<f64>());
                 }
             }
         }
@@ -677,7 +697,7 @@ pub fn optimise(base: &Foil, s: &OptimSettings, prog: &Progress, on_iteration: &
         return Err(FoilError::Geometry("no design variables (bumps per side = 0 and no flap)".into()));
     }
     let pop = s.population.max(2);
-    let total = pop * (s.iterations + 1);
+    let total = pop * (s.iterations + 1); // bounded by validate()
     let bounds = s.bounds();
     let mut rng = Rng::new(s.seed);
     let mut ctx = Ctx { base, s, specs: specs.clone(), scales: vec![1.0; specs.len()], prog, done: AtomicUsize::new(0), total };
@@ -925,10 +945,10 @@ mod tests {
         let s = OptimSettings { parameterization: Parameterization::Cst, cst_order: 4, flap: Some((-5.0, 5.0)), ..Default::default() };
         assert_eq!(s.dimension(), 11);
         let f = apply_genes(&base, &s, &s.neutral_genes()).unwrap();
-        let b = base.normalized();
         for i in 0..f.n() {
-            assert_eq!((f.x[i], f.y[i]), (b.x[i], b.y[i]), "point {i}");
+            assert_eq!((f.x[i], f.y[i]), (base.x[i], base.y[i]), "point {i}");
         }
+        let b = base.normalized();
         // raising A0 of the upper surface enlarges the nose radius and thickens
         let mut g = s.neutral_genes();
         g[0] = 0.04;
@@ -949,6 +969,15 @@ mod tests {
         let nan = OptimSettings { parameterization: Parameterization::Cst, cst_order: 2, cst_max_delta: f64::NAN, ..Default::default() };
         assert!(matches!(optimise(&base0, &nan, &Progress::none(), &|_, _| {}), Err(FoilError::Geometry(_))));
         assert!(apply_genes(&base0, &nan, &[0.0; 6]).is_err());
+        // zero genes keep a cambered generated foil in its own frame (its
+        // LE is not the leftmost point), so the design angle is unchanged
+        let tilted = Foil::naca("23112").unwrap();
+        let z = OptimSettings { parameterization: Parameterization::Cst, cst_order: 3, ..Default::default() };
+        let g = apply_genes(&tilted, &z, &z.neutral_genes()).unwrap();
+        assert_eq!((&g.x, &g.y), (&tilted.x, &tilted.y));
+        // 1.1 accepted more than 50 bumps; huge workloads are refused
+        assert!(OptimSettings { bumps_per_side: 51, ..Default::default() }.validate().is_ok());
+        assert!(OptimSettings { iterations: usize::MAX, ..Default::default() }.validate().is_err());
         // settings written before CST existed still load as Hicks-Henne
         let old: OptimSettings = serde_json::from_str(r#"{"bumps_per_side": 4}"#).unwrap();
         assert_eq!((old.parameterization, old.bumps_per_side, old.dimension()), (Parameterization::HicksHenne, 4, 8));

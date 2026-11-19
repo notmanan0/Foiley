@@ -12,7 +12,7 @@
 //! A0 sets the leading-edge radius (r = A0^2 / 2), A_n the trailing-edge
 //! wedge angle, and dz the trailing-edge offset of that surface.
 
-use super::{check_contour, check_thickness, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
+use super::{bernstein_positive, check_contour, cosine_spacing, from_surfaces, surfaces_cross, Recipe, Surfaces, NSIDE};
 use crate::{Foil, FoilError};
 use foiley_core::linalg::{lstsq, DenseMatrix};
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,9 @@ impl Cst {
         if self.upper.iter().chain(&self.lower).chain([&self.te_upper, &self.te_lower, &self.n1, &self.n2]).any(|v| !v.is_finite()) {
             return Err(FoilError::Geometry("CST: non-finite parameter".into()));
         }
+        if self.upper.iter().chain(&self.lower).any(|v| v.abs() > 10.0) || self.te_upper.abs() > 1.0 || self.te_lower.abs() > 1.0 {
+            return Err(FoilError::Geometry("CST: weights must be within +-10 and trailing-edge heights within +-1 chord".into()));
+        }
         if self.te_upper < self.te_lower {
             return Err(FoilError::Geometry(format!("CST: the upper trailing edge ({}) is below the lower one ({})", self.te_upper, self.te_lower)));
         }
@@ -119,7 +122,13 @@ impl Cst {
         if surfaces_cross(&up, &lo) {
             return Err(FoilError::Geometry("CST: the upper surface dips below the lower one".into()));
         }
-        check_thickness("CST", |x| surface(&self.upper, self.n1, self.n2, self.te_upper, x) - surface(&self.lower, self.n1, self.n2, self.te_lower, x))?;
+        // thickness = C(x) sum (Au_i - Al_i) B_i(x) + x (dz_u - dz_l), with
+        // C > 0 inside the chord and dz_u >= dz_l: it is positive wherever
+        // the Bernstein polynomial of the weight differences is
+        let diff: Vec<f64> = self.upper.iter().zip(&self.lower).map(|(u, l)| u - l).collect();
+        if !bernstein_positive(&diff) {
+            return Err(FoilError::Geometry("CST: the upper surface does not stay above the lower one (the weight differences A_upper - A_lower must give a positive shape function)".into()));
+        }
         let mut f = from_surfaces(name, &up, &lo)?;
         check_contour(&f, "CST")?;
         f.note = format!("CST order {}", self.order());
@@ -252,5 +261,11 @@ mod tests {
         let up = vec![0.249975, -0.250025, 0.249975];
         let c = Cst { lower: up.iter().map(|v| -v).collect(), upper: up, te_upper: 0.0, te_lower: 0.0, ..Cst::default() };
         assert!(c.generate("x").is_err());
+        // a crossing near the nose, between any sampling stations
+        let c = Cst { upper: vec![-0.00002, 0.1], lower: vec![0.0, -0.1], n1: 0.01, n2: 1.0, te_upper: 0.0, te_lower: 0.0 };
+        assert!(c.generate("x").is_err());
+        // absurd magnitudes are input errors, not panics
+        assert!(Cst { upper: vec![1e300, 1e300], lower: vec![-1e300, -1e300], ..Cst::default() }.generate("x").is_err());
+        assert!(Cst { te_upper: 1e308, te_lower: -1e308, ..Cst::default() }.generate("x").is_err());
     }
 }

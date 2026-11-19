@@ -85,10 +85,7 @@ pub enum Thickness {
     /// maximum thickness (x/c).
     FourDigitModified { t: f64, le_index: f64, x_max: f64 },
     /// NACA 6- or 6A-series, from the conformal mapping of a circle.
-    /// `form_t` is the thickness of the basic form whose ordinates are
-    /// scaled linearly to `t` (equal to `t` except in the older
-    /// `65(318)-217` notation of NACA Report 824).
-    SixSeries { family: SixFamily, t: f64, form_t: f64 },
+    SixSeries { family: SixFamily, t: f64 },
 }
 
 /// Mean (camber) line.
@@ -143,20 +140,19 @@ pub fn strip_naca_prefix(name: &str) -> Option<&str> {
     (!rest.is_empty()).then_some(rest)
 }
 
-/// The foil a name like "NACA 2412" stands for, if it starts with NACA:
-/// the designation as [`parse`] reads it, or else, as Foiley 1.1 did, the
-/// digits left after dropping spaces, dashes and underscores ("NACA_24_12",
-/// "NACA 23-012").  `None` when the name does not start with NACA.
+/// The foil a name like "NACA 2412" stands for, if it starts with NACA
+/// (see [`crate::Foil::naca`] for the spellings accepted).  `None` when the
+/// name does not start with NACA.
 pub fn foil_from_name(name: &str) -> Option<Result<crate::Foil, FoilError>> {
-    let code = strip_naca_prefix(name)?;
-    Some(crate::Foil::naca(code).or_else(|e| {
-        let legacy: String = code.chars().filter(|c| !matches!(c, ' ' | '-' | '_')).collect();
-        if (1..=5).contains(&legacy.len()) && legacy.chars().all(|c| c.is_ascii_digit()) {
-            crate::Foil::naca(&legacy).map_err(|_| e)
-        } else {
-            Err(e)
-        }
-    }))
+    strip_naca_prefix(name).map(crate::Foil::naca)
+}
+
+/// Foiley 1.1 read a NACA code by keeping only its digits.  When a code
+/// does not parse, the same digits are tried if nothing but separators
+/// (no letters) surrounds them: "24-12", "23-012", "24_12", "24/12".
+pub(crate) fn legacy_digits(code: &str) -> Option<String> {
+    let kept: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    ((1..=5).contains(&kept.len()) && kept.chars().all(|c| c.is_ascii_digit())).then_some(kept)
 }
 
 /// Parse a NACA designation (with or without the "NACA" prefix):
@@ -205,7 +201,7 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
         s = s.replace(" =", "=").replace("= ", "=");
     }
     let mut closed_te = false;
-    let mut a: Option<f64> = None;
+    let mut a: Option<(f64, String)> = None;
     loop {
         let t = s.trim_end().trim_end_matches(',').trim_end().to_string();
         if let Some(r) = t.strip_suffix("CLOSED TE").or_else(|| t.strip_suffix("CLOSED-TE")).or_else(|| t.strip_suffix("CLOSEDTE")) {
@@ -220,11 +216,15 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
             if a.is_some() {
                 return Err(bad(code, "the mean line a= is given twice"));
             }
-            let v: f64 = t[pos + 2..].trim().parse().map_err(|_| bad(code, "the mean line must be given as a=<number between 0 and 1>"))?;
+            let lit = t[pos + 2..].trim().to_ascii_lowercase();
+            let v: f64 = lit.parse().map_err(|_| bad(code, "the mean line must be given as a=<number between 0 and 1>"))?;
             if !(0.0..=1.0).contains(&v) {
                 return Err(bad(code, "the mean-line parameter a must be between 0 and 1"));
             }
-            a = Some(v);
+            if v > 0.999 && v < 1.0 {
+                return Err(bad(code, "the mean-line parameter a must be 1 or at most 0.999 (the a-line formulas are ill-conditioned just below 1)"));
+            }
+            a = Some((v, lit));
             s = t[..pos].to_string();
             continue;
         }
@@ -235,6 +235,8 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
     if body.is_empty() {
         return Err(bad(code, "no designation"));
     }
+    let a_text = a.as_ref().map(|x| x.1.clone());
+    let a: Option<f64> = a.map(|x| x.0);
     let only_six = |what: &str| -> Result<(), FoilError> {
         if a.is_some() {
             return Err(bad(code, &format!("a= applies to 6-series sections only, not {what}")));
@@ -340,12 +342,7 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
         let fam_digit = ch.next().and_then(|c| c.to_digit(10)).ok_or_else(|| bad(code, "unrecognised designation"))?;
         let rest: String = ch.collect();
         let (sub, rest) = six_subscript(code, &rest)?;
-        let sub_label = sub.as_ref().map(|s| format!("({})", s.0)).unwrap_or_default();
-        let form_t = |t: f64| -> Result<f64, FoilError> {
-            let f = sub.as_ref().and_then(|s| s.1).unwrap_or(t);
-            check_t(code, f, 0.3)?;
-            Ok(f)
-        };
+        let sub_label = sub.as_ref().map(|s| format!("({s})")).unwrap_or_default();
         if let Some(r) = rest.strip_prefix('A') {
             let family = SixFamily::from_digit(fam_digit, true).ok_or_else(|| bad(code, "6A-series thickness forms exist for 63A, 64A and 65A"))?;
             if a.is_some() {
@@ -358,25 +355,29 @@ pub fn parse(code: &str) -> Result<NacaSection, FoilError> {
             check_t(code, t, 0.3)?;
             return Ok(NacaSection {
                 designation: format!("{}{sub_label}A{}{}{}", &family.label()[..2], d[0], d[1], d[2]),
-                thickness: Thickness::SixSeries { family, t, form_t: form_t(t)? },
+                thickness: Thickness::SixSeries { family, t },
                 mean_line: if cl == 0.0 { MeanLine::Symmetric } else { MeanLine::SixA { cl } },
                 xfoil_code: None,
             });
         }
         let family = SixFamily::from_digit(fam_digit, false).ok_or_else(|| bad(code, "6-series thickness forms exist for 63 to 67"))?;
         let tail = rest.strip_prefix('-').ok_or_else(|| bad(code, "a 6-series section is written 6x-CTT or 6x(n)-CTT, e.g. 63-206 or 64(2)-415"))?;
+        if tail.starts_with('(') {
+            return Err(bad(code, "NACA Report 824's older notation for a basic form of another thickness scaled linearly (65(318)-217, 65(318)-(1.5)(16.5)) is not supported: its basic forms are the printed tables of that report, which Foiley does not include"));
+        }
         let d = digits(tail).filter(|d| d.len() == 3).ok_or_else(|| bad(code, "the part after the dash must be three digits: design CL in tenths, t/c percent"))?;
         let cl = d[0] as f64 / 10.0;
         let t = (d[1] * 10 + d[2]) as f64 / 100.0;
         check_t(code, t, 0.3)?;
         let mut designation = format!("{}{sub_label}-{}{}{}", family.label(), d[0], d[1], d[2]);
-        let a = a.unwrap_or(1.0);
-        if a != 1.0 {
-            designation.push_str(&format!(" a={a}"));
+        let a_val = a.unwrap_or(1.0);
+        if a_val != 1.0 {
+            designation.push_str(&format!(" a={}", a_text.unwrap_or_default()));
         }
+        let a = a_val;
         return Ok(NacaSection {
             designation,
-            thickness: Thickness::SixSeries { family, t, form_t: form_t(t)? },
+            thickness: Thickness::SixSeries { family, t },
             mean_line: if cl == 0.0 { MeanLine::Symmetric } else { MeanLine::SixSeries { a, cl } },
             xfoil_code: None,
         });
@@ -402,29 +403,26 @@ fn five_digit_mean_line(code: &str, d: &[u32]) -> Result<MeanLine, FoilError> {
 }
 
 /// The optional low-drag-range subscript after the 6-series family digit:
-/// `(2)`, `_2`, `,2`, or one digit followed by `-` or `A`; or the older
-/// `(318)` form (subscript 3, basic form 18% thick).  Returns the label,
-/// the thickness of the basic form if given, and the rest of the body.
-#[allow(clippy::type_complexity)]
-fn six_subscript<'a>(code: &str, rest: &'a str) -> Result<(Option<(String, Option<f64>)>, &'a str), FoilError> {
+/// `(2)`, `_2`, `,2`, or one digit followed by `-` or `A`.  Returns it and
+/// the rest of the body.
+fn six_subscript<'a>(code: &str, rest: &'a str) -> Result<(Option<String>, &'a str), FoilError> {
     if let Some(r) = rest.strip_prefix('(') {
         let (inner, after) = r.split_once(')').ok_or_else(|| bad(code, "unclosed parenthesis"))?;
-        let d = digits(inner).ok_or_else(|| bad(code, "the subscript in parentheses must be digits"))?;
-        return match d.len() {
-            1 => Ok((Some((inner.to_string(), None)), after)),
-            3 => Ok((Some((inner.to_string(), Some((d[1] * 10 + d[2]) as f64 / 100.0))), after)),
-            _ => Err(bad(code, "the parentheses hold the low-drag range (one digit) or the range and the thickness of the basic form (three digits, as in 65(318)-217); other forms of NACA Report 824, such as 65(10)-211 or fractional (1.5)(16.5) suffixes, are not supported")),
+        return match digits(inner) {
+            Some(d) if d.len() == 1 => Ok((Some(inner.to_string()), after)),
+            Some(d) if d.len() == 3 => Err(bad(code, "NACA Report 824's older notation for a basic form of another thickness scaled linearly (65(318)-217, 65(318)-(1.5)(16.5)) is not supported: its basic forms are the printed tables of that report, which Foiley does not include")),
+            _ => Err(bad(code, "the parentheses hold the low-drag range, one digit (64(2)-415)")),
         };
     }
     if let Some(r) = rest.strip_prefix('_').or_else(|| rest.strip_prefix(',')) {
         let mut c = r.chars();
         let d = c.next().filter(|c| c.is_ascii_digit()).ok_or_else(|| bad(code, "the low-drag-range subscript must be one digit"))?;
-        return Ok((Some((d.to_string(), None)), c.as_str()));
+        return Ok((Some(d.to_string()), c.as_str()));
     }
     let mut c = rest.chars();
     if let (Some(d), Some(next)) = (c.next(), c.next()) {
         if d.is_ascii_digit() && (next == '-' || next == 'A') {
-            return Ok((Some((d.to_string(), None)), &rest[1..]));
+            return Ok((Some(d.to_string()), &rest[1..]));
         }
     }
     Ok((None, rest))
@@ -489,7 +487,7 @@ impl NacaSection {
                 x.iter().map(|&x| if x <= 0.0 { 0.0 } else { 5.0 * t * (0.2969 * x.sqrt() + x * (-0.1260 + x * (-0.3516 + x * (0.2843 + x * a4)))) }).collect()
             }
             Thickness::FourDigitModified { t, le_index, x_max } => four_digit_modified(t, le_index, x_max, x),
-            Thickness::SixSeries { family, t, form_t } => SixForm::new(family, form_t)?.half_thickness(x)?.into_iter().map(|y| y * t / form_t).collect(),
+            Thickness::SixSeries { family, t } => SixForm::new(family, t)?.half_thickness(x)?,
         })
     }
 
@@ -613,7 +611,6 @@ fn five_digit_reflex_constants(p: f64) -> (f64, f64) {
 
 /// NACA a-type mean line (Abbott & von Doenhoff, eq. 4-26 and 4-27).
 fn a_mean_line(a: f64, cl: f64, x: f64) -> (f64, f64) {
-    const EPS: f64 = 1e-7;
     // u ln u -> 0 as u -> 0
     let xlnx = |u: f64| if u <= 0.0 { 0.0 } else { u * u.ln() };
     let omx = 1.0 - x;
@@ -623,7 +620,7 @@ fn a_mean_line(a: f64, cl: f64, x: f64) -> (f64, f64) {
         return (0.0, 0.0);
     }
     let oma = 1.0 - a;
-    if oma.abs() < EPS {
+    if a == 1.0 {
         if omx <= 0.0 {
             // a = 1: the slope is also logarithmically infinite at the
             // trailing edge; the trailing-edge point uses the chord direction
@@ -633,7 +630,7 @@ fn a_mean_line(a: f64, cl: f64, x: f64) -> (f64, f64) {
         let s = (omx.ln() - x.ln()) * cl * (0.25 / PI);
         return (y, s);
     }
-    let (g, h) = if a.abs() < EPS {
+    let (g, h) = if a == 0.0 {
         (-0.25, -0.5)
     } else {
         let g = -(a * a * (0.5 * a.ln() - 0.25) + 0.25) / oma;
@@ -815,7 +812,6 @@ mod tests {
             ("64₂A215", "64(2)A215", false),
             ("642A215", "64(2)A215", false),
             ("63-206 a = 0.5", "63-206 a=0.5", false),
-            ("65(318)-217", "65(318)-217", false),
             ("0012-93", "0012-93", false),
         ];
         for (code, want, xfoil) in cases {
@@ -861,16 +857,34 @@ mod tests {
     }
 
     #[test]
-    fn report_824_form_thickness_scales_the_basic_form() {
-        let scaled = parse("65(318)-017").unwrap();
-        let base = parse("65-018").unwrap();
-        let fresh = parse("65-017").unwrap();
-        let x = [0.01, 0.1, 0.4, 0.8];
-        let (a, b, c) = (scaled.half_thickness(&x).unwrap(), base.half_thickness(&x).unwrap(), fresh.half_thickness(&x).unwrap());
-        for i in 0..x.len() {
-            assert!((a[i] - b[i] * 17.0 / 18.0).abs() < 1e-12);
+    fn report_824_scaled_notation_is_refused_with_its_reason() {
+        for code in ["65(318)-217", "65(418)-217", "65(318)-(1.5)(16.5), a=0.5", "65-(1.5)(16.5)"] {
+            let e = parse(code).unwrap_err().to_string();
+            assert!(e.contains("Report 824"), "{code}: {e}");
         }
-        assert!(a.iter().zip(&c).any(|(p, q)| (p - q).abs() > 1e-5), "the scaled 18% form differs from a fresh 17% form");
+    }
+
+    #[test]
+    fn mean_line_parameter_near_one_is_refused_and_literals_are_kept() {
+        assert!(parse("63-406 a=0.99999999").is_err());
+        let s = parse("63-406 a=0.999").unwrap();
+        // a < 1 has a finite trailing-edge slope, reached continuously
+        let (_, s1) = s.mean_line(&[1.0])[0];
+        let (_, s2) = s.mean_line(&[1.0 - 1e-9])[0];
+        assert!(s1 < -0.1 && (s1 - s2).abs() < 1e-3, "{s1} {s2}");
+        assert_eq!(parse("63-206 a=1e-320").unwrap().designation(), "63-206 a=1e-320");
+    }
+
+    #[test]
+    fn foiley_1_1_separator_spellings_still_read() {
+        for (code, want) in [("24-12", "2412"), ("23-012", "23012"), ("24_12", "2412"), ("24/12", "2412"), ("NACA 24/12", "2412")] {
+            let f = crate::Foil::naca(code).unwrap_or_else(|e| panic!("{code}: {e}"));
+            let g = crate::Foil::naca(want).unwrap();
+            assert_eq!((&f.x, &f.y, &f.name), (&g.x, &g.y, &g.name), "{code}");
+        }
+        // trailing words are not dropped any more: "NACA 2412 mod" is not NACA 2412
+        assert!(crate::Foil::naca("2412 mod").is_err());
+        assert!(foil_from_name("NACA 0012 (tail)").unwrap().is_err());
     }
 
     #[test]

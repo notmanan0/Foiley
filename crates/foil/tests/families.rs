@@ -20,10 +20,17 @@ fn every_family_converges_in_a_viscous_analysis() {
             println!("{:<22} alpha {alpha}: CL {:.4} CD {:.5}", f.name, p.cl, p.cd);
         }
     }
-    // a thin cambered plate at low Reynolds number
-    let plate = Foil::from_recipe(&Recipe::Plate(Plate::default()), None).unwrap();
+    // thin cambered plates at low Reynolds number: both camber signs
+    // converge from 0 to 3 degrees and mirror each other (the vertical
+    // trailing-edge cut of an earlier draft broke the -4% plate)
     let low = AnalysisSettings { re: 1.0e5, ..Default::default() };
-    let p = analyze_point(&plate, &low, 3.0, true, &Progress::none()).unwrap().expect("plate converged").point;
-    println!("{:<22} alpha 3: CL {:.4} CD {:.5}", plate.name, p.cl, p.cd);
-    assert!(p.cl > 0.4, "plate CL {}", p.cl);
+    let pos = Foil::from_recipe(&Recipe::Plate(Plate::default()), None).unwrap();
+    let neg = Foil::from_recipe(&Recipe::Plate(Plate { camber: -Plate::default().camber, ..Plate::default() }), None).unwrap();
+    for alpha in [0.0, 1.0, 2.0, 3.0] {
+        let a = analyze_point(&pos, &low, alpha, true, &Progress::none()).unwrap().unwrap_or_else(|| panic!("+4% plate did not converge at {alpha}")).point;
+        let b = analyze_point(&neg, &low, -alpha, true, &Progress::none()).unwrap().unwrap_or_else(|| panic!("-4% plate did not converge at {}", -alpha)).point;
+        println!("plate alpha {alpha}: CL {:.4} / mirrored {:.4}, CD {:.5}", a.cl, b.cl, a.cd);
+        assert!((a.cl + b.cl).abs() < 2e-3 && (a.cd - b.cd).abs() < 2e-4, "alpha {alpha}: {} vs {}", a.cl, b.cl);
+        assert!(a.cl > 0.4, "plate CL {}", a.cl);
+    }
 }
