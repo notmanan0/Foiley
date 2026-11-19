@@ -1,20 +1,21 @@
 //! Plane design, 3D analysis and stability modules.
 
 use crate::body_list::{self, BodyAction};
-use crate::view3d::{self, Camera, ColorField, Overlay};
+use crate::view3d::{self, Camera, ColorField, FieldRevision, MeshCache, Overlay, SelectionHighlight, ViewportInput};
 use crate::widgets::{self, check, heading, hint, int, num, num_u, section, series_color};
-use crate::{App, Pending};
+use crate::{App, Pending, PolarTarget};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, MarkerShape, Plot, PlotPoints, Points};
-use foiley_app::{auto, CadFormat, CadImport, JobId, JobKind};
+use foiley_app::{auto, CadFormat, CadImport, JobId, JobKind, JobManager};
 use foiley_core::atmosphere::{isa, Fluid};
+use foiley_core::hash::Hash32;
 use foiley_core::{Spacing, Vec3};
-use foiley_plane::analysis::{ControlRange, ControlTarget, ExtraDrag, Method, PlaneOpp, PolarKind, RefDims, Setting};
+use foiley_plane::analysis::{ControlRange, ControlTarget, ExtraDrag, Method, PlaneOpp, PolarKind, RefDims, Setting, StripResult};
 use foiley_plane::geom::{FuseFrame, PointMass, Wing, WingKind, WingSection};
 use foiley_plane::mesh::{Mesh, MeshOptions};
 use foiley_plane::stability::{modal_initial_state, time_response};
-use foiley_plane::{Plane, PlanePolarDef};
-use std::collections::HashSet;
+use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 pub struct PlaneUi {
@@ -32,9 +33,13 @@ pub struct PlaneUi {
     pub plots: [(usize, usize); 4],
     pub span_var: usize,
     pub cam: Camera,
+    view_cache: Option<MeshCache>,
     mesh_key: Option<CachedMeshKey>,
     pub mesh: Option<(u64, Mesh)>,
+    pub mesh_hash: Option<Hash32>,
     pub mesh_job: Option<(JobId, u64)>,
+    base_mesh_hash: Option<BaseMeshHash>,
+    analysis_overlay_cache: Option<CachedAnalysisOverlay>,
     pub view_thick: bool,
     pub color_cp: bool,
     pub edges: bool,
@@ -65,9 +70,13 @@ impl Default for PlaneUi {
             plots: [(0, 4), (5, 4), (0, 9), (0, 13)],
             span_var: 0,
             cam: Camera::default(),
+            view_cache: None,
             mesh_key: None,
             mesh: None,
+            mesh_hash: None,
             mesh_job: None,
+            base_mesh_hash: None,
+            analysis_overlay_cache: None,
             view_thick: false,
             color_cp: true,
             edges: true,
@@ -89,9 +98,62 @@ struct CachedMeshKey {
     key: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AnalysisOverlayKey {
+    plane_idx: usize,
+    point: FieldRevision,
+    mesh_key: u64,
+    base_mesh_hash: Option<Result<Hash32, &'static str>>,
+}
+
+struct BaseMeshHash {
+    plane: usize,
+    options: MeshOptions,
+    /// renamed foils hashed under their run-time names (`RenamedLabels::foils`)
+    foils: BTreeMap<String, String>,
+    job: Option<JobId>,
+    result: Result<Hash32, &'static str>,
+}
+
+struct CachedAnalysisOverlay {
+    key: AnalysisOverlayKey,
+    verified: Result<(), &'static str>,
+    cp_range: Option<(f32, f32)>,
+    overlay: Overlay,
+}
+
+struct AnalysisPreview {
+    mesh_key: u64,
+    method: Method,
+    base_mesh_hash: Option<Result<Hash32, &'static str>>,
+}
+
 impl PlaneUi {
-    pub(super) fn invalidate_mesh_key(&mut self) {
+    pub(super) fn invalidate_mesh_key(&mut self, jobs: &JobManager) {
         self.mesh_key = None;
+        self.cancel_base_mesh_hash(jobs);
+        self.analysis_overlay_cache = None;
+    }
+
+    fn cancel_base_mesh_hash(&mut self, jobs: &JobManager) {
+        if let Some(job) = self.base_mesh_hash.take().and_then(|base| base.job).and_then(|id| jobs.get(id)) {
+            job.cancel();
+        }
+    }
+
+    /// Store the outcome of verification job `job`; `None` (cancelled before
+    /// it finished) forgets it, so that the next frame asks again.
+    pub(super) fn finish_base_mesh_hash(&mut self, job: JobId, outcome: Option<Result<Hash32, &'static str>>) {
+        if self.base_mesh_hash.as_ref().is_some_and(|base| base.job == Some(job)) {
+            match outcome {
+                Some(result) => {
+                    let base = self.base_mesh_hash.as_mut().unwrap();
+                    base.job = None;
+                    base.result = result;
+                }
+                None => self.base_mesh_hash = None,
+            }
+        }
     }
 }
 
@@ -189,7 +251,289 @@ fn plane_key(p: &Plane, o: &MeshOptions, project: &foiley_app::Project) -> u64 {
     h.finish()
 }
 
+/// Mesh options for a specific operating point, applying T6 control ranges or
+/// T7 stability gains at `ctrl`. Returns `(options, has_point_deflection)`.
+fn point_mesh_options(def: &PlanePolarDef, ctrl: f64) -> (MeshOptions, bool) {
+    let mut extra_flaps: HashMap<(usize, usize), f64> = HashMap::new();
+    let mut tilts: HashMap<usize, f64> = HashMap::new();
+    match def.kind {
+        PolarKind::Control => {
+            for r in &def.ranges {
+                let val = r.min + ctrl * (r.max - r.min);
+                match r.target {
+                    ControlTarget::Flap { wing, index } => {
+                        extra_flaps.insert((wing, index), val);
+                    }
+                    ControlTarget::Tilt { wing } => {
+                        tilts.insert(wing, val);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        PolarKind::Stability => {
+            for &(target, gain) in &def.gains {
+                match target {
+                    ControlTarget::Flap { wing, index } => {
+                        extra_flaps.insert((wing, index), gain * ctrl);
+                    }
+                    ControlTarget::Tilt { wing } => {
+                        tilts.insert(wing, gain * ctrl);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    let has_deflection = extra_flaps.values().any(|v| v.abs() > 1e-12) || tilts.values().any(|v| v.abs() > 1e-12);
+    (foiley_plane::analysis::mesh_options(def, &extra_flaps, &tilts), has_deflection)
+}
+
+/// Robust 2nd/98th percentile range over finite `Cp` values. Returns `None` if
+/// every value is non-finite or the slice is empty.
+fn cp_display_range(cp: &[f32]) -> Option<(f32, f32)> {
+    let mut v: Vec<f32> = cp.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    let pad = v.len() / 50;
+    let lo = v[pad];
+    let hi = v[v.len() - 1 - pad];
+    Some((lo, hi))
+}
+
+/// Verify that `polar` / `opp` belong to `plane` and match the exact ordered
+/// `mesh` before painting Cp, local Cl, wake, lift vectors, or NP overlays.
+fn verify_analysis_mesh_match(
+    plane: &Plane,
+    polar: &PlanePolar,
+    opp: &PlaneOpp,
+    mesh: &Mesh,
+    mesh_hash: Hash32,
+    base_mesh_hash: Option<Result<Hash32, &'static str>>,
+) -> Result<(), &'static str> {
+    if polar.plane != plane.name {
+        return Err("selected polar belongs to another plane — geometry-only view");
+    }
+    let Some(manifest) = polar.manifest.as_ref() else {
+        return Err("polar has no provenance manifest — geometry-only view");
+    };
+    if !polar.matches_plane_geometry(plane) {
+        return Err("plane edited since this polar ran — geometry-only view");
+    }
+    let method = polar.def.as_ref().map(|d| d.method);
+    if method == Some(Method::Llt) {
+        return Ok(());
+    }
+    let Some(expected_hash) = manifest.mesh_hash else {
+        return Err("polar has no mesh hash — geometry-only view");
+    };
+    let actual = match base_mesh_hash {
+        Some(base) => base?,
+        // renamed foils are hashed under the names the polar ran with
+        None if !polar.renamed.foils.is_empty() => polar.mesh_hash(mesh),
+        None => mesh_hash,
+    };
+    if actual != expected_hash {
+        return Err("mesh or foils changed since this polar ran — geometry-only view");
+    }
+    if !opp.cp.is_empty() && opp.cp.len() != mesh.panels.len() {
+        return Err("panel count mismatch with polar results — geometry-only view");
+    }
+    if !opp.strips.is_empty() {
+        if opp.strips.len() != mesh.strips.len() {
+            return Err("strip layout mismatch with polar results — geometry-only view");
+        }
+        for (s, r) in mesh.strips.iter().zip(&opp.strips) {
+            if s.wing != r.wing
+                || (s.span_pos - r.span_pos).abs() > 1e-3
+                || (s.chord - r.chord).abs() > 1e-3
+            {
+                return Err("strip ordering mismatch with polar results — geometry-only view");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn llt_station_nearest(strips: &[StripResult], span: f64) -> Option<&StripResult> {
+    let next = strips.partition_point(|strip| strip.span_pos < span);
+    match (next.checked_sub(1).and_then(|i| strips.get(i)), strips.get(next)) {
+        (Some(a), Some(b)) if span - a.span_pos <= b.span_pos - span => Some(a),
+        (a, b) => b.or(a),
+    }
+}
+
+/// Draw LLT loads at their signed span stations on the main wing.
+fn llt_lift_vectors(wing: &Wing, strips: &[StripResult], scale: f64, color: Color32) -> Vec<(Vec3, Vec3, Color32)> {
+    let port = wing.frames(true);
+    let starboard = wing.frames(false);
+    strips.iter().filter_map(|strip| {
+        let left = strip.span_pos < 0.0;
+        let span = strip.span_pos.abs();
+        if (left && !wing.two_sided) || !span.is_finite() || span < wing.sections.first()?.y || span > wing.sections.last()?.y {
+            return None;
+        }
+        let i = wing.sections.partition_point(|section| section.y < span).saturating_sub(1);
+        let a = &wing.sections[i];
+        let b = &wing.sections[i + 1];
+        let t = (span - a.y) / (b.y - a.y);
+        let frames = if left { &port } else { &starboard };
+        let anchor = frames[i].q4.lerp(frames[i + 1].q4, t);
+        let normal = frames[i].cu.lerp(frames[i + 1].cu, t).normalized();
+        Some((anchor, anchor + normal * (strip.lift_per_span * scale), color))
+    }).collect()
+}
+
+fn result_overlay(plane: &Plane, mesh: &Mesh, opp: &PlaneOpp, method: Method) -> Overlay {
+    let mut overlay = Overlay::default();
+    overlay.points.push((opp.cog, Color32::YELLOW, "CoG".into()));
+    if let Some(np) = opp.stability.as_ref().map(|s| s.x_np).filter(|x| x.is_finite()) {
+        overlay.points.push((
+            Vec3::new(np, 0.0, opp.cog.z),
+            Color32::from_rgb(95, 225, 255),
+            format!("NP x={np:.3} m"),
+        ));
+    }
+    for line in &opp.wake {
+        for segment in line.windows(2) {
+            let world = |a: [f32; 3]| Vec3::new(a[0].into(), a[1].into(), a[2].into());
+            overlay.lines.push((world(segment[0]), world(segment[1]), Color32::from_rgb(170, 200, 255)));
+        }
+    }
+    if let Some(wing) = plane.main_wing() {
+        let max_lift = opp.strips.iter().map(|s| s.lift_per_span.abs()).fold(0.0, f64::max).max(1e-9);
+        let scale = 0.15 * wing.planform_span() / max_lift;
+        let color = Color32::from_rgb(120, 230, 120);
+        if method == Method::Llt {
+            overlay.lines.extend(llt_lift_vectors(wing, &opp.strips, scale, color));
+        } else {
+            overlay.lines.extend(mesh.strips.iter().zip(&opp.strips).map(|(s, r)| {
+                (s.c4, s.c4 + s.normal * (r.lift_per_span * scale), color)
+            }));
+        }
+    }
+    overlay
+}
+
+/// Format a concise single-line hover readout for panel `panel_idx`.
+fn format_panel_hover(plane: &Plane, mesh: &Mesh, panel_idx: usize, verified_opp: Option<(&PlaneOpp, Method)>) -> String {
+    let Some(p) = mesh.panels.get(panel_idx) else {
+        return String::new();
+    };
+    let owner = if let Some(b) = p.body_id {
+        plane.fuses.get(b).map(|f| f.name.clone()).unwrap_or_else(|| format!("Body {}", b + 1))
+    } else if let Some(w) = plane.wings.get(p.wing) {
+        w.name.clone()
+    } else {
+        format!("Panel #{panel_idx}")
+    };
+    let flap_tag = if p.flap.is_some() { " (flap)" } else { "" };
+
+    if let Some((opp, method)) = verified_opp {
+        let mut parts = vec![format!("{owner}{flap_tag}")];
+        if let Some(&cp) = opp.cp.get(panel_idx) {
+            let label = if method.is_panel() { "Cp" } else { "dCp" };
+            if cp.is_finite() {
+                parts.push(format!("{label} {cp:+.4}"));
+            } else {
+                parts.push(format!("{label} n/a"));
+            }
+        }
+        let strip = p.strip.and_then(|i| {
+            if method == Method::Llt {
+                let strip = mesh.strips.get(i)?;
+                let wing = plane.wings.get(strip.wing)?;
+                if std::ptr::eq(wing, plane.main_wing()?) {
+                    llt_station_nearest(&opp.strips, strip.span_pos)
+                } else {
+                    None
+                }
+            } else {
+                opp.strips.get(i)
+            }
+        });
+        if let Some(sr) = strip {
+            parts.push(format!("y={:.3} m", sr.span_pos));
+            parts.push(format!("Cl {:.4}", sr.cl));
+        }
+        parts.push(format!("#{panel_idx}"));
+        parts.join("  |  ")
+    } else {
+        format!(
+            "{owner}{flap_tag}  |  #{panel_idx}  |  x={:.3} y={:.3} z={:.3} m",
+            p.centre.x, p.centre.y, p.centre.z
+        )
+    }
+}
+
 impl App {
+    /// Hash of the undeflected mesh of the active plane for a deflected T6/T7
+    /// point, built in the background; `foils` are the polar's renamed foils.
+    fn ensure_base_mesh_hash(&mut self, options: MeshOptions, foils: &BTreeMap<String, String>) -> Result<Hash32, &'static str> {
+        let plane = self.sel_plane;
+        let options = MeshOptions { allow_missing_foils: true, ..options };
+        if let Some(base) = self.pui.base_mesh_hash.as_ref().filter(|base| base.plane == plane && base.options == options && base.foils == *foils) {
+            // a job removed before its result was collected is asked for again
+            if base.job.is_none_or(|id| self.jobs.get(id).is_some()) {
+                return base.result;
+            }
+        }
+        self.pui.cancel_base_mesh_hash(&self.jobs);
+        let db = self.foil_db();
+        let plane_data = &self.project.planes[plane];
+        let job = self.jobs.submit(format!("verify mesh {}", plane_data.name), JobKind::MeshHash {
+            plane: plane_data.clone(),
+            db: (*db).clone(),
+            options: options.clone(),
+            foils: foils.clone(),
+        });
+        self.track_job(job.id, Pending::BaseMeshHash);
+        let result = Err("verifying base mesh…");
+        self.pui.base_mesh_hash = Some(BaseMeshHash { plane, options, foils: foils.clone(), job: Some(job.id), result });
+        result
+    }
+
+    fn edit_active_plane(&mut self, edited: Plane) {
+        if edited == self.project.planes[self.sel_plane] {
+            return;
+        }
+        if let Err(error) = edited.validate() {
+            self.toast = Some((error, std::time::Instant::now(), true));
+        }
+        self.snapshot_plane_geometry();
+        let before = &self.project.planes[self.sel_plane];
+        let old_name = &before.name;
+        // 3D polars of this plane, finished or running, follow a rename and
+        // record renamed labels so that their results still show.
+        for polar in self.project.plane_polars.iter_mut().filter(|polar| polar.plane == *old_name) {
+            if edited.name != *old_name {
+                let old_key = (old_name.clone(), polar.name.clone());
+                let new_key = (edited.name.clone(), polar.name.clone());
+                if self.pui.visible.remove(&old_key) {
+                    self.pui.visible.insert(new_key.clone());
+                }
+                if self.pui.sel_polar.as_ref() == Some(&old_key) {
+                    self.pui.sel_polar = Some(new_key);
+                }
+            }
+            polar.follow_plane_edit(before, &edited);
+        }
+        for target in crate::polar_targets(&mut self.pending).filter(|target| target.plane == *old_name) {
+            target.follow_plane_edit(before, &edited);
+        }
+        for pending in &mut self.pending {
+            if let Pending::CadImport { plane } = &mut pending.action {
+                if plane == old_name {
+                    plane.clone_from(&edited.name);
+                }
+            }
+        }
+        self.project.planes[self.sel_plane] = edited;
+    }
+
     fn preview_mesh_key(&mut self, options: &MeshOptions) -> u64 {
         let plane = self.sel_plane;
         if let Some(cached) = self.pui.mesh_key.as_ref().filter(|c| c.plane == plane && c.options == *options) {
@@ -261,12 +605,13 @@ impl App {
         let mut edited = self.project.planes[self.sel_plane].clone();
         let db = self.foil_db();
         let mut cad_request = None;
-        egui::SidePanel::left("plane_left").resizable(true).default_width(560.0).show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+        let editor_max = (ui.available_width() - 320.0).max(160.0);
+        egui::SidePanel::left("plane_left").resizable(true).default_width(560.0).max_width(editor_max).show_inside(ui, |ui| {
+            egui::ScrollArea::both().auto_shrink([false, true]).show(ui, |ui| {
                 let p = &mut edited;
                 ui.horizontal(|ui| {
-                    ui.label("Plane");
-                    ui.text_edit_singleline(&mut p.name);
+                    let label = ui.label("Plane");
+                    ui.text_edit_singleline(&mut p.name).labelled_by(label.id);
                 });
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.pui.design_tab, 0, "Wings");
@@ -286,22 +631,7 @@ impl App {
         if let Some((path, scale, body)) = cad_request {
             self.import_cad_body(self.sel_plane, body, &path, scale);
         }
-        let before = &self.project.planes[self.sel_plane];
-        if edited != *before {
-            if let Err(e) = edited.validate() {
-                self.toast = Some((e, std::time::Instant::now(), true));
-            }
-            // keep plane polars attached when renaming
-            if edited.name != before.name {
-                for q in &mut self.project.plane_polars {
-                    if q.plane == before.name {
-                        q.plane = edited.name.clone();
-                    }
-                }
-            }
-            self.snapshot_plane_geometry();
-            self.project.planes[self.sel_plane] = edited;
-        }
+        self.edit_active_plane(edited);
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.pui.view_thick, "thick surfaces (panel-method mesh)");
@@ -309,7 +639,7 @@ impl App {
                 ui.menu_button("Export", |ui| {
                     let plane_now = self.project.planes[self.sel_plane].clone();
                     if ui.button("AVL geometry (.avl + foil files)").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.avl", plane_now.name)).save_file() {
+                        if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}.avl", plane_now.name)).save_file()) {
                             let mut ok = std::fs::write(&path, foiley_plane::export::avl(&plane_now, &db, 0.0)).is_ok();
                             let dir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
                             for (n, t) in foiley_plane::export::avl_foil_files(&plane_now, &self.project.foils) {
@@ -320,13 +650,13 @@ impl App {
                         ui.close();
                     }
                     if ui.button("AVL mass file (.mass)").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.mass", plane_now.name)).save_file() {
+                        if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}.mass", plane_now.name)).save_file()) {
                             let _ = std::fs::write(&path, foiley_plane::export::avl_mass(&plane_now, &db));
                         }
                         ui.close();
                     }
                     if ui.button("Panel mesh (.stl)").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.stl", plane_now.name)).save_file() {
+                        if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}.stl", plane_now.name)).save_file()) {
                             match foiley_plane::export::stl_mesh(&plane_now, &db, self.pui.view_thick) {
                                 Ok(b) => {
                                     let _ = std::fs::write(&path, b);
@@ -337,7 +667,7 @@ impl App {
                         ui.close();
                     }
                     if ui.button("xflr5 plane XML").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.xml", plane_now.name)).save_file() {
+                        if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}.xml", plane_now.name)).save_file()) {
                             let _ = std::fs::write(&path, foiley_plane::xml::write_plane(&plane_now));
                         }
                         ui.close();
@@ -348,7 +678,6 @@ impl App {
             let opts = MeshOptions { thick: self.pui.view_thick, include_fuse: true, fuse_in_thin: true, ..Default::default() };
             let key = self.ensure_mesh(opts);
             let plane = &self.project.planes[self.sel_plane];
-            let mesh = self.pui.mesh.as_ref().filter(|m| m.0 == key).map(|m| &m.1);
             let inertia = plane.inertia(&db);
             let mut ov = Overlay { lines: vec![], points: vec![] };
             if inertia.mass > 0.0 {
@@ -357,7 +686,38 @@ impl App {
             for pm in &plane.point_masses {
                 ov.points.push((pm.position, Color32::from_rgb(255, 120, 200), pm.tag.clone()));
             }
-            view3d::show(ui, &mut self.pui.cam, mesh, None, &ov, self.pui.edges);
+            let highlight = match self.pui.design_tab {
+                0 => SelectionHighlight::Wing(self.pui.sel_wing),
+                1 => SelectionHighlight::Body(self.pui.sel_body),
+                _ => SelectionHighlight::None,
+            };
+            let clicked = {
+                let mesh = self.pui.mesh.as_ref().filter(|m| m.0 == key).map(|m| &m.1);
+                let hover_fmt = |idx: usize| mesh.map(|m| format_panel_hover(plane, m, idx, None)).unwrap_or_default();
+                let vp_in = ViewportInput {
+                    plane_id: self.sel_plane,
+                    mesh: mesh.map(|m| (key, m)),
+                    field: None,
+                    overlay: &ov,
+                    show_edges: self.pui.edges,
+                    highlight,
+                    hover_label: Some(&hover_fmt),
+                    notice: None,
+                };
+                let ev = view3d::show(ui, "plane_design", &mut self.pui.cam, &mut self.view3d_prefs, &mut self.pui.view_cache, &self.view3d_gl, &vp_in);
+                ev.clicked_panel.and_then(|idx| mesh.and_then(|m| m.panels.get(idx)).map(|p| (p.body_id, p.wing)))
+            };
+            if let Some((body_id, wing)) = clicked {
+                if let Some(b) = body_id {
+                    if b < plane.fuses.len() {
+                        self.pui.sel_body = b;
+                        self.pui.design_tab = 1;
+                    }
+                } else if wing < plane.wings.len() {
+                    self.pui.sel_wing = wing;
+                    self.pui.design_tab = 0;
+                }
+            }
         });
     }
 
@@ -373,15 +733,17 @@ impl App {
         }
         self.sel_plane = self.sel_plane.min(self.project.planes.len() - 1);
         let plane = self.project.planes[self.sel_plane].clone();
-        egui::SidePanel::left("an3d_left").resizable(true).default_width(340.0).show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+        let editor_max = ((ui.available_width() - 390.0) * 0.65).max(120.0);
+        egui::SidePanel::left("an3d_left").resizable(true).default_width(340.0).max_width(editor_max).show_inside(ui, |ui| {
+            egui::ScrollArea::both().auto_shrink([false, true]).show(ui, |ui| {
                 heading(ui, &format!("Analysis of '{}'", plane.name));
                 self.polar_def_editor(ui, &plane);
             });
         });
-        egui::SidePanel::right("an3d_right").resizable(true).default_width(240.0).show_inside(ui, |ui| {
+        let polar_list_max = (ui.available_width() - 390.0).max(110.0);
+        egui::SidePanel::right("an3d_right").resizable(true).default_width(240.0).max_width(polar_list_max).show_inside(ui, |ui| {
             heading(ui, "3D polars");
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::ScrollArea::both().auto_shrink([false, true]).show(ui, |ui| {
                 let mut del = None;
                 let mut vis_idx = 0;
                 for (i, p) in self.project.plane_polars.iter().enumerate() {
@@ -416,13 +778,13 @@ impl App {
                         }
                         ui.menu_button("...", |ui| {
                             if ui.button("Export CSV").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}_{}.csv", p.plane, p.name)).save_file() {
+                                if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}_{}.csv", p.plane, p.name)).save_file()) {
                                     let _ = std::fs::write(path, p.to_csv());
                                 }
                                 ui.close();
                             }
                             if ui.button("Export JSON (all results)").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}_{}.json", p.plane, p.name)).save_file() {
+                                if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}_{}.json", p.plane, p.name)).save_file()) {
                                     let _ = std::fs::write(path, serde_json::to_string_pretty(p).unwrap_or_default());
                                 }
                                 ui.close();
@@ -712,7 +1074,7 @@ impl App {
             match auto::plan(plane, &self.project.foils, &db, &def, self.pui.auto_polars) {
                 Ok(plan) if !plan.is_empty() => {
                     self.notify(format!("computing {} first", plan.describe()), false);
-                    self.submit(format!("2D polars for {}", plane.name), JobKind::AutoPolars { batches: plan.batches }, Pending::AutoPolarsThen(Box::new((plane.clone(), def))));
+                    self.submit(format!("2D polars for {}", plane.name), JobKind::AutoPolars { batches: plan.batches }, Pending::AutoPolarsThen(Box::new((plane.clone(), def, PolarTarget::new(plane)))));
                     return;
                 }
                 Ok(_) => {}
@@ -722,7 +1084,96 @@ impl App {
                 }
             }
         }
-        self.submit(title, JobKind::PlanePolar { plane: plane.clone(), db: (*db).clone(), def }, Pending::PlanePolar);
+        self.submit(title, JobKind::PlanePolar { plane: plane.clone(), db: (*db).clone(), def }, Pending::PlanePolar(PolarTarget::new(plane)));
+    }
+
+    fn analysis_preview(&mut self, selected: Option<usize>) -> AnalysisPreview {
+        let plane = &self.project.planes[self.sel_plane];
+        let polar = selected.map(|i| &self.project.plane_polars[i]);
+        let def = polar.and_then(|p| p.def.as_ref()).unwrap_or(&self.pui.def);
+        let method = def.method;
+        let polar = polar.filter(|p| p.plane == plane.name);
+        let point = polar.and_then(|p| p.points.get(self.pui.sel_point));
+        let foils = polar.map(|p| p.renamed.foils.clone()).unwrap_or_default();
+        let base_options = foiley_plane::analysis::mesh_options(def, &HashMap::new(), &HashMap::new());
+        let (options, baseline) = if let Some(point) = point {
+            let (options, deflected) = point_mesh_options(def, point.ctrl);
+            (options, deflected.then_some(base_options))
+        } else {
+            (base_options, None)
+        };
+        let mesh_key = self.ensure_mesh(options);
+        let base_mesh_hash = baseline.map(|options| self.ensure_base_mesh_hash(options, &foils));
+        AnalysisPreview { mesh_key, method, base_mesh_hash }
+    }
+
+    fn analysis_viewport(&mut self, ui: &mut egui::Ui, plane: &Plane, selected: Option<usize>, preview: &AnalysisPreview) {
+        let mesh = self.pui.mesh.as_ref().filter(|m| m.0 == preview.mesh_key).map(|m| &m.1);
+        let point_idx = self.pui.sel_point;
+        let selected = selected.and_then(|polar_idx| {
+            let polar = &self.project.plane_polars[polar_idx];
+            polar.points.get(point_idx).map(|point| (polar_idx, polar, point))
+        });
+        let cached = if let (Some((polar_idx, polar, point)), Some(mesh), Some(hash)) = (selected, mesh, self.pui.mesh_hash) {
+            let key = AnalysisOverlayKey {
+                plane_idx: self.sel_plane,
+                point: FieldRevision {
+                    project: self.version.project,
+                    revision: self.version.revision,
+                    polar: polar_idx,
+                    point: point_idx,
+                },
+                mesh_key: preview.mesh_key,
+                base_mesh_hash: preview.base_mesh_hash,
+            };
+            let cache = &mut self.pui.analysis_overlay_cache;
+            if cache.as_ref().is_none_or(|cached| cached.key != key) {
+                let verified = verify_analysis_mesh_match(plane, polar, point, mesh, hash, preview.base_mesh_hash);
+                let (cp_range, overlay) = if verified.is_ok() {
+                    (
+                        if preview.method == Method::Llt { None } else { cp_display_range(&point.cp) },
+                        result_overlay(plane, mesh, point, preview.method),
+                    )
+                } else {
+                    (None, Overlay::default())
+                };
+                *cache = Some(CachedAnalysisOverlay { key, verified, cp_range, overlay });
+            }
+            cache.as_ref()
+        } else {
+            self.pui.analysis_overlay_cache = None;
+            None
+        };
+        let empty_overlay = Overlay::default();
+        let point = selected.map(|(_, _, point)| point);
+        let verified_point = point.filter(|_| cached.is_some_and(|cache| cache.verified.is_ok()));
+        let field = if self.pui.color_cp {
+            cached.and_then(|cache| {
+                let point = verified_point?;
+                let (min, max) = cache.cp_range?;
+                Some(ColorField {
+                    values: &point.cp,
+                    min,
+                    max,
+                    label: if preview.method.is_panel() { "Cp".into() } else { "dCp (loading)".into() },
+                    revision: cache.key.point,
+                })
+            })
+        } else {
+            None
+        };
+        let hover_fmt = |idx| mesh.map(|m| format_panel_hover(plane, m, idx, verified_point.map(|p| (p, preview.method)))).unwrap_or_default();
+        let input = ViewportInput {
+            plane_id: self.sel_plane,
+            mesh: mesh.map(|m| (preview.mesh_key, m)),
+            field: field.as_ref(),
+            overlay: cached.map_or(&empty_overlay, |cache| &cache.overlay),
+            show_edges: self.pui.edges,
+            highlight: SelectionHighlight::None,
+            hover_label: Some(&hover_fmt),
+            notice: cached.and_then(|cache| cache.verified.err()),
+        };
+        view3d::show(ui, "plane_analysis", &mut self.pui.cam, &mut self.view3d_prefs, &mut self.pui.view_cache, &self.view3d_gl, &input);
     }
 
     fn results_3d(&mut self, ui: &mut egui::Ui, plane: &Plane) {
@@ -749,15 +1200,6 @@ impl App {
                 }
             }
         });
-        let preview = if self.pui.show_3d {
-            let def = sel.and_then(|p| p.def.as_ref()).unwrap_or(&self.pui.def);
-            let panel_method = def.method.is_panel();
-            let opts = foiley_plane::analysis::mesh_options(def, &Default::default(), &Default::default());
-            Some((self.ensure_mesh(opts), panel_method))
-        } else {
-            None
-        };
-        let sel = selected.map(|i| &self.project.plane_polars[i]);
         let mut series: Vec<_> = self.project.plane_polars
             .iter()
             .filter(|p| self.pui.visible.contains(&(p.plane.clone(), p.name.clone())))
@@ -831,6 +1273,7 @@ impl App {
         if let Some(i) = clicked {
             self.pui.sel_point = i;
         }
+        let preview = self.pui.show_3d.then(|| self.analysis_preview(selected));
         ui.separator();
         let rest = ui.available_height();
         ui.horizontal(|ui| {
@@ -841,7 +1284,7 @@ impl App {
                     widgets::pick(ui, "spanvar", &mut self.pui.span_var, &SPANVARS);
                 });
                 Plot::new("span").height(rest - 30.0).legend(Legend::default()).x_axis_label("span position (m)").show(ui, |pu| {
-                    if let Some(p) = sel {
+                    if let Some(p) = selected.map(|i| &self.project.plane_polars[i]) {
                         if let Some(o) = p.points.get(self.pui.sel_point) {
                             let mac = p.ref_dims.2.max(1e-9);
                             let nw = o.strips.iter().map(|s| s.wing).max().map(|m| m + 1).unwrap_or(0);
@@ -875,46 +1318,13 @@ impl App {
                     }
                 });
             });
-            if let Some((key, panel_method)) = preview {
+            if let Some(preview) = preview.as_ref() {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.pui.color_cp, "colour by Cp");
                         ui.checkbox(&mut self.pui.edges, "edges");
                     });
-                    let mesh = self.pui.mesh.as_ref().filter(|m| m.0 == key).map(|m| &m.1);
-                    let mut ov = Overlay { lines: vec![], points: vec![] };
-                    let mut cpv: &[f32] = &[];
-                    if let (Some(p), Some(m)) = (sel, mesh) {
-                        if let Some(o) = p.points.get(self.pui.sel_point) {
-                            ov.points.push((o.cog, Color32::YELLOW, "CoG".into()));
-                            for l in &o.wake {
-                                for w in l.windows(2) {
-                                    let v = |a: [f32; 3]| Vec3::new(a[0] as f64, a[1] as f64, a[2] as f64);
-                                    ov.lines.push((v(w[0]), v(w[1]), Color32::from_rgb(170, 200, 255)));
-                                }
-                            }
-                            if o.cp.len() == m.panels.len() {
-                                cpv = &o.cp;
-                            }
-                            // lift vectors per strip
-                            let lmax = o.strips.iter().map(|s| s.lift_per_span.abs()).fold(0.0, f64::max).max(1e-9);
-                            let span = plane.main_wing().map(|w| w.planform_span()).unwrap_or(1.0);
-                            for (s, r) in m.strips.iter().zip(&o.strips) {
-                                let len = 0.15 * span * r.lift_per_span / lmax;
-                                ov.lines.push((s.c4, s.c4 + s.normal * len, Color32::from_rgb(120, 230, 120)));
-                            }
-                        }
-                    }
-                    let field = if self.pui.color_cp && !cpv.is_empty() {
-                        let mut v: Vec<f32> = cpv.iter().copied().filter(|x| x.is_finite()).collect();
-                        v.sort_by(|a, b| a.total_cmp(b));
-                        let lo = v.get(v.len() / 50).cloned().unwrap_or(-1.0);
-                        let hi = v.get(v.len() - 1 - v.len() / 50).cloned().unwrap_or(1.0);
-                        Some(ColorField { values: cpv, min: lo, max: hi, label: if panel_method { "Cp".into() } else { "dCp (loading)".into() } })
-                    } else {
-                        None
-                    };
-                    view3d::show(ui, &mut self.pui.cam, mesh, field.as_ref(), &ov, self.pui.edges);
+                    self.analysis_viewport(ui, plane, selected, preview);
                 });
             }
         });
@@ -1119,7 +1529,6 @@ impl App {
         });
     }
 }
-
 fn flap_targets(p: &Plane) -> Vec<(usize, usize, String)> {
     // flaps: surfaces whose both foils carry a hinge; numbered left tip -> right tip per wing
     let mut out = vec![];
@@ -1381,7 +1790,7 @@ fn fuse_editor(ui: &mut egui::Ui, p: &mut Plane, sel: &mut usize) -> Option<(std
             UNITS.store(u, std::sync::atomic::Ordering::Relaxed);
         }
         if ui.button("Import STL / STEP...").on_hover_text("replace this body by a CAD surface; use the triangle panel method to analyse it").clicked() {
-            if let Some(path) = rfd::FileDialog::new().add_filter("CAD surface", &["stl", "step", "stp"]).pick_file() {
+            if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.add_filter("CAD surface", &["stl", "step", "stp"]).pick_file()) {
                 import = Some((path, u));
             }
         }
@@ -1720,5 +2129,339 @@ mod mesh_cache_regressions {
         assert_eq!(mesh.0, latest.1);
         assert_ne!(old_centres, mesh.1.panels.iter().map(|p| p.centre).collect::<Vec<_>>());
         assert!(app.pui.mesh_job.is_none());
+    }
+}
+
+#[cfg(test)]
+mod view3d_analysis_regressions {
+    use super::*;
+    use crate::view3d::{NavPreset, OrbitMode};
+    use foiley_app::{JobManager, Project};
+    use foiley_core::progress::Progress;
+    use foiley_foil::Foil;
+    use foiley_plane::analysis::{Range, run_polar};
+    use foiley_plane::provenance::mesh_hash;
+
+    fn coarse_plane_and_db() -> (Plane, foiley_plane::FoilDb, Foil) {
+        let foil = Foil::naca("2412").unwrap();
+        let mut plane = Plane::default_plane(&foil.name, &foil.name);
+        for wing in &mut plane.wings {
+            for sec in &mut wing.sections {
+                sec.nx = 3;
+                sec.ny = 3;
+            }
+        }
+        let mut project = Project::new("test");
+        project.foils.push(foil.clone());
+        project.planes.push(plane.clone());
+        let db = project.foil_db();
+        (plane, db, foil)
+    }
+
+    #[test]
+    fn verify_analysis_rejects_other_plane_same_count_edits_and_missing_manifest() {
+        let (plane, db, _foil) = coarse_plane_and_db();
+        let def = PlanePolarDef {
+            method: Method::Vlm2,
+            viscous: false,
+            range: Range { from: 2.0, to: 2.0, step: 1.0 },
+            ..Default::default()
+        };
+
+        let polar = run_polar(&plane, &db, &def, &Progress::none(), &|_| {}).unwrap();
+        let opp = &polar.points[0];
+        let opts = foiley_plane::analysis::mesh_options(&def, &HashMap::new(), &HashMap::new());
+        let mesh = foiley_plane::mesh::build(&plane, &db, &opts).unwrap();
+
+        // Exact plane + mesh verifies cleanly.
+        let hash = mesh_hash(&mesh);
+        assert!(verify_analysis_mesh_match(&plane, &polar, opp, &mesh, hash, None).is_ok());
+
+        // Different plane with identical mesh count is rejected.
+        let mut other_plane = plane.clone();
+        other_plane.name = "Other Plane".into();
+        assert!(verify_analysis_mesh_match(&other_plane, &polar, opp, &mesh, hash, None).is_err());
+
+        // Same-count geometry edit (changing twist preserves exact panel & strip counts) is rejected.
+        let mut edited = plane.clone();
+        edited.wings[0].sections[0].twist += 3.0;
+        let edited_mesh = foiley_plane::mesh::build(&edited, &db, &opts).unwrap();
+        assert_eq!(edited_mesh.panels.len(), mesh.panels.len());
+        assert_eq!(edited_mesh.strips.len(), mesh.strips.len());
+        assert!(verify_analysis_mesh_match(&edited, &polar, opp, &edited_mesh, mesh_hash(&edited_mesh), None).is_err());
+
+        // Same-count foil replacement (changing camber keeps identical plane struct & panel counts)
+        // is still rejected via mesh_hash!
+        let mut sym = Foil::naca("0012").unwrap();
+        sym.name = plane.wings[0].sections[0].foil_left.clone();
+        let mut project2 = Project::new("foil_swap");
+        project2.foils.push(sym);
+        project2.planes.push(plane.clone());
+        let db2 = project2.foil_db();
+        let foil_swapped_mesh = foiley_plane::mesh::build(&plane, &db2, &opts).unwrap();
+        assert_eq!(foil_swapped_mesh.panels.len(), mesh.panels.len());
+        assert!(verify_analysis_mesh_match(&plane, &polar, opp, &foil_swapped_mesh, mesh_hash(&foil_swapped_mesh), None).is_err());
+
+        // Polar without provenance manifest is rejected (geometry-only hover).
+        let mut legacy = polar.clone();
+        legacy.manifest = None;
+        assert!(verify_analysis_mesh_match(&plane, &legacy, opp, &mesh, hash, None).is_err());
+
+        let mut renamed = polar.clone();
+        renamed.rename_plane(&other_plane.name);
+        let renamed: PlanePolar = serde_json::from_str(&serde_json::to_string(&renamed).unwrap()).unwrap();
+        assert!(verify_analysis_mesh_match(&other_plane, &renamed, opp, &mesh, hash, None).is_ok());
+        other_plane.wings[0].sections[0].twist += 3.0;
+        assert!(verify_analysis_mesh_match(&other_plane, &renamed, opp, &edited_mesh, mesh_hash(&edited_mesh), None).is_err());
+    }
+
+    #[test]
+    fn cp_display_range_handles_empty_and_all_non_finite_safely() {
+        assert_eq!(cp_display_range(&[]), None);
+        assert_eq!(cp_display_range(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY]), None);
+        let (lo, hi) = cp_display_range(&[f32::NAN, -1.2, 0.0, 0.8, f32::INFINITY]).unwrap();
+        assert!((lo - (-1.2)).abs() < 1e-6);
+        assert!((hi - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn point_mesh_options_applies_control_ranges_and_stability_gains() {
+        let mut ctrl_def = PlanePolarDef { kind: PolarKind::Control, ..Default::default() };
+        ctrl_def.ranges.push(ControlRange {
+            target: ControlTarget::Tilt { wing: 1 },
+            min: -4.0,
+            max: 6.0,
+        });
+        let (opts, deflected) = point_mesh_options(&ctrl_def, 0.5);
+        assert!(deflected);
+        assert!((*opts.tilts.get(&1).unwrap() - 1.0).abs() < 1e-9);
+
+        let mut stab_def = PlanePolarDef { kind: PolarKind::Stability, ..Default::default() };
+        stab_def.gains.push((ControlTarget::Flap { wing: 0, index: 0 }, 10.0));
+        let (opts_s, deflected_s) = point_mesh_options(&stab_def, 0.25);
+        assert!(deflected_s);
+        assert!((*opts_s.flaps.get(&(0, 0)).unwrap() - 2.5).abs() < 1e-9);
+
+        let base_def = PlanePolarDef::default();
+        let (_, deflected_b) = point_mesh_options(&base_def, 1.0);
+        assert!(!deflected_b);
+    }
+
+    #[test]
+    fn llt_overlay_draws_loads_at_the_solver_stations() {
+        let (plane, db, _) = coarse_plane_and_db();
+        let mesh = foiley_plane::mesh::build(&plane, &db, &MeshOptions::default()).unwrap();
+        let def = PlanePolarDef { method: Method::Llt, ..Default::default() };
+        let manifest = foiley_core::provenance::RunManifest::new(
+            foiley_core::provenance::hash_json("foiley.def3d.v1", &def),
+            foiley_plane::provenance::plane_hash(&plane),
+        );
+        let polar = PlanePolar { plane: plane.name.clone(), def: Some(def), manifest: Some(manifest), ..Default::default() };
+        let point = PlaneOpp {
+            strips: [-0.8, 0.25, 0.9].map(|span_pos| StripResult { span_pos, lift_per_span: 30.0, ..Default::default() }).to_vec(),
+            ..Default::default()
+        };
+        assert_ne!(point.strips.len(), mesh.strips.len());
+        assert!(verify_analysis_mesh_match(&plane, &polar, &point, &mesh, mesh_hash(&mesh), None).is_ok());
+        let overlay = result_overlay(&plane, &mesh, &point, Method::Llt);
+        assert_eq!(overlay.points[0].2, "CoG");
+        assert_eq!(overlay.lines.len(), 3);
+        for ((start, end, _), station) in overlay.lines.iter().zip(&point.strips) {
+            assert!((start.y - station.span_pos).abs() < 1e-9);
+            assert!(end.z > start.z);
+        }
+    }
+
+    #[test]
+    fn base_mesh_hash_reuses_completed_work_and_ignores_obsolete_jobs() {
+        let (plane, _, foil) = coarse_plane_and_db();
+        let mut project = Project::new("mesh");
+        project.foils.push(foil);
+        project.planes.push(plane);
+        let mut app = App::from_project(project, JobManager::new(1), true);
+        let options = MeshOptions::default();
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &BTreeMap::new()), Err("verifying base mesh…"));
+        let old = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        app.jobs.wait(old, |_| {});
+        let mut plane = app.project.planes[0].clone();
+        plane.wings[0].sections[0].twist = 3.0;
+        app.edit_active_plane(plane);
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &BTreeMap::new()), Err("verifying base mesh…"));
+        let new = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        assert_ne!(old, new);
+        app.jobs.wait(new, |_| {});
+        app.process_jobs();
+        let first = app.ensure_base_mesh_hash(options.clone(), &BTreeMap::new()).unwrap();
+        let expected = foiley_plane::mesh::build(&app.project.planes[0], &app.project.foil_db(), &options).unwrap();
+        assert_eq!(first, mesh_hash(&expected));
+        assert_eq!(app.ensure_base_mesh_hash(options, &BTreeMap::new()), Ok(first));
+        assert_eq!(app.jobs.jobs().len(), 2);
+    }
+
+    #[test]
+    fn view3d_prefs_survive_project_replacement_while_camera_requests_refit() {
+        let mut app = App::from_project(Project::starter(), JobManager::new(1), true);
+        app.view3d_prefs.nav_preset = NavPreset::CadBlender;
+        app.view3d_prefs.orbit_mode = OrbitMode::Trackball;
+        app.view3d_prefs.perspective = false;
+        app.view3d_prefs.show_grid = false;
+        app.pui.cam.needs_fit = false;
+
+        app.replace_project(Project::new("fresh"), None, false);
+        assert_eq!(app.view3d_prefs.nav_preset, NavPreset::CadBlender);
+        assert_eq!(app.view3d_prefs.orbit_mode, OrbitMode::Trackball);
+        assert!(!app.view3d_prefs.perspective);
+        assert!(!app.view3d_prefs.show_grid);
+        assert!(app.pui.cam.needs_fit, "new project must auto-fit its aircraft");
+    }
+
+    fn inviscid_vlm() -> PlanePolarDef {
+        PlanePolarDef { method: Method::Vlm2, viscous: false, range: Range { from: 2.0, to: 2.0, step: 1.0 }, ..Default::default() }
+    }
+
+    /// The coarse plane with one inviscid VLM polar, open in Studio.
+    fn app_with_polar() -> App {
+        let (plane, db, foil) = coarse_plane_and_db();
+        let polar = run_polar(&plane, &db, &inviscid_vlm(), &Progress::none(), &|_| {}).unwrap();
+        let mut project = Project::new("renames");
+        project.foils.push(foil);
+        project.planes.push(plane);
+        project.add_plane_polar(polar);
+        App::from_project(project, JobManager::new(1), true)
+    }
+
+    /// Verify the first polar's first point against a fresh mesh of its plane.
+    fn overlay_check(app: &App) -> Result<(), &'static str> {
+        let polar = &app.project.plane_polars[0];
+        let plane = app.project.planes.iter().find(|p| p.name == polar.plane).ok_or("no such plane")?;
+        let options = foiley_plane::analysis::mesh_options(polar.def.as_ref().unwrap(), &HashMap::new(), &HashMap::new());
+        let mesh = foiley_plane::mesh::build(plane, &app.project.foil_db(), &options).unwrap();
+        verify_analysis_mesh_match(plane, polar, &polar.points[0], &mesh, mesh_hash(&mesh), None)
+    }
+
+    #[test]
+    fn cancelling_a_base_mesh_verification_does_not_hide_the_overlay() {
+        let (plane, _, foil) = coarse_plane_and_db();
+        let mut project = Project::new("mesh");
+        project.foils.push(foil);
+        project.planes.push(plane);
+        let mut app = App::from_project(project, JobManager::new(1), true);
+        let options = MeshOptions::default();
+        let none = BTreeMap::new();
+        let expected = mesh_hash(&foiley_plane::mesh::build(&app.project.planes[0], &app.project.foil_db(), &options).unwrap());
+
+        // "Cancel all" to stop a long analysis while the verification waits
+        // for the one compute thread: the mesh is still built, and its hash used
+        let sweep = foiley_foil::Sweep::Alpha { from: -10.0, to: 15.0, step: 0.05 };
+        let long = app.jobs.submit("long polar", JobKind::FoilPolar { foil: Foil::naca("0012").unwrap(), settings: Default::default(), sweep });
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &none), Err("verifying base mesh…"));
+        let job = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        app.jobs.cancel_all();
+        assert_eq!(app.jobs.wait(long.id, |_| {}), foiley_app::JobStatus::Cancelled);
+        assert_eq!(app.jobs.wait(job, |_| {}), foiley_app::JobStatus::Cancelled);
+        app.process_jobs();
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &none), Ok(expected));
+
+        // cancelled without a result: asked for again, not cached as a failure
+        app.pui.invalidate_mesh_key(&app.jobs);
+        assert!(app.ensure_base_mesh_hash(options.clone(), &none).is_err());
+        let job = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        app.pui.finish_base_mesh_hash(job, None);
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &none), Err("verifying base mesh…"));
+        let again = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        assert_ne!(job, again);
+
+        // removed from the job list ("Clear finished") before it was collected
+        app.jobs.wait(again, |_| {});
+        app.jobs.get(again).unwrap().take_output();
+        app.jobs.clear_finished();
+        assert_eq!(app.ensure_base_mesh_hash(options.clone(), &none), Err("verifying base mesh…"));
+        let last = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        assert_ne!(last, again);
+        app.jobs.wait(last, |_| {});
+        app.process_jobs();
+        assert!(app.pending.is_empty(), "a vanished job left its pending entry behind");
+        assert_eq!(app.ensure_base_mesh_hash(options, &none), Ok(expected));
+    }
+
+    #[test]
+    fn renaming_a_foil_or_wing_keeps_the_analysis_overlay() {
+        let mut app = app_with_polar();
+        assert_eq!(overlay_check(&app), Ok(()));
+        let foil = app.project.foils[0].name.clone();
+        app.rename_foil(&foil, "Root");
+        assert_eq!(overlay_check(&app), Ok(()), "a foil rename hid the overlay");
+
+        // a deflected point verifies the undeflected mesh in the background
+        let polar = &app.project.plane_polars[0];
+        let expected = polar.manifest.as_ref().unwrap().mesh_hash;
+        let options = foiley_plane::analysis::mesh_options(polar.def.as_ref().unwrap(), &HashMap::new(), &HashMap::new());
+        let foils = polar.renamed.foils.clone();
+        assert!(!foils.is_empty());
+        assert!(app.ensure_base_mesh_hash(options.clone(), &foils).is_err());
+        let job = app.pui.base_mesh_hash.as_ref().unwrap().job.unwrap();
+        app.jobs.wait(job, |_| {});
+        app.process_jobs();
+        assert_eq!(app.ensure_base_mesh_hash(options, &foils).ok(), expected);
+
+        let mut plane = app.project.planes[0].clone();
+        plane.wings[0].name = "Main wing".into();
+        app.edit_active_plane(plane);
+        assert_eq!(overlay_check(&app), Ok(()), "a wing rename hid the overlay");
+        let mut plane = app.project.planes[0].clone();
+        plane.wings[0].sections[0].twist += 3.0;
+        app.edit_active_plane(plane);
+        assert!(overlay_check(&app).is_err(), "a geometry edit kept the overlay");
+    }
+
+    #[test]
+    fn a_polar_that_finishes_after_a_rename_lands_on_the_renamed_plane() {
+        let (plane, db, foil) = coarse_plane_and_db();
+        let mut project = Project::new("running");
+        project.foils.push(foil.clone());
+        project.planes.push(plane.clone());
+        let mut app = App::from_project(project.clone(), JobManager::new(1), true);
+        let polar = run_polar(&plane, &db, &inviscid_vlm(), &Progress::none(), &|_| {}).unwrap();
+        let finish = |app: &mut App| {
+            let crate::PendingJob { generation, action, .. } = app.pending.remove(0);
+            app.apply_output(generation, "3D polar", action, foiley_app::JobOutput::PlanePolar(Box::new(polar.clone())));
+        };
+
+        // the plane, a wing and a foil renamed while it ran
+        app.track_job(1001, Pending::PlanePolar(PolarTarget::new(&plane)));
+        let mut edited = plane.clone();
+        edited.name = "Glider".into();
+        edited.wings[0].name = "Main wing".into();
+        app.edit_active_plane(edited);
+        app.rename_foil(&foil.name, "Root");
+        finish(&mut app);
+        let arrived = &app.project.plane_polars[0];
+        assert_eq!(arrived.plane, "Glider");
+        assert_eq!(app.pui.sel_polar, Some(("Glider".to_string(), arrived.name.clone())));
+        assert_eq!(overlay_check(&app), Ok(()));
+
+        // a rename undone while it ran: the polar stays on the original name
+        let mut app = App::from_project(project, JobManager::new(1), true);
+        app.track_job(1002, Pending::PlanePolar(PolarTarget::new(&plane)));
+        let mut edited = plane.clone();
+        edited.name = "Renamed".into();
+        app.edit_active_plane(edited);
+        app.undo();
+        finish(&mut app);
+        assert_eq!(app.project.plane_polars[0].plane, plane.name);
+        assert_eq!(overlay_check(&app), Ok(()));
+
+        // the chained run after automatic 2D polars carries the rename along
+        let mut app = App::from_project(Project::starter(), JobManager::new(1), true);
+        let plane = app.project.planes[0].clone();
+        app.track_job(1003, Pending::AutoPolarsThen(Box::new((plane.clone(), inviscid_vlm(), PolarTarget::new(&plane)))));
+        let mut edited = plane.clone();
+        edited.name = "Chained".into();
+        app.edit_active_plane(edited);
+        let crate::PendingJob { generation, action, .. } = app.pending.remove(0);
+        app.apply_output(generation, "2D polars", action, foiley_app::JobOutput::Batch(vec![]));
+        let chained = app.pending.last().unwrap();
+        assert!(matches!(&chained.action, Pending::PlanePolar(target) if target.plane == "Chained"));
+        app.jobs.cancel_all();
     }
 }

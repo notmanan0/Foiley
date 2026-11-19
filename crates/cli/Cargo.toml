@@ -10,10 +10,11 @@ name = "foiley"
 path = "src/main.rs"
 
 [features]
-default = ["gui"]
+default = ["gui", "snap"]
 # Foiley Studio built into the `foiley` binary (`foiley studio`).  Without it
 # (`--no-default-features`) the binary is headless and has no windowing code.
 gui = ["dep:foiley-gui"]
+snap = ["gui", "foiley-gui/snap"]
 
 [dependencies]
 foiley-gui = { workspace = true, optional = true }

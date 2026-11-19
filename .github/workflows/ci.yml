@@ -79,3 +79,5 @@ jobs:
           key: windows
       - run: cargo clippy -p foiley-cli -p foiley-gui --all-targets -- -D warnings
       - run: cargo test -p foiley-cli -p foiley-gui
+        env:
+          FOILEY_SNAP_SOFTWARE: "1"

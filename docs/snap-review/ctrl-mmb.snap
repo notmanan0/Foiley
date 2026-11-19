@@ -1,0 +1,8 @@
+settle
+snap zoom-before viewport
+trace ctrl-mmb
+drag ctrl+mmb vp:0.68,0.55 70 0 8
+snap horizontal viewport
+drag ctrl+mmb vp:0.68,0.55 0 -55 8
+end
+snap zoom-after viewport

@@ -9,6 +9,8 @@
 mod body_list;
 mod foil_ui;
 mod plane_ui;
+#[cfg(feature = "snap")]
+pub mod snap;
 mod view3d;
 mod widgets;
 
@@ -16,13 +18,14 @@ use eframe::egui::{self, Color32, RichText};
 use foiley_app::{JobId, JobKind, JobManager, JobOutput, JobStatus, Project};
 use foiley_core::progress::LogLevel;
 use foiley_foil::analysis::PointDetail;
-use foiley_plane::{FoilDb, Plane, PlanePolarDef};
+use foiley_plane::provenance::RenamedLabels;
+use foiley_plane::{FoilDb, Plane, PlanePolar, PlanePolarDef};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Module {
     FoilDesign,
     FoilAnalysis,
@@ -45,10 +48,11 @@ pub enum Pending {
     FoilPolar,
     FoilPoint,
     Batch,
-    PlanePolar,
+    PlanePolar(PolarTarget),
     /// compute the missing 2D polars, then run this 3D analysis
-    AutoPolarsThen(Box<(Plane, PlanePolarDef)>),
+    AutoPolarsThen(Box<(Plane, PlanePolarDef, PolarTarget)>),
     Mesh(u64),
+    BaseMeshHash,
     Inverse,
     Optimise,
     /// apply an imported CAD body to the plane of this name
@@ -59,6 +63,56 @@ pub enum Pending {
 struct ProjectRevision {
     project: u64,
     revision: u64,
+}
+
+/// The plane a running 3D analysis belongs to.  Renames made while it runs
+/// (of the plane, its wings, bodies or foils) are recorded here and given to
+/// the polar when it arrives, so it lands on the renamed plane and its
+/// results still match the geometry.
+#[derive(Clone, Debug)]
+pub struct PolarTarget {
+    plane: String,
+    renamed: RenamedLabels,
+}
+
+impl PolarTarget {
+    pub fn new(plane: &Plane) -> Self {
+        PolarTarget { plane: plane.name.clone(), renamed: RenamedLabels::default() }
+    }
+
+    fn follow_plane_edit(&mut self, before: &Plane, after: &Plane) {
+        self.plane.clone_from(&after.name);
+        self.renamed.follow_plane_edit(before, after);
+    }
+
+    /// Put the finished polar `pol` (named after the plane it was submitted
+    /// for) on its plane in `project`.
+    fn apply(self, pol: &mut PlanePolar, project: &Project) {
+        let exists = |name: &str| project.planes.iter().any(|p| p.name == name);
+        // An undone rename leaves the plane under its submitted name.
+        if exists(&self.plane) || !exists(&pol.plane) {
+            pol.plane = self.plane;
+        }
+        if pol.manifest.is_some() {
+            // Labels renamed back by an undo restore to what they already are.
+            pol.renamed = self.renamed;
+        }
+    }
+}
+
+/// Finished or superseded background meshing is not interesting: the Jobs
+/// list hides it, unless it failed.
+fn shown_in_jobs_panel(job: &foiley_app::Job) -> bool {
+    !(job.background && matches!(job.status(), JobStatus::Done | JobStatus::Cancelled))
+}
+
+/// The plane targets of running 3D analyses.
+fn polar_targets(pending: &mut [PendingJob]) -> impl Iterator<Item = &mut PolarTarget> {
+    pending.iter_mut().filter_map(|p| match &mut p.action {
+        Pending::PlanePolar(target) => Some(target),
+        Pending::AutoPolarsThen(chain) => Some(&mut chain.2),
+        _ => None,
+    })
 }
 
 pub struct PendingJob {
@@ -111,6 +165,11 @@ pub struct App {
     pub details: HashMap<(String, String), Vec<PointDetail>>,
     pub point_detail: Option<PointDetail>,
     bottom_tab: usize,
+    headless: bool,
+    /// Persisted 3D viewport preferences (preserved across project replacements).
+    pub view3d_prefs: view3d::ViewPrefs,
+    /// App-owned OpenGL 3D renderer (explicitly destroyed in `on_exit`).
+    pub view3d_gl: Arc<Mutex<view3d::GlRenderer>>,
 }
 
 impl App {
@@ -127,6 +186,23 @@ impl App {
         });
         let project = Project::starter();
         let mut app = Self::from_project(project, jobs, dark);
+        if let Some(s) = cc.storage {
+            if let Some(v) = s.get_string("view3d_nav_preset") {
+                app.view3d_prefs.nav_preset = view3d::NavPreset::from_str(&v);
+            }
+            if let Some(v) = s.get_string("view3d_orbit_mode") {
+                app.view3d_prefs.orbit_mode = view3d::OrbitMode::from_str(&v);
+            }
+            if let Some(v) = s.get_string("view3d_perspective") {
+                app.view3d_prefs.perspective = v == "1";
+            }
+            if let Some(v) = s.get_string("view3d_show_grid") {
+                app.view3d_prefs.show_grid = v == "1";
+            }
+        }
+        if let Some(gl) = cc.gl.as_ref() {
+            app.view3d_gl.lock().unwrap().init(gl);
+        }
         app.module = module.unwrap_or(Module::FoilDesign);
         for f in files {
             let ext = f.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -155,14 +231,7 @@ impl App {
             }
         }
         if run_now && !app.project.planes.is_empty() {
-            // start the current 3D analysis definition of the first plane (fine panel mesh)
-            let mut plane = app.project.planes[0].clone();
-            for w in &mut plane.wings {
-                for s in &mut w.sections {
-                    s.nx = s.nx.max(20);
-                    s.ny = s.ny.max(30);
-                }
-            }
+            let plane = app.project.planes[0].clone();
             app.pui.def.method = foiley_plane::analysis::Method::Panel;
             app.pui.def.viscous = false;
             app.module = Module::PlaneAnalysis;
@@ -202,6 +271,9 @@ impl App {
             details: HashMap::new(),
             point_detail: None,
             bottom_tab: 0,
+            headless: false,
+            view3d_prefs: view3d::ViewPrefs::default(),
+            view3d_gl: Arc::new(Mutex::new(view3d::GlRenderer::default())),
         }
     }
 
@@ -233,17 +305,28 @@ impl App {
 
     fn snapshot_plane_geometry(&mut self) {
         self.snapshot();
-        self.pui.invalidate_mesh_key();
+        self.pui.invalidate_mesh_key(&self.jobs);
+    }
+
+    /// Rename foil `old` to `new` everywhere, including in running 3D analyses.
+    fn rename_foil(&mut self, old: &str, new: &str) {
+        self.project.rename_foil(old, new);
+        let renames = HashMap::from([(old.to_owned(), new.to_owned())]);
+        for target in polar_targets(&mut self.pending) {
+            target.renamed.follow_foil_renames(&renames);
+        }
     }
 
     fn invalidate_preview_inputs(&mut self) {
         self.foil_db = None;
-        self.pui.invalidate_mesh_key();
+        self.pui.invalidate_mesh_key(&self.jobs);
     }
 
     fn undo(&mut self) {
         if let Some(p) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.project, p));
+            let before = std::mem::replace(&mut self.project, p);
+            self.follow_plane_selection(&before);
+            self.redo.push(before);
             self.invalidate_preview_inputs();
             self.version.revision += 1;
             self.dirty = true;
@@ -252,11 +335,36 @@ impl App {
     }
     fn redo(&mut self) {
         if let Some(p) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.project, p));
+            let before = std::mem::replace(&mut self.project, p);
+            self.follow_plane_selection(&before);
+            self.undo.push(before);
             self.invalidate_preview_inputs();
             self.version.revision += 1;
             self.dirty = true;
         }
+    }
+
+    /// After undo or redo replaced `before` with `self.project`: keep the
+    /// selected plane selected (an undone deletion moves it) and refit the
+    /// 3D view unless it still shows the plane it was fitted to.
+    fn follow_plane_selection(&mut self, before: &Project) {
+        let planes = &self.project.planes;
+        // Where plane `i` of `before` is now.  A step that keeps the number
+        // of planes (an edit or a rename) moves none; one that adds or
+        // deletes a plane is followed by name.
+        let find = |i: usize| {
+            let name = &before.planes.get(i)?.name;
+            if planes.len() == before.planes.len() || planes.get(i).is_some_and(|p| &p.name == name) {
+                planes.get(i).map(|_| i)
+            } else {
+                planes.iter().position(|p| &p.name == name)
+            }
+        };
+        if let Some(i) = find(self.sel_plane) {
+            self.sel_plane = i;
+        }
+        self.sel_plane = self.sel_plane.min(planes.len().saturating_sub(1));
+        self.pui.cam.fitted_plane = self.pui.cam.fitted_plane.and_then(find);
     }
 
     pub fn notify(&mut self, msg: impl Into<String>, error: bool) {
@@ -319,6 +427,7 @@ impl App {
     }
 
     fn open_dialog(&mut self) {
+        if self.headless { return; }
         if let Some(p) = rfd::FileDialog::new().add_filter("Foiley project", &["foiley", "json"]).pick_file() {
             self.load_async(p);
         }
@@ -330,6 +439,7 @@ impl App {
     }
 
     fn save(&mut self, as_new: bool) {
+        if self.headless { return; }
         let path = if as_new || self.path.is_none() {
             match rfd::FileDialog::new().add_filter("Foiley project", &["foiley"]).set_file_name(format!("{}.foiley", self.project.name)).save_file() {
                 Some(p) => p,
@@ -396,6 +506,7 @@ impl App {
     }
 
     fn import_dialog(&mut self) {
+        if self.headless { return; }
         if let Some(files) = rfd::FileDialog::new()
             .add_filter("All supported", &["dat", "txt", "xml", "pol", "foiley", "json", "xfl", "fl5", "plr", "avl"])
             .add_filter("xflr5 / flow5 projects and polars", &["xfl", "fl5", "plr"])
@@ -435,18 +546,29 @@ impl App {
         }
         let mut done = Vec::new();
         for (i, pending) in self.pending.iter().enumerate() {
-            if let Some(j) = self.jobs.get(pending.id) {
-                if j.status().is_finished() {
-                    done.push(i);
-                }
+            // a job removed from the list ("Clear finished") counts as finished
+            if self.jobs.get(pending.id).is_none_or(|j| j.status().is_finished()) {
+                done.push(i);
             }
         }
         for i in done.into_iter().rev() {
             let PendingJob { id, generation, action: what } = self.pending.remove(i);
-            let Some(job) = self.jobs.get(id) else { continue };
-            let st = job.status();
-            let out = job.take_output();
+            let job = self.jobs.get(id);
+            let st = job.as_ref().map_or(JobStatus::Cancelled, |job| job.status());
+            let out = job.as_ref().and_then(|job| job.take_output());
             if generation != self.job_generation { continue; }
+            if matches!(what, Pending::BaseMeshHash) {
+                // A finished hash is valid even if the job was cancelled at
+                // the end; a cancelled job without one is asked for again.
+                let outcome = match (out, st) {
+                    (Some(JobOutput::MeshHash(hash)), _) => Some(Ok(hash)),
+                    (_, JobStatus::Cancelled) => None,
+                    _ => Some(Err("could not verify the base mesh")),
+                };
+                self.pui.finish_base_mesh_hash(id, outcome);
+                continue;
+            }
+            let Some(job) = job else { continue };
             match (st, out) {
                 (JobStatus::Done, Some(out)) | (JobStatus::Cancelled, Some(out)) => self.apply_output(generation, &job.title, what, out),
                 (JobStatus::Failed(e), _) => self.notify(format!("{} failed: {e}", job.title), true),
@@ -494,12 +616,14 @@ impl App {
                 for p in pols {
                     self.project.add_foil_polar(p);
                 }
-                let (plane, def) = *b;
+                let (plane, def, target) = *b;
                 let db = self.foil_db();
-                let t = format!("{} - {}", plane.name, def.name);
-                self.submit(t, JobKind::PlanePolar { plane, db: (*db).clone(), def }, Pending::PlanePolar);
+                let t = format!("{} - {}", target.plane, def.name);
+                self.submit(t, JobKind::PlanePolar { plane, db: (*db).clone(), def }, Pending::PlanePolar(target));
             }
-            (Pending::PlanePolar, JobOutput::PlanePolar(pol)) => {
+            (Pending::PlanePolar(target), JobOutput::PlanePolar(pol)) => {
+                let mut pol = *pol;
+                target.apply(&mut pol, &self.project);
                 self.snapshot();
                 let msg = format!("{}: {} points ({} unknowns){}", pol.name, pol.points.len(), pol.unknowns, if pol.failed.is_empty() { String::new() } else { format!(", {} failed", pol.failed.len()) });
                 let key = (pol.plane.clone(), pol.name.clone());
@@ -540,8 +664,9 @@ impl App {
                 }
                 None => self.notify(format!("{title}: plane '{plane}' no longer exists"), true),
             },
-            (Pending::Mesh(key), JobOutput::Mesh(m)) if self.pui.mesh_job.map(|(_, pending_key)| pending_key) == Some(key) => {
-                self.pui.mesh = Some((key, m));
+            (Pending::Mesh(key), JobOutput::Mesh { mesh, hash }) if self.pui.mesh_job.map(|(_, pending_key)| pending_key) == Some(key) => {
+                self.pui.mesh = Some((key, mesh));
+                self.pui.mesh_hash = Some(hash);
                 self.pui.mesh_job = None;
             }
             _ => {}
@@ -627,6 +752,14 @@ impl App {
                     let name = self.project.planes[i].name.clone();
                     self.project.planes.remove(i);
                     self.project.plane_polars.retain(|p| p.plane != name);
+                    if i < self.sel_plane {
+                        self.sel_plane -= 1;
+                    }
+                    self.pui.cam.fitted_plane = self.pui.cam.fitted_plane.and_then(|fitted| match fitted.cmp(&i) {
+                        std::cmp::Ordering::Less => Some(fitted),
+                        std::cmp::Ordering::Equal => None,
+                        std::cmp::Ordering::Greater => Some(fitted - 1),
+                    });
                     self.sel_plane = self.sel_plane.min(self.project.planes.len().saturating_sub(1));
                 }
                 if ui.button("+ New plane").on_hover_text("Default glider: wing, elevator, fin").clicked() {
@@ -671,8 +804,7 @@ impl App {
         ui.separator();
         if self.bottom_tab == 0 {
             egui::ScrollArea::vertical().id_salt("jobs").auto_shrink([false, false]).show(ui, |ui| {
-                // finished background meshing is not interesting: hide it
-                let jobs: Vec<_> = self.jobs.jobs().iter().rev().filter(|j| !(j.kind == "mesh" && j.status() == JobStatus::Done)).cloned().collect();
+                let jobs: Vec<_> = self.jobs.jobs().iter().rev().filter(|j| shown_in_jobs_panel(j)).cloned().collect();
                 if jobs.is_empty() {
                     widgets::hint(ui, "No jobs yet. Analyses run here in the background; the window stays responsive and every job can be cancelled.");
                 }
@@ -740,7 +872,7 @@ impl eframe::App for App {
         }
         self.process_jobs();
         // crash safety: autosave every 3 minutes when modified
-        if self.dirty && self.autosave_at.elapsed() > Duration::from_secs(180) && !self.io_busy {
+        if !self.headless && self.dirty && self.autosave_at.elapsed() > Duration::from_secs(180) && !self.io_busy {
             self.autosave_at = Instant::now();
             self.save_to(std::env::temp_dir().join("foiley_autosave.foiley"), true);
         }
@@ -758,8 +890,10 @@ impl eframe::App for App {
         if y && !ctx.wants_keyboard_input() {
             self.redo();
         }
-        let title = format!("Foiley Studio - {}{}", self.path.as_ref().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone()), if self.dirty { " *" } else { "" });
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if !self.headless {
+            let title = format!("Foiley Studio - {}{}", self.path.as_ref().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone()), if self.dirty { " *" } else { "" });
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
 
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -786,7 +920,7 @@ impl eframe::App for App {
                         self.import_dialog();
                     }
                     let recovery = std::env::temp_dir().join("foiley_autosave.foiley");
-                    if recovery.exists() && ui.button("Recover autosave").clicked() {
+                    if !self.headless && recovery.exists() && ui.button("Recover autosave").clicked() {
                         ui.close();
                         self.load_async(recovery);
                     }
@@ -856,10 +990,19 @@ impl eframe::App for App {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("dark", if self.dark { "1".into() } else { "0".into() });
+        storage.set_string("view3d_nav_preset", self.view3d_prefs.nav_preset.as_str().into());
+        storage.set_string("view3d_orbit_mode", self.view3d_prefs.orbit_mode.as_str().into());
+        storage.set_string("view3d_perspective", if self.view3d_prefs.perspective { "1".into() } else { "0".into() });
+        storage.set_string("view3d_show_grid", if self.view3d_prefs.show_grid { "1".into() } else { "0".into() });
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         self.jobs.cancel_all();
+        if let Some(gl) = gl {
+            if let Ok(mut renderer) = self.view3d_gl.lock() {
+                renderer.destroy(gl);
+            }
+        }
     }
 }
 
@@ -893,6 +1036,11 @@ pub fn error_dialog(text: &str) {
     rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Foiley").set_description(text).set_buttons(rfd::MessageButtons::Ok).show();
 }
 
+fn file_dialog(ctx: &egui::Context) -> Option<rfd::FileDialog> {
+    let headless = ctx.data(|data| data.get_temp::<bool>(egui::Id::new("foiley_snap"))).unwrap_or_default();
+    (!headless).then(rfd::FileDialog::new)
+}
+
 /// Import a file into the project.  xflr5 / flow5 projects, .plr polars and
 /// AVL geometry return their full conversion report as the message.
 fn import_file(p: &mut Project, f: &std::path::Path) -> Result<String, String> {
@@ -910,6 +1058,68 @@ mod review_regressions {
 
     fn app() -> App {
         App::from_project(Project::starter(), JobManager::new(1), true)
+    }
+
+    #[test]
+    fn undo_and_redo_keep_the_selected_plane_and_its_camera_fit() {
+        let mut app = app();
+        let mut b = app.project.planes[0].clone();
+        b.name = "B".into();
+        b.wings[0].sections[1].y *= 2.0;
+        app.project.planes.push(b);
+        app.sel_plane = 1;
+        app.pui.cam.fitted_plane = Some(1);
+        // delete plane 0 the way the explorer does
+        app.snapshot_plane_geometry();
+        app.project.planes.remove(0);
+        app.sel_plane = 0;
+        app.pui.cam.fitted_plane = Some(0);
+
+        app.undo();
+        assert_eq!(app.project.planes.len(), 2);
+        assert_eq!(app.project.planes[app.sel_plane].name, "B", "undo moved the view to another plane");
+        assert_eq!(app.pui.cam.fitted_plane, Some(app.sel_plane), "the view lost (or kept a wrong) fit");
+        app.redo();
+        assert_eq!((app.sel_plane, app.pui.cam.fitted_plane), (0, Some(0)));
+        assert_eq!(app.project.planes[0].name, "B");
+
+        // undoing a rename keeps the framing
+        app.snapshot();
+        app.project.planes[0].name = "B renamed".into();
+        app.undo();
+        assert_eq!((app.sel_plane, app.pui.cam.fitted_plane), (0, Some(0)));
+
+        // undoing the plane on screen: another plane is shown, and fitted again
+        app.snapshot();
+        let mut c = app.project.planes[0].clone();
+        c.name = "C".into();
+        app.project.planes.push(c);
+        app.sel_plane = 1;
+        app.pui.cam.fitted_plane = Some(1);
+        app.undo();
+        assert_eq!(app.sel_plane, 0);
+        assert_eq!(app.pui.cam.fitted_plane, None);
+    }
+
+    #[test]
+    fn superseded_background_jobs_are_hidden_and_not_logged() {
+        let mut app = app();
+        // the long polar holds the one compute thread, so both are cancelled before they finish
+        let sweep = foiley_foil::Sweep::Alpha { from: -10.0, to: 15.0, step: 0.05 };
+        let polar = app.jobs.submit("polar", JobKind::FoilPolar { foil: foiley_foil::Foil::naca("0012").unwrap(), settings: AnalysisSettings::default(), sweep });
+        let plane = app.project.planes[0].clone();
+        let db = (*app.foil_db()).clone();
+        let options = foiley_plane::mesh::MeshOptions::default();
+        let mesh = app.jobs.submit("verify mesh", JobKind::MeshHash { plane, db, options, foils: Default::default() });
+        app.jobs.cancel_all();
+        for job in [&polar, &mesh] {
+            assert_eq!(app.jobs.wait(job.id, |_| {}), JobStatus::Cancelled);
+        }
+        app.process_jobs();
+        assert!(shown_in_jobs_panel(&polar));
+        assert!(!shown_in_jobs_panel(&mesh), "a superseded mesh check stays in the Jobs list");
+        let cancelled: Vec<_> = app.log.iter().filter(|line| line.text == "cancelled").map(|line| line.job.as_str()).collect();
+        assert_eq!(cancelled, ["polar"], "only the user's analysis is reported as cancelled");
     }
 
     #[test]
@@ -1041,7 +1251,7 @@ mod review_regressions {
         let mut app = app();
         let old = app.job_generation;
         let plane = app.project.planes[0].clone();
-        app.track_job(123, Pending::AutoPolarsThen(Box::new((plane.clone(), PlanePolarDef::default()))));
+        app.track_job(123, Pending::AutoPolarsThen(Box::new((plane.clone(), PlanePolarDef::default(), PolarTarget::new(&plane)))));
         assert_eq!(app.pending[0].generation, old);
         assert!(app.current_job(123));
         app.replace_project(Project::new("successor"), None, false);
@@ -1049,7 +1259,8 @@ mod review_regressions {
         let polar = FoilPolar { foil: "old foil".into(), ..Default::default() };
         app.apply_output(old, "old 2D", Pending::FoilPolar, JobOutput::FoilPolar { polar: polar.clone(), details: vec![PointDetail::default()] });
         app.apply_output(old, "old batch", Pending::Batch, JobOutput::Batch(vec![polar.clone()]));
-        app.apply_output(old, "old chain", Pending::AutoPolarsThen(Box::new((plane, PlanePolarDef::default()))), JobOutput::Batch(vec![polar]));
+        let target = PolarTarget::new(&plane);
+        app.apply_output(old, "old chain", Pending::AutoPolarsThen(Box::new((plane, PlanePolarDef::default(), target))), JobOutput::Batch(vec![polar]));
         app.apply_output(old, "old point", Pending::FoilPoint, JobOutput::FoilPoint(Some(PointDetail::default())));
         app.apply_output(old, "old CAD", Pending::CadImport { plane: "successor".into() }, JobOutput::CadImport(foiley_app::CadImportResult { body: 0, name: "stale".into(), triangles: vec![], notes: vec![] }));
         assert!(app.project.foil_polars.is_empty());
@@ -1063,7 +1274,8 @@ mod review_regressions {
     fn completed_pending_job_is_collected_without_applying_to_loaded_project() {
         let mut app = app();
         let plane = app.project.planes[0].clone();
-        app.submit("automatic batch".into(), JobKind::Batch { foils: vec![], cases: vec![], settings: AnalysisSettings::default(), sweep: foiley_foil::Sweep::AlphaList(vec![]) }, Pending::AutoPolarsThen(Box::new((plane, PlanePolarDef::default()))));
+        let target = PolarTarget::new(&plane);
+        app.submit("automatic batch".into(), JobKind::Batch { foils: vec![], cases: vec![], settings: AnalysisSettings::default(), sweep: foiley_foil::Sweep::AlphaList(vec![]) }, Pending::AutoPolarsThen(Box::new((plane, PlanePolarDef::default(), target))));
         let id = app.pending[0].id;
         app.jobs.wait(id, |_| {});
         assert!(app.jobs.get(id).unwrap().has_output());

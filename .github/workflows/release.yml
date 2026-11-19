@@ -62,7 +62,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --profile dist --locked -p foiley-cli
+        run: cargo build --profile dist --locked -p foiley-cli --no-default-features --features gui
 
       - name: Smoke test
         run: |

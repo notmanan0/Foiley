@@ -12,6 +12,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod launch;
 mod legacy;
 mod progress_ui;
+#[cfg(feature = "snap")]
+mod snap;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use foiley_app::{auto, JobKind, JobManager, JobOutput, Project};
@@ -88,6 +90,9 @@ enum Cmd {
         #[arg(long)]
         run: bool,
     },
+    /// Capture Foiley Studio images and motion traces without opening a window
+    #[cfg(feature = "snap")]
+    Snap(snap::SnapArgs),
 }
 
 #[cfg(feature = "gui")]
@@ -835,12 +840,33 @@ fn command_names() -> Vec<String> {
     names
 }
 
+/// The subcommand `args` invoke: the first argument after the global
+/// options, parsed by clap from `Cli`'s own global option definitions.
+#[cfg(feature = "snap")]
+fn invoked_subcommand(args: &[OsString]) -> Option<String> {
+    let cli = <Cli as clap::CommandFactory>::command();
+    let globals = clap::Command::new("foiley")
+        .args(cli.get_arguments().filter(|arg| arg.is_global_set()).cloned())
+        .allow_external_subcommands(true)
+        .disable_help_flag(true)
+        .disable_version_flag(true);
+    globals.try_get_matches_from(args).ok()?.subcommand_name().map(String::from)
+}
+
 fn real_main() -> Result<(), String> {
     #[cfg_attr(not(feature = "gui"), allow(unused_mut))]
     let mut args: Vec<OsString> = std::env::args_os().collect();
     #[cfg(feature = "gui")]
     launch::route(&mut args, &command_names());
-    let cli = Cli::parse_from(args);
+    let cli = Cli::try_parse_from(&args).unwrap_or_else(|error| {
+        // `foiley snap` documents exit status 1 for argument errors
+        #[cfg(feature = "snap")]
+        if error.use_stderr() && invoked_subcommand(&args).as_deref() == Some("snap") {
+            let _ = error.print();
+            std::process::exit(1);
+        }
+        error.exit()
+    });
     let Some(cmd) = cli.cmd else {
         if !std::io::stdin().is_terminal() {
             legacy::run(None, cli.verbose);
@@ -853,6 +879,11 @@ fn real_main() -> Result<(), String> {
     #[cfg(feature = "gui")]
     let cmd = match cmd {
         Cmd::Studio { files, module, run } => return launch::studio(foiley_gui::Launch { files, module: module.map(Into::into), run, threads: cli.threads }),
+        #[cfg(feature = "snap")]
+        Cmd::Snap(snap) => {
+            snap.run(cli.threads);
+            return Ok(());
+        }
         cmd => cmd,
     };
     let mut mgr = JobManager::new(cli.threads);
@@ -1430,7 +1461,7 @@ fn real_main() -> Result<(), String> {
                         if proj.planes.iter().all(|p| p.name != plane.name) {
                             proj.planes.push(plane);
                         }
-                        proj.add_plane_polar(pol);
+                        proj.add_plane_polar(*pol);
                         proj.save(&path)?;
                         eprintln!("  saved {}", path.display());
                     }
@@ -1440,6 +1471,8 @@ fn real_main() -> Result<(), String> {
         Cmd::Run { script } => run_script(&mut mgr, &mut ui, &script)?,
         #[cfg(feature = "gui")]
         Cmd::Studio { .. } => unreachable!("Studio returned above"),
+        #[cfg(feature = "snap")]
+        Cmd::Snap(_) => unreachable!("snap returned above"),
     }
     Ok(())
 }
@@ -1608,7 +1641,7 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
                             std::fs::write(d.join(format!("{}_{}_strips.csv", pol.plane.replace(' ', "_"), pol.name)), strips_csv(&pol)).map_err(|e| e.to_string())?;
                         }
                     }
-                    proj.add_plane_polar(pol);
+                    proj.add_plane_polar(*pol);
                 }
             }
         }
@@ -1627,5 +1660,27 @@ fn main() {
             eprintln!("error: {e}");
             std::process::exit(if e == "cancelled" { 130 } else { 1 });
         }
+    }
+}
+
+#[cfg(all(test, feature = "snap"))]
+mod tests {
+    use super::*;
+
+    fn args(line: &str) -> Vec<OsString> {
+        std::iter::once("foiley").chain(line.split_whitespace()).map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_invoked_subcommand_follows_the_global_options() {
+        let sub = |line| invoked_subcommand(&args(line));
+        assert_eq!(sub("snap --bogus").as_deref(), Some("snap"));
+        assert_eq!(sub("--threads 2 -qv snap --bogus").as_deref(), Some("snap"));
+        assert_eq!(sub("--threads=2 --json-progress snap").as_deref(), Some("snap"));
+        // a file or value called "snap" is not the snap command
+        assert_eq!(sub("run snap --bogus").as_deref(), Some("run"));
+        assert_eq!(sub("plane polar snap --bogus").as_deref(), Some("plane"));
+        assert_eq!(sub("--threads snap run").as_deref(), None);
+        assert_eq!(sub("").as_deref(), None);
     }
 }

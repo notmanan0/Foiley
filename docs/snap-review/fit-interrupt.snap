@@ -1,0 +1,9 @@
+settle
+hover vp:0.5,0.5
+trace fit-interrupt
+key 7
+wait 3
+key f
+wait 14
+end
+snap fit-after viewport

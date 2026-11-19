@@ -68,6 +68,24 @@ the release text.
 build portable binaries; the SIMD kernels detect CPU features at run time.
 Use `cargo build --profile dist` for a fully optimised (fat LTO) release.
 
+### Headless Studio captures
+
+Source builds include `foiley snap`. It runs Studio without a desktop window
+and writes PNGs and a JSON manifest.
+
+```sh
+cargo snap --preset views
+cargo snap --module plane --nav cad --do "settle; trace orbit; drag mmb vp:0.5,0.5 400 0 24; end" --gif
+cargo snap project.foiley --module 3d --script capture.snap --out target/snap/example
+```
+
+`foiley snap --help` lists the steps and options. The headless viewport
+uses the CPU painter. Egui rasterizes the result with wgpu and records the
+adapter in the manifest. Windows can use WARP, and Linux can use a Mesa
+software adapter when one is available. The published archives omit snap
+to keep their download size down. The [viewport checks](docs/snap-review/README.md)
+include scripts for recording the review cases.
+
 ## Layout
 
 | crate | contents |
@@ -178,6 +196,30 @@ the Jobs and Log panel is always visible at the bottom.
   dimensional and non-dimensional derivatives; state matrices; root locus.
   Modal time responses, and forced responses to step, pulse, doublet or
   sine control inputs (T7 gains give the control derivatives).
+
+### 3D viewport
+
+Plane Design and 3D Analysis use a world-space orbit camera with a target,
+distance, yaw and pitch. It fits the aircraft's bounding sphere when you
+select a plane and keeps the same framing as you orbit. The viewport offers
+perspective and orthographic projection, Z-up turntable and free trackball,
+and wheel zoom toward the cursor.
+
+Standard navigation uses left-drag to orbit, right-drag to pan and the
+wheel to zoom. CAD/Blender navigation uses middle-drag to orbit, Shift +
+middle-drag to pan and Ctrl + middle-drag to zoom. Keys 1, 3 and 7 select
+front, side and top views, with Ctrl or Shift for the opposite. 5 switches
+projection, F fits the aircraft, G toggles the grid, and R or 0 resets the
+view. Studio saves these preferences.
+
+OpenGL uses a depth buffer to hide edges behind surfaces. Studio uses its
+CPU painter if viewport GL setup fails. Set `FOILEY_VIEW3D_CPU=1` to force it.
+A ray from the cursor selects wings or bodies in Plane Design and reads
+panel pressure in 3D Analysis. The toolbar, clickable orientation gizmo and
+ground grid accompany labelled CoG, point-mass and neutral-point markers.
+Analysis overlays require a manifest matching the geometry and, for mesh-based
+methods, the mesh hash. A mismatch shows the geometry and a notice. LLT
+loads are drawn at their own stations.
 
 `foiley studio project.foiley --module 3d` opens a project in a given
 workspace. File › Import also reads xflr5 `.xfl`, flow5 `.fl5`, `.plr` and

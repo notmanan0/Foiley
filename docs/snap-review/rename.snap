@@ -1,0 +1,9 @@
+settle
+scroll 210 vp:0.6,0.57
+wait 20
+snap before-name viewport
+click 340,47
+key ctrl+a
+text "Renamed plane"
+settle
+snap after-name viewport

@@ -1,0 +1,6 @@
+settle
+snap before-rerun viewport
+click 1249,73
+click "Run analysis"
+settle
+snap after-rerun viewport

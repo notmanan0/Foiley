@@ -214,7 +214,7 @@ impl App {
                     }
                 });
                 if ui.button("Load .dat files...").on_hover_text("Selig or Lednicer coordinate files; clockwise files are reordered automatically").clicked() {
-                    if let Some(files) = rfd::FileDialog::new().add_filter("Airfoil", &["dat", "txt"]).pick_files() {
+                    if let Some(files) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.add_filter("Airfoil", &["dat", "txt"]).pick_files()) {
                         self.snapshot_foil_geometry();
                         for p in files {
                             match Foil::load(&p) {
@@ -467,7 +467,7 @@ impl App {
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Export .dat...").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{}.dat", foil.name)).save_file() {
+                        if let Some(p) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}.dat", foil.name)).save_file()) {
                             if let Err(e) = foil.save(&p) {
                                 self.notify(e.to_string(), true);
                             }
@@ -476,27 +476,7 @@ impl App {
                     let mut name = foil.name.clone();
                     if ui.add(egui::TextEdit::singleline(&mut name).desired_width(120.0)).on_hover_text("rename (updates polars and wings using it)").lost_focus() && name != foil.name && !name.trim().is_empty() && self.project.foil(&name).is_none() {
                         self.snapshot_foil_geometry();
-                        let old = foil.name.clone();
-                        if let Some(f) = self.project.foils.iter_mut().find(|f| f.name == old) {
-                            f.name = name.clone();
-                        }
-                        for p in &mut self.project.foil_polars {
-                            if p.foil == old {
-                                p.foil = name.clone();
-                            }
-                        }
-                        for pl in &mut self.project.planes {
-                            for w in &mut pl.wings {
-                                for s in &mut w.sections {
-                                    if s.foil_left == old {
-                                        s.foil_left = name.clone();
-                                    }
-                                    if s.foil_right == old {
-                                        s.foil_right = name.clone();
-                                    }
-                                }
-                            }
-                        }
+                        self.rename_foil(&foil.name, &name);
                         self.sel_foil = Some(name);
                     }
                 });
@@ -788,13 +768,13 @@ impl App {
                         r.on_hover_text(format!("{} points, {} not converged\n{}", p.points.len(), p.failed.len(), if p.failed.is_empty() { String::new() } else { format!("not converged at {:?}", p.failed) }));
                         ui.menu_button("...", |ui| {
                             if ui.button("Export CSV").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.csv", p.export_stem())).save_file() {
+                                if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}.csv", p.export_stem())).save_file()) {
                                     let _ = std::fs::write(path, p.to_csv());
                                 }
                                 ui.close();
                             }
                             if ui.button("Export XFoil text").clicked() {
-                                if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.txt", p.export_stem())).save_file() {
+                                if let Some(path) = crate::file_dialog(ui.ctx()).and_then(|dialog| dialog.set_file_name(format!("{}.txt", p.export_stem())).save_file()) {
                                     let _ = std::fs::write(path, p.to_xfoil_text());
                                 }
                                 ui.close();

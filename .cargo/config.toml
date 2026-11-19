@@ -1,2 +1,5 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+[alias]
+snap = "run -p foiley-cli -- snap"
