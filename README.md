@@ -92,7 +92,7 @@ include scripts for recording the review cases.
 |---|---|
 | `foiley` (repo root, `src/`) | the XFoil 6.99 engine: panel method, boundary layer, Newton solver, GDES/QDES/MDES. The regression tests can still select 6.97 numerics to compare with the 6.97 Fortran (F015 matrix); Foiley's pipelined, fine-parallel, scalar and AVX2 paths are bit-identical to its own sequential run. |
 | `crates/core` | `Vec3`, progress and cancellation handles, dense LU and eigenvalues (faer, multithreaded), interpolation, ISA atmosphere |
-| `crates/foil` | `Foil` geometry and file I/O (Selig and Lednicer .dat), NACA 4/5 digit, every XFoil design operation as a function, inverse design (QDES/MDES), the optimiser (MOPSO/GA), the 2D analysis service with convergence recovery, polar types 1/2/3/4/6, batch polar meshes |
+| `crates/foil` | `Foil` geometry and file I/O (Selig and Lednicer .dat), generators (NACA 4/5-digit, 4-digit modified, 16-, 6- and 6A-series, CST, PARSEC, Kármán–Trefftz, cambered plates; see [docs/airfoil-families.md](docs/airfoil-families.md)), every XFoil design operation as a function, inverse design (QDES/MDES), the optimiser (MOPSO/GA), the 2D analysis service with convergence recovery, polar types 1/2/3/4/6, batch polar meshes |
 | `crates/plane` | plane/wing/fuselage model (elliptic, NURBS, STL/STEP), reference dimensions, inertia, meshing (thin and thick, quads or triangles, flaps, tips, fuselage), LLT, VLM1, VLM2 with optional free wake, source/doublet panel methods, polar types T1 to T8, trim, stability and control derivatives, modes, time responses, XML/AVL/STL exchange |
 | `crates/app` | project file (`.foiley`, JSON), imports (including xflr5 `.xfl`, flow5 `.fl5`, `.plr`), automatic 2D polar meshes for 3D runs, the background **job manager** |
 | `crates/cli` | the `foiley` binary: command line, XFoil mode, start-up routing; links `crates/gui` (feature `gui`, on by default) |
@@ -131,6 +131,13 @@ foiley foil design naca0012 --flap 0.7,0.5,10 --thickness 0.10 --te-gap 0.002 -o
 foiley foil inverse naca2412 --alpha 2 --segment upper,0.3,0.7 --scale 0.97 -o inv.dat   # QDES
 foiley foil inverse naca2412 --mode full --segment lower,0.2,0.7 --bump 0.03 -o inv.dat  # MDES
 foiley foil optimize naca0012 --re 5e5 --alpha 3 --objectives "cl/cd:max,cm:0" -o best.dat
+foiley foil optimize naca2412 --shape cst --cst-order 5 --alpha 4 -o best.dat  # CST weights
+foiley foil gen naca "64(2)-415" -o 642415.dat      # also 23112, 0012-64, 16-212, 64A010, "2412 closed TE"
+foiley foil gen cst --upper 0.17,0.16,0.15 --lower=-0.17,-0.16,-0.15 -o cst.dat
+foiley foil gen parsec --rle 0.012 --upper 0.35,0.075,-0.6 --te 0,0.002,4,10 -o parsec.dat
+foiley foil gen kt --x-center 0.08 --y-center 0.05 --te-angle 10 --exact 0,4   # exact inviscid CL, Cm
+foiley foil gen plate --thickness 0.02 --camber 0.05 --save models.foiley
+foiley foil fit-cst e387.dat --order 8 --json > e387-cst.json
 
 foiley plane info glider.xml                     # xflr5 / flow5 XML or a .foiley project
 foiley plane analyze glider.xml --type t2 --method vlm2 --range=-2:10:1 --strips span.csv
@@ -148,7 +155,8 @@ foiley < script.xfoil                            # XFoil-compatible menu mode
 
 * Missing 2D polars for viscous or LLT 3D runs are computed automatically
   over the Reynolds range the analysis needs (`--auto-polars N`).
-* NACA foils referenced by an imported plane are generated automatically.
+* NACA foils referenced by an imported plane are generated automatically,
+  in every family Foiley generates.
 * Batch and scripted 2D CSV filenames include a hash of the foil and run
   settings, so runs at nearby Reynolds numbers produce separate files.
   An explicit `-o` path keeps the filename you supply.
@@ -162,13 +170,18 @@ There are five workspaces: **Foil design**, **2D analysis**, **Plane design**,
 the Jobs and Log panel is always visible at the bottom.
 
 * **Foil design.**
+  * **Create** generates NACA 4/5-digit (standard, reflexed, any design CL,
+    closed TE), 4-digit modified, 16-, 6- and 6A-series sections, CST,
+    PARSEC, Kármán–Trefftz and cambered-plate foils with a live preview.
+    *Fit to selected foil* fits CST weights to a foil, and *Edit
+    parameters* reopens the recipe of a generated foil.
   * Every geometric operation is previewed as an overlay before you apply it
     or save it as a new foil: flap, thickness and camber, max-point positions,
     LE radius, TE gap, repanelling, normalisation, interpolation.
   * **Inverse design** (mixed QDES / full MDES): plot the surface speed,
     scale, bump or smooth a segment, see the target, and solve.
   * **Optimiser** (MOPSO particle swarm or genetic algorithm) with
-    Hicks–Henne bumps and an optional flap, on Cl, Cd, Cl/Cd, Cpmin and Cm
+    Hicks–Henne bumps or CST weights and an optional flap, on Cl, Cd, Cl/Cd, Cpmin and Cm
     (minimise, maximise or target). The best design and the score history
     update live.
 * **2D analysis.** Polar types 1/2/3/4/6 and single points.
@@ -231,9 +244,10 @@ approximated and skipped, and why); `foiley project` prints the same report.
 | area | status |
 |---|---|
 | XFoil direct analysis, polar types 1/2/3/4/6, Cp and boundary layer, batch polar meshes | ✔ |
+| Foil generators: NACA 4/5-digit (incl. reflexed, any CL, closed TE), 4-digit modified, 16-, 6- and 6A-series; CST with least-squares fitting; PARSEC; Kármán–Trefftz with exact solution; cambered plates | ✔ (beyond xflr5, which generates NACA 4/5-digit only) |
 | Foil design: NACA, flap, TE gap, LE radius, thickness/camber, max-point positions, repanel, derotate/normalise, interpolation | ✔ |
 | Mixed and full inverse design (QDES / MDES) | ✔ GUI and CLI (all other XFoil menus via `foiley xfoil`) |
-| Foil optimiser: MOPSO and genetic algorithm, Hicks–Henne bumps, flap, multi-objective with Pareto archive | ✔ |
+| Foil optimiser: MOPSO and genetic algorithm, Hicks–Henne bumps or CST weights, flap, multi-objective with Pareto archive | ✔ |
 | Planes: multi-section wings, dihedral, twist, sweep, fins, flaps (control surfaces), point masses, inertia | ✔ |
 | Fuselages: elliptic frames, NURBS (xflr5/flow5 frames), STL and STEP surfaces | ✔ (STEP: B-spline/NURBS surfaces and planar faces; other analytic surface types are skipped with a note) |
 | LLT, VLM1, VLM2, 3D panels on quads and triangles, Galerkin linear-doublet triangles, ground effect | ✔ |
@@ -264,6 +278,18 @@ in xflr5 and flow5; use VLM or panels for swept or dihedral wings.
 * Cancellation and invalid inputs return errors and never hang.
 * Inverse design: a mixed inverse changes only the targeted segment.
 * Optimiser: NACA 0012 Cl/Cd improves (53 → 73 in a short run).
+
+**Airfoil generators** ([docs/airfoil-families.md](docs/airfoil-families.md))
+
+* The 5-digit (standard and reflexed), 4-digit modified, 16-, 6- and
+  6A-series generators match the ordinates of NASA Langley's NACA4 and NACA6
+  programs within 1.6e-5 of chord aft of x/c = 0.0125 (5-decimal tables).
+* All 10,500 codes XFoil generates (any 1- to 4-digit code, 210xx-250xx)
+  are bit-identical to Foiley 1.1.
+* XFoil's inviscid CL on Kármán–Trefftz sections is within 0.3% of the exact
+  conformal-map solution, and Cm within 4e-4.
+* CST fits of NACA 2412 (order 8) are within 2e-4 of chord.
+* One section of every family converges in a viscous polar at Re 1e6.
 
 **3D panel kernels**
 
@@ -368,6 +394,10 @@ It needs more memory and computation than `tripanel`; start with fewer panels.
 ## Reference sources
 
 The specs used for this work were taken from:
+
+* **NACA families:** Abbott & von Doenhoff; NASA TM-4741; Ralph Carmichael's
+  public-domain NACA456 (pdas.com), whose 6-series ε/ψ tables Foiley
+  embeds, and whose NASA reference outputs are the test fixtures.
 
 * **flow5:** github.com/techwinder/flow5, cloned into `refsrc/` (git-ignored).
 * **xflr5 v6.61:** github.com/polmes/xflr5-ubuntu, a source mirror; xflr5

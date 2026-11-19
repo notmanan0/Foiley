@@ -266,7 +266,7 @@ struct RawPolar {
 
 fn push_foil(imp: &mut LegacyImport, f: RawFoil) {
     let name = if f.name.trim().is_empty() { format!("Foil {}", imp.foils.len() + 1) } else { f.name.trim().to_string() };
-    let foil = Foil { name: name.clone(), x: f.x, y: f.y, hinge: if f.te_flap { Some(f.hinge) } else { None }, note: f.desc };
+    let foil = Foil { name: name.clone(), x: f.x, y: f.y, hinge: if f.te_flap { Some(f.hinge) } else { None }, note: f.desc, recipe: None };
     if let Err(e) = foil.validate() {
         imp.warnings.push(format!("foil '{name}' skipped: {e}"));
         return;

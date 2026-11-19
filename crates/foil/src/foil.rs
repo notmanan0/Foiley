@@ -1,8 +1,9 @@
 //! Airfoil geometry.
 
+use crate::gen::Recipe;
 use crate::FoilError;
 use foiley::cli::{Input, Session};
-use foiley::geom::{geopar, naca4, naca5};
+use foiley::geom::geopar;
 use foiley::spline::{scalc, segspl, seval, sinvrt};
 use foiley::xfoil::{XFoil, IBX, IQX};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,10 @@ pub struct Foil {
     /// Free-form description / provenance ("NACA 2412", "flap 10 deg"...).
     #[serde(default)]
     pub note: String,
+    /// How the shape was generated (NACA designation, CST weights, ...), so
+    /// editors can reopen it.  Operations that change the shape clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<Recipe>,
 }
 
 /// Geometric properties of a foil.
@@ -43,6 +48,13 @@ pub struct FoilProps {
     pub te_angle: f64,
     /// cross-section area / chord^2
     pub area: f64,
+}
+
+/// Whether a .dat title must be written in quotes to read back unchanged:
+/// its first two tokens would read as a point, or it is itself quoted.
+fn title_needs_quotes(name: &str) -> bool {
+    let numeric = name.split(|c: char| c.is_whitespace() || c == ',' || c == ';').filter(|t| !t.is_empty()).take(2).filter(|t| t.parse::<f64>().is_ok()).count() == 2;
+    numeric || (name.len() >= 2 && name.starts_with('"') && name.ends_with('"'))
 }
 
 /// 1-based copy (index 0 unused) as the XFoil engine expects.
@@ -103,7 +115,7 @@ impl SurfaceSpline {
 
 impl Foil {
     pub fn new(name: impl Into<String>, x: Vec<f64>, y: Vec<f64>) -> Result<Foil, FoilError> {
-        let f = Foil { name: name.into(), x, y, hinge: None, note: String::new() };
+        let f = Foil { name: name.into(), x, y, hinge: None, note: String::new(), recipe: None };
         f.validate()?;
         Ok(f)
     }
@@ -127,6 +139,10 @@ impl Foil {
         if self.x.iter().chain(&self.y).any(|v| !v.is_finite()) {
             return Err(FoilError::Geometry("coordinates contain NaN or infinite values".into()));
         }
+        // lengths, areas and spline sums of larger values overflow
+        if self.x.iter().chain(&self.y).any(|v| v.abs() > 1e6) {
+            return Err(FoilError::Geometry("coordinates larger than 1e6 in magnitude".into()));
+        }
         let chord = self.x.iter().cloned().fold(f64::MIN, f64::max) - self.x.iter().cloned().fold(f64::MAX, f64::min);
         if chord <= 1e-9 {
             return Err(FoilError::Geometry("zero chord".into()));
@@ -134,23 +150,27 @@ impl Foil {
         Ok(())
     }
 
-    /// NACA 4- or 5-digit section ("2412", "0012", "23012").
+    /// A NACA section from its designation: 4-digit ("2412"), 5-digit
+    /// ("23012", reflexed "23112", any design CL "43012"), 4-digit modified
+    /// ("0012-64"), 16-series ("16-212"), 6-series ("63-206", "64(2)-415",
+    /// "65-415 a=0.5") or 6A-series ("64A010"); "closed TE" after a 4- or
+    /// 5-digit code closes its trailing edge.  See [`crate::gen::naca::parse`].
+    ///
+    /// The codes XFoil's NACA command accepts (4-digit, 210xx-250xx) give
+    /// exactly the geometry of earlier Foiley versions.
+    ///
+    /// Codes that do not parse but are digits joined only by separators, as
+    /// Foiley 1.1 read them ("24-12", "23-012", "24_12"), give the section
+    /// of those digits.  Trailing words are not dropped: "2412 mod" is an
+    /// error, not NACA 2412.
     pub fn naca(code: &str) -> Result<Foil, FoilError> {
-        let digits: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
-        let ides: i32 = digits.parse().map_err(|_| FoilError::Parse(format!("'{code}' is not a NACA 4/5-digit designation")))?;
-        let _q = foiley::quiet_scope();
-        // Keep the library geometry stable for saved projects and 3D meshes.
-        // XFOIL script-mode NACA uses the selected version's own seed count.
-        let nside = 120;
-        let r = match digits.len() {
-            1..=4 => Some(naca4(ides, nside)),
-            5 => naca5(ides, nside),
-            _ => None,
-        };
-        let (xb, yb, nb, _name) = r.ok_or_else(|| FoilError::Parse(format!("NACA {digits} is not a supported designation (4-digit, or 5-digit 210xx-250xx)")))?;
-        let mut f = Foil::new(format!("NACA {digits}"), xb[1..=nb].to_vec(), yb[1..=nb].to_vec())?;
-        f.note = format!("NACA {digits} generated");
-        Ok(f)
+        Recipe::Naca { designation: code.to_string() }.generate(None)
+    }
+
+    /// Generate a foil from a recipe, named `name` (a NACA section keeps its
+    /// designation as the name when `name` is `None`).
+    pub fn from_recipe(recipe: &Recipe, name: Option<&str>) -> Result<Foil, FoilError> {
+        recipe.generate(name)
     }
 
     /// Parse a coordinate file (Selig or Lednicer .dat; blanks, tabs or commas).
@@ -166,7 +186,12 @@ impl Foil {
             if nums.len() >= 2 {
                 pts.push((nums[0], nums[1]));
             } else if pts.is_empty() && name.is_empty() {
-                name = l.to_string();
+                // to_dat quotes a title that would read as numbers, or one
+                // that is itself quoted; anything else is kept as written
+                name = match l.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+                    Some(inner) if title_needs_quotes(inner) => inner.to_string(),
+                    _ => l.to_string(),
+                };
             }
         }
         if name.is_empty() {
@@ -177,7 +202,7 @@ impl Foil {
             if a > 1.5 && b > 1.5 && a.fract() == 0.0 && b.fract() == 0.0 {
                 let (nu, nl) = (a as usize, b as usize);
                 let body = &pts[1..];
-                if body.len() >= nu + nl {
+                if nu.checked_add(nl).is_some_and(|total| body.len() >= total) {
                     let upper = &body[..nu];
                     let lower = &body[nu..nu + nl];
                     let mut out: Vec<(f64, f64)> = upper.iter().rev().cloned().collect();
@@ -216,7 +241,7 @@ impl Foil {
 
     /// Selig-format .dat text.
     pub fn to_dat(&self) -> String {
-        let mut s = format!("{}\n", self.name);
+        let mut s = if title_needs_quotes(&self.name) { format!("\"{}\"\n", self.name) } else { format!("{}\n", self.name) };
         for (x, y) in self.x.iter().zip(&self.y) {
             s.push_str(&format!("{:10.6} {:10.6}\n", x, y));
         }
@@ -272,13 +297,15 @@ impl Foil {
         f.x = xf.x[1..=xf.n].to_vec();
         f.y = xf.y[1..=xf.n].to_vec();
         f.note = format!("repaneled ({} panels)", xf.n);
+        // regenerating from the recipe would undo the new paneling
+        f.recipe = None;
         Ok(f)
     }
 
     /// Geometric properties (via XFoil GEOPAR on a spline of the coordinates).
     pub fn props(&self) -> FoilProps {
         let n = self.n();
-        if n < 3 {
+        if n < 3 || self.validate().is_err() {
             return FoilProps::default();
         }
         let x = one_based(&self.x);
@@ -375,6 +402,7 @@ impl Foil {
             f.y[i] = (s * dx + c * dy) / ch;
         }
         f.note = "normalized".into();
+        f.recipe = None;
         f
     }
 
@@ -416,6 +444,7 @@ impl Foil {
         s.run(None);
         let nb = s.xf.nb;
         let mut f = self.clone();
+        f.recipe = None;
         f.x = s.xf.xb[1..=nb].to_vec();
         f.y = s.xf.yb[1..=nb].to_vec();
         f.note = note;
@@ -445,8 +474,24 @@ impl Foil {
         self.gdes(&format!("LERA {factor} {blend}"), format!("LE radius x{factor}"))
     }
     /// Scale thickness and camber.
+    ///
+    /// XFoil's TFAC pairs each point with the point at the same x on the
+    /// other surface.  On a blunt trailing edge cut at a slant (a cambered
+    /// plate, say) one side can run past the other and the result is
+    /// wrecked; that is reported as an error instead of returned.
     pub fn scaled_tc(&self, tfac: f64, cfac: f64) -> Result<Foil, FoilError> {
-        self.gdes(&format!("TFAC {tfac} {cfac}"), format!("thickness x{tfac}, camber x{cfac}"))
+        let f = self.gdes(&format!("TFAC {tfac} {cfac}"), format!("thickness x{tfac}, camber x{cfac}"))?;
+        let (before, after) = (self.props(), f.props());
+        let close = |got: f64, want: f64| (got - want).abs() <= 0.1 * want.abs() + 2e-3;
+        if !close(after.chord, before.chord) || !close(after.thickness, tfac * before.thickness) || !close(after.camber, cfac * before.camber) {
+            return Err(FoilError::Geometry(format!(
+                "XFoil's thickness/camber scaling did not work on '{}' (it gave t/c {:.2}%, camber {:.2}%); for a generated foil, generate it again at the new size",
+                self.name,
+                after.thickness * 100.0,
+                after.camber * 100.0
+            )));
+        }
+        Ok(f)
     }
     /// Set absolute max thickness and camber (chord fractions); `None` keeps.
     pub fn with_tc(&self, t: Option<f64>, c: Option<f64>) -> Result<Foil, FoilError> {
@@ -600,6 +645,26 @@ mod tests {
         let m = Foil::interpolate(&f, &Foil::naca("4412").unwrap(), 0.5, "mix").unwrap();
         assert!((m.props().camber - 0.02).abs() < 2e-3);
     }
+    #[test]
+    fn numeric_titles_round_trip_and_huge_counts_do_not_panic() {
+        let mut f = Foil::naca("2412").unwrap();
+        for name in ["10 10", "1.5, 2", "\"quoted\"", "\"10 10\"", "NACA 2412", "\"My Foil\""] {
+            f.name = name.into();
+            let g = Foil::from_dat(&f.to_dat(), "x").unwrap();
+            assert_eq!((g.name.as_str(), g.n()), (name, f.n()), "{name}");
+        }
+        // a title written quoted by another program keeps its quotes
+        let txt = format!("\"My Foil\"\n{}", f.to_dat().split_once('\n').unwrap().1);
+        assert_eq!(Foil::from_dat(&txt, "x").unwrap().name, "\"My Foil\"");
+        // absurd coordinates are rejected, and props never panics on them
+        let mut big = Foil::naca("0012").unwrap();
+        big.y[3] = 1e300;
+        assert!(big.validate().is_err());
+        assert_eq!(big.props(), FoilProps::default());
+        let txt = "9223372036854775808 9223372036854775808\n0 0\n0.5 0.1\n1 0\n0.5 -0.1\n0 0\n0.2 0.05\n0.4 0.06\n0.6 0.05\n0.8 0.03\n1 0.01\n";
+        let _ = Foil::from_dat(txt, "x");
+    }
+
     #[test]
     fn lednicer() {
         let txt = "TEST\n3. 3.\n\n0 0\n0.5 0.1\n1 0\n\n0 0\n0.5 -0.1\n1 0\n";

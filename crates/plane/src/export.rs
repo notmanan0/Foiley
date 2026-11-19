@@ -17,6 +17,17 @@ fn naca_digits(name: &str) -> Option<String> {
     (d.len() == 4 && d.chars().all(|c| c.is_ascii_digit())).then(|| d.to_string())
 }
 
+/// The 4-digit code AVL should generate for a foil: only when the name is
+/// "NACA dddd" and the stored geometry (`hash`, if the foil is known) is
+/// that section, so a foil reshaped under a NACA name is exported as a file.
+fn avl_naca(name: &str, hash: Option<foiley_core::hash::Hash32>) -> Option<String> {
+    let d = naca_digits(name)?;
+    match hash {
+        None => Some(d),
+        Some(h) => (Foil::naca(&d).ok()?.geom_hash() == h).then_some(d),
+    }
+}
+
 /// Shortest text that reads back to the same f64 (no exponent, no "-0").
 fn num(v: f64) -> String {
     if v == 0.0 {
@@ -156,7 +167,35 @@ fn plan_wing(iw: usize, w: &Wing, flaps: &[&FlapInfo], gains: &[(ControlTarget, 
     plan
 }
 
-fn write_surface(o: &mut String, title: &str, w: &Wing, left: bool, ydup: bool, ctrls: &[AvlControl]) {
+/// The AFILE name of each foil in the plane (in `plane.foil_names()`
+/// order), unique even when names differ only by characters the file name
+/// replaces ("NACA 2412" and "NACA_2412").
+fn avl_file_names(plane: &Plane) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut used = HashSet::new();
+    for n in plane.foil_names() {
+        // a flat, portable base name: no path separators or characters
+        // Windows or AVL's reader reject, and no device names
+        let mut base: String = n.chars().map(|c| if c.is_ascii_alphanumeric() || "._-()+".contains(c) { c } else { '_' }).collect();
+        base = base.trim_start_matches('.').to_string();
+        let stem = base.split('.').next().unwrap_or("").to_ascii_uppercase();
+        let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit());
+        if base.is_empty() || device {
+            base = format!("foil_{base}");
+        }
+        let mut file = format!("{base}.dat");
+        let mut k = 2;
+        while !used.insert(file.to_lowercase()) {
+            file = format!("{base}_{k}.dat");
+            k += 1;
+        }
+        map.insert(n, file);
+    }
+    map
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_surface(o: &mut String, title: &str, w: &Wing, left: bool, ydup: bool, ctrls: &[AvlControl], db: &FoilDb, files: &HashMap<String, String>) {
     let nx = w.sections.first().map(|s| s.nx).unwrap_or(8);
     let cspace = avl_space(w.sections.first().map(|s| s.xdist).unwrap_or_default(), false);
     o.push_str(&format!("#{}\nSURFACE\n{title}\n#Nchord Cspace\n{nx} {}\n", "=".repeat(60), num(cspace)));
@@ -185,9 +224,9 @@ fn write_surface(o: &mut String, title: &str, w: &Wing, left: bool, ydup: bool, 
             num(avl_space(seg.ydist, left))
         ));
         let foil = w.foil(k, left);
-        match naca_digits(foil) {
+        match avl_naca(foil, db.foil_hash(foil)) {
             Some(d) => o.push_str(&format!("NACA\n{d}\n")),
-            None => o.push_str(&format!("AFILE\n{}.dat\n", foil.replace(' ', "_"))),
+            None => o.push_str(&format!("AFILE\n{}\n", files.get(foil).cloned().unwrap_or_else(|| format!("{}.dat", foil.replace(' ', "_"))))),
         }
         for c in ctrls.iter().filter(|c| c.surf == k || c.surf + 1 == k) {
             o.push_str(&format!("CONTROL\n#name gain Xhinge XYZhvec SgnDup\n{} {} {} 0 0 0 {}\n", c.name, num(c.gain), num(c.xhinge), num(c.sgn_dup)));
@@ -222,29 +261,33 @@ pub fn avl_with_gains(plane: &Plane, db: &FoilDb, mach: f64, gains: &[(ControlTa
     o.push_str(&format!("{}\n#Mach\n{mach:.3}\n#IYsym IZsym Zsym\n0 0 0.0\n#Sref Cref Bref\n{s:.6} {c:.6} {b:.6}\n#Xref Yref Zref\n{:.6} {:.6} {:.6}\n#CDp\n0.0\n", plane.name, i.cog.x, i.cog.y, i.cog.z));
     let flaps = build(plane, db, &MeshOptions { allow_missing_foils: true, ..Default::default() }).map(|m| m.flaps).unwrap_or_default();
     let mut used = HashSet::new();
+    let files = avl_file_names(plane);
     for (iw, w) in plane.wings.iter().enumerate() {
         let wf: Vec<&FlapInfo> = flaps.iter().filter(|f| f.wing == iw).collect();
         let plan = plan_wing(iw, w, &wf, gains, &mut used);
         let title = format!("{} ({})", w.name, w.kind.label());
         if plan.mirrored || !w.two_sided {
-            write_surface(&mut o, &title, w, false, plan.mirrored, &plan.right);
+            write_surface(&mut o, &title, w, false, plan.mirrored, &plan.right, db, &files);
         } else {
-            write_surface(&mut o, &format!("{title} right"), w, false, false, &plan.right);
-            write_surface(&mut o, &format!("{title} left"), w, true, false, &plan.left);
+            write_surface(&mut o, &format!("{title} right"), w, false, false, &plan.right, db, &files);
+            write_surface(&mut o, &format!("{title} left"), w, true, false, &plan.left, db, &files);
         }
     }
     o
 }
 
 /// Foil files referenced by `AFILE` entries: (file name, .dat text).
+/// Uses the same NACA-or-file decision as [`avl_with_gains`].
 pub fn avl_foil_files(plane: &Plane, foils: &[foiley_foil::Foil]) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let files = avl_file_names(plane);
     for n in plane.foil_names() {
-        if naca_digits(&n).is_some() {
+        let foil = foils.iter().find(|f| f.name == n);
+        if avl_naca(&n, foil.map(|f| f.geom_hash())).is_some() {
             continue;
         }
-        if let Some(f) = foils.iter().find(|f| f.name == n) {
-            out.push((format!("{}.dat", n.replace(' ', "_")), f.to_dat()));
+        if let Some(f) = foil {
+            out.push((files[&n].clone(), f.to_dat()));
         }
     }
     out
@@ -844,5 +887,50 @@ mod tests {
         assert!(avl_mass(&p, &db).contains("whole aircraft"));
         let stl = stl_mesh(&p, &db, true).unwrap();
         assert!(crate::cad::read_stl(&stl).unwrap().len() > 500);
+    }
+
+    #[test]
+    fn a_foil_reshaped_under_a_naca_name_is_exported_as_a_file() {
+        // Studio's "Replace selected" keeps the name "NACA 2412" on a CST shape
+        let mut cst = foiley_foil::Foil::from_recipe(&foiley_foil::Recipe::Cst(Default::default()), Some("NACA 2412")).unwrap();
+        cst.name = "NACA 2412".into();
+        let tail = foiley_foil::Foil::naca("0009").unwrap();
+        let mut db = FoilDb::new();
+        db.add_foil(&cst);
+        db.add_foil(&tail);
+        let p = Plane::default_plane("NACA 2412", "NACA 0009");
+        let t = avl(&p, &db, 0.0);
+        assert!(!t.contains("NACA\n2412") && t.contains("AFILE\nNACA_2412.dat"), "{t}");
+        assert!(t.contains("NACA\n0009"));
+        let files = avl_foil_files(&p, &[cst.clone(), tail]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], ("NACA_2412.dat".to_string(), cst.to_dat()));
+    }
+
+    #[test]
+    fn foils_whose_file_names_collide_get_their_own_files() {
+        let mk = |name: &str, w: f64| {
+            let mut c = foiley_foil::gen::cst::Cst::default();
+            c.upper[0] = w;
+            let mut f = foiley_foil::Foil::from_recipe(&foiley_foil::Recipe::Cst(c), Some(name)).unwrap();
+            f.name = name.into();
+            f
+        };
+        for (n1, n2) in [("NACA 2412", "NACA_2412"), ("Root/Upper", "Root\\Upper"), ("CON", "c:on")] {
+            let (a, b) = (mk(n1, 0.15), mk(n2, 0.2));
+            let mut db = FoilDb::new();
+            db.add_foil(&a);
+            db.add_foil(&b);
+            let p = Plane::default_plane(n1, n2);
+            let t = avl(&p, &db, 0.0);
+            let files = avl_foil_files(&p, &[a.clone(), b.clone()]);
+            assert_eq!(files.len(), 2);
+            assert_ne!(files[0].0.to_lowercase(), files[1].0.to_lowercase());
+            for (file, text) in &files {
+                assert!(!file.contains(['/', '\\', ':']) && !file.to_uppercase().starts_with("CON."), "{file}");
+                assert!(t.contains(&format!("AFILE\n{file}\n")), "{file}");
+                assert!(*text == a.to_dat() || *text == b.to_dat());
+            }
+        }
     }
 }

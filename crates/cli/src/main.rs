@@ -23,6 +23,7 @@ use foiley_foil::analysis::PolarType;
 use foiley_foil::batch::BatchCase;
 use foiley_foil::foil::Paneling;
 use foiley_foil::{AnalysisSettings, Foil, FoilPolar, Sweep};
+use foiley_foil::gen::naca;
 use foiley_plane::analysis::{Method, PolarKind, Range, RefDims};
 use foiley_plane::geom::Inertia;
 use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
@@ -142,6 +143,14 @@ struct Out {
     /// output format
     #[arg(short, long, value_enum, default_value_t = Format::Table)]
     format: Format,
+}
+
+impl FoilSrc {
+    /// The foil argument when it names a file on disk (an input to protect).
+    fn foil_file(&self) -> Option<PathBuf> {
+        let p = PathBuf::from(&self.foil);
+        p.is_file().then_some(p)
+    }
 }
 
 #[derive(Args, Clone)]
@@ -311,7 +320,7 @@ enum FoilCmd {
         #[arg(long)]
         save: Option<PathBuf>,
     },
-    /// Shape optimisation (MOPSO particle swarm or genetic algorithm, Hicks-Henne bumps)
+    /// Shape optimisation (MOPSO particle swarm or genetic algorithm; Hicks-Henne bumps or CST weights)
     Optimize {
         #[command(flatten)]
         src: FoilSrc,
@@ -330,12 +339,21 @@ enum FoilCmd {
         population: usize,
         #[arg(long, default_value_t = 25)]
         iterations: usize,
+        /// shape variables: hh (Hicks-Henne bumps) or cst (CST weight changes)
+        #[arg(long, default_value = "hh")]
+        shape: String,
         /// Hicks-Henne bumps per surface
         #[arg(long, default_value_t = 3)]
         bumps: usize,
         /// max bump amplitude, fraction of chord
         #[arg(long, default_value_t = 0.01)]
         amplitude: f64,
+        /// CST order (order + 1 weights per surface)
+        #[arg(long, default_value_t = 5)]
+        cst_order: usize,
+        /// largest change of a CST weight
+        #[arg(long, default_value_t = 0.05)]
+        cst_delta: f64,
         /// also optimise a TE flap angle "min,max" (deg)
         #[arg(long, allow_hyphen_values = true)]
         flap: Option<String>,
@@ -378,6 +396,35 @@ enum FoilCmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+    /// Generate a foil (NACA families, CST, PARSEC, Karman-Trefftz, cambered plate) and write it as .dat
+    #[command(visible_alias = "gen")]
+    Generate {
+        #[command(subcommand)]
+        family: GenFamily,
+        /// foil name (default: the NACA designation, or the family)
+        #[arg(long, global = true)]
+        name: Option<String>,
+        /// add the foil to this project file (created if missing)
+        #[arg(long, global = true)]
+        save: Option<PathBuf>,
+        /// output .dat (default: stdout)
+        #[arg(short, long, global = true)]
+        out: Option<PathBuf>,
+    },
+    /// Fit CST weights to a foil; print them (or the recipe as JSON) and the fit error
+    FitCst {
+        #[command(flatten)]
+        src: FoilSrc,
+        /// CST order (order + 1 weights per surface)
+        #[arg(long, default_value_t = 8)]
+        order: usize,
+        /// print the recipe as JSON (for `foil generate cst --json`)
+        #[arg(long)]
+        json: bool,
+        /// write the CST foil as .dat
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
     /// Modify a foil (XFoil GDES operations) and write it as .dat
     Design {
         #[command(flatten)]
@@ -416,6 +463,253 @@ enum FoilCmd {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum GenFamily {
+    /// NACA 4/5-digit, 4-digit modified, 16-, 6- or 6A-series, e.g. "23112", "0012-64", "16-212", "64(2)-415", "63-412 a=0.5", "64A010", "2412 closed TE"
+    Naca { designation: String },
+    /// Kulfan CST: weights A0..An per surface (lower ones negative)
+    Cst {
+        /// upper weights "a0,a1,..."
+        #[arg(long, allow_hyphen_values = true)]
+        upper: Option<String>,
+        /// lower weights "a0,a1,..." (same count)
+        #[arg(long, allow_hyphen_values = true)]
+        lower: Option<String>,
+        /// trailing-edge y of the upper and lower surface "yu,yl"
+        #[arg(long, allow_hyphen_values = true)]
+        te: Option<String>,
+        /// class-function exponents "N1,N2" (0.5,1 for a round nose)
+        #[arg(long)]
+        class: Option<String>,
+        /// read the whole recipe from a JSON file (as `foil fit-cst --json` prints)
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+    /// Sobieczky PARSEC (defaults close to NACA 0012)
+    Parsec {
+        /// leading-edge radius
+        #[arg(long)]
+        rle: Option<f64>,
+        /// upper crest "x,z,z''"
+        #[arg(long, allow_hyphen_values = true)]
+        upper: Option<String>,
+        /// lower crest "x,z,z''"
+        #[arg(long, allow_hyphen_values = true)]
+        lower: Option<String>,
+        /// trailing edge "z,thickness,direction_deg,wedge_deg" (direction positive below the chord line)
+        #[arg(long, allow_hyphen_values = true)]
+        te: Option<String>,
+    },
+    /// Karman-Trefftz (Joukowsky with a finite trailing-edge angle)
+    Kt {
+        /// leftward offset of the circle centre (thickness)
+        #[arg(long, default_value_t = 0.08)]
+        x_center: f64,
+        /// upward offset of the circle centre (camber)
+        #[arg(long, default_value_t = 0.08, allow_hyphen_values = true)]
+        y_center: f64,
+        /// trailing-edge angle, degrees (0 = Joukowsky)
+        #[arg(long, default_value_t = 10.0)]
+        te_angle: f64,
+        /// also print the exact inviscid CL and Cm at these angles "a1,a2,..." (deg)
+        #[arg(long, allow_hyphen_values = true)]
+        exact: Option<String>,
+    },
+    /// Constant-thickness cambered plate with round edges
+    Plate {
+        /// thickness / chord
+        #[arg(long, default_value_t = 0.02)]
+        thickness: f64,
+        /// maximum camber / chord
+        #[arg(long, default_value_t = 0.04, allow_hyphen_values = true)]
+        camber: f64,
+        /// arc (circular arc) or parabolic
+        #[arg(long, default_value = "arc")]
+        kind: String,
+        /// position of maximum camber (parabolic only)
+        #[arg(long, default_value_t = 0.5)]
+        x_camber: f64,
+        /// trailing edge: square (blunt, cut square to the plate; XFoil can analyse it) or round (geometry only)
+        #[arg(long, default_value = "square")]
+        te: String,
+    },
+}
+
+/// The recipe a `foil generate` command describes.
+fn gen_recipe(family: &GenFamily) -> Result<foiley_foil::Recipe, String> {
+    use foiley_foil::gen::{cst::Cst, kt::KarmanTrefftz, parsec::Parsec, plate, Recipe};
+    let three = |s: &Option<String>, what: &str, n: usize| -> Result<Option<Vec<f64>>, String> {
+        match s {
+            None => Ok(None),
+            Some(t) => {
+                let v = parse_list(t)?;
+                if v.len() != n {
+                    return Err(format!("{what} needs {n} numbers"));
+                }
+                Ok(Some(v))
+            }
+        }
+    };
+    Ok(match family {
+        GenFamily::Naca { designation } => Recipe::Naca { designation: designation.clone() },
+        GenFamily::Cst { upper, lower, te, class, json } => {
+            if let Some(path) = json {
+                let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+                // a recipe with a "family" tag must be a CST recipe; untagged
+                // input is read as bare CST weights
+                return if v.get("family").is_some() {
+                    match serde_json::from_value::<Recipe>(v) {
+                        Ok(r @ Recipe::Cst(_)) => Ok(r),
+                        Ok(_) => Err(format!("{}: not a CST recipe", path.display())),
+                        Err(e) => Err(format!("{}: {e}", path.display())),
+                    }
+                } else {
+                    serde_json::from_value::<Cst>(v).map(Recipe::Cst).map_err(|e| format!("{}: {e}", path.display()))
+                };
+            }
+            let mut c = Cst::default();
+            if let Some(u) = upper {
+                c.upper = parse_list(u)?;
+            }
+            if let Some(l) = lower {
+                c.lower = parse_list(l)?;
+            }
+            if let Some(v) = three(te, "--te", 2)? {
+                (c.te_upper, c.te_lower) = (v[0], v[1]);
+            }
+            if let Some(v) = three(class, "--class", 2)? {
+                (c.n1, c.n2) = (v[0], v[1]);
+            }
+            Recipe::Cst(c)
+        }
+        GenFamily::Parsec { rle, upper, lower, te } => {
+            let mut p = Parsec::default();
+            if let Some(r) = rle {
+                p.r_le = *r;
+            }
+            if let Some(v) = three(upper, "--upper", 3)? {
+                (p.x_up, p.z_up, p.zxx_up) = (v[0], v[1], v[2]);
+            }
+            if let Some(v) = three(lower, "--lower", 3)? {
+                (p.x_lo, p.z_lo, p.zxx_lo) = (v[0], v[1], v[2]);
+            }
+            if let Some(v) = three(te, "--te", 4)? {
+                (p.z_te, p.dz_te, p.alpha_te, p.beta_te) = (v[0], v[1], v[2], v[3]);
+            }
+            Recipe::Parsec(p)
+        }
+        GenFamily::Kt { x_center, y_center, te_angle, .. } => Recipe::KarmanTrefftz(KarmanTrefftz { x_center: *x_center, y_center: *y_center, te_angle: *te_angle }),
+        GenFamily::Plate { thickness, camber, kind, x_camber, te } => Recipe::Plate(plate::Plate {
+            trailing_edge: match te.to_lowercase().as_str() {
+                "square" | "blunt" => plate::PlateEdge::Square,
+                "round" => plate::PlateEdge::Round,
+                o => return Err(format!("--te must be square or round, not '{o}'")),
+            },
+            thickness: *thickness,
+            camber: *camber,
+            x_camber: *x_camber,
+            kind: match kind.to_lowercase().as_str() {
+                "arc" | "circular" | "circular-arc" => plate::PlateCamber::CircularArc,
+                "parabolic" | "parabola" => plate::PlateCamber::Parabolic,
+                o => return Err(format!("--kind must be arc or parabolic, not '{o}'")),
+            },
+        }),
+    })
+}
+
+/// Whether two paths name the same file.  Existing files are compared by
+/// identity (hard links, junctions and links included); otherwise by path,
+/// a new file through its existing parent directory.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if same_file::is_same_file(a, b).unwrap_or(false) {
+        return true;
+    }
+    let full = |p: &Path| -> PathBuf {
+        if let Ok(c) = std::fs::canonicalize(p) {
+            return c;
+        }
+        let parent = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        match (std::fs::canonicalize(parent), p.file_name()) {
+            (Ok(d), Some(n)) => d.join(n),
+            _ => std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()),
+        }
+    };
+    let (a, b) = (full(a), full(b));
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+/// A device or pipe rather than a file: `NUL`, `NUL:`, `CON` (on Windows,
+/// the bare reserved names; Windows 11 treats `nul.dat` as a file) or
+/// anything on disk that is neither a file nor a directory (`/dev/null`).
+fn is_device(path: &Path) -> bool {
+    let reserved = cfg!(windows)
+        && path.file_name().map(|n| n.to_string_lossy().trim_end_matches(':').to_ascii_uppercase()).is_some_and(|n| {
+            matches!(n.as_str(), "NUL" | "CON" | "PRN" | "AUX") || ((n.starts_with("COM") || n.starts_with("LPT")) && n.len() == 4 && n.as_bytes()[3].is_ascii_digit())
+        });
+    reserved || std::fs::metadata(path).is_ok_and(|m| !m.is_file() && !m.is_dir())
+}
+
+/// Refuse outputs that are an input file or each other (checked again by
+/// [`publish`] when each is written).  Devices are not files: two outputs
+/// to `NUL` are fine.
+fn guard_paths(outputs: &[&Option<PathBuf>], inputs: &[&Option<PathBuf>]) -> Result<(), String> {
+    let outs: Vec<&PathBuf> = outputs.iter().filter_map(|p| p.as_ref()).filter(|p| !is_device(p)).collect();
+    for (i, o) in outs.iter().enumerate() {
+        for p in inputs.iter().filter_map(|p| p.as_ref()) {
+            if same_file(o, p) {
+                return Err(format!("the output {} is the input file {}: it would be overwritten", o.display(), p.display()));
+            }
+        }
+        for q in &outs[i + 1..] {
+            if same_file(o, q) {
+                return Err(format!("two outputs name the same file: {} and {}", o.display(), q.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a file through a temporary sibling and a rename, after checking
+/// again that it is none of `protected`: a link or junction created while
+/// the command ran, or a hard link, cannot redirect it onto an input.
+fn publish(path: &Path, bytes: &[u8], protected: &[&Option<PathBuf>]) -> Result<(), String> {
+    // a device or pipe (NUL, /dev/null, /dev/stdout) holds no file to
+    // overwrite and cannot be replaced by a rename: write to it directly
+    if is_device(path) {
+        return std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()));
+    }
+    for p in protected.iter().filter_map(|p| p.as_ref()) {
+        if same_file(path, p) {
+            return Err(format!("the output {} is the input file {}: it would be overwritten", path.display(), p.display()));
+        }
+    }
+    let name = path.file_name().ok_or_else(|| format!("{}: not a file name", path.display()))?;
+    let tmp = path.with_file_name(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// Print a one-line summary of a foil to stderr and write it.
+fn emit_foil(f: &Foil, out: &Option<PathBuf>, protected: &[&Option<PathBuf>]) -> Result<(), String> {
+    let p = f.props();
+    eprintln!("  {}: {} points, t/c {:.2}% at {:.3}, camber {:.2}% at {:.3}, LE radius {:.4}", f.name, p.points, p.thickness * 100.0, p.x_thickness, p.camber * 100.0, p.x_camber, p.le_radius);
+    match out {
+        Some(o) => publish(o, f.to_dat().as_bytes(), protected),
+        None => {
+            print!("{}", f.to_dat());
+            Ok(())
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -611,19 +905,20 @@ fn resolve_foil(spec: &str, proj: &Project) -> Result<Foil, String> {
     if path.exists() {
         return Foil::load(path).map_err(|e| e.to_string());
     }
-    let l = spec.to_lowercase().replace([' ', '-', '_'], "");
-    if let Some(code) = l.strip_prefix("naca") {
-        return Foil::naca(code).map_err(|e| e.to_string());
+    if let Some(r) = naca::foil_from_name(spec) {
+        return r.map_err(|e| e.to_string());
     }
-    if l.chars().all(|c| c.is_ascii_digit()) && (l.len() == 4 || l.len() == 5) {
-        return Foil::naca(&l).map_err(|e| e.to_string());
+    // a bare designation ("2412", "64A010", "0012-64")
+    let l = spec.trim();
+    if l.starts_with(|c: char| c.is_ascii_digit()) {
+        return Foil::naca(l).map_err(|e| format!("'{spec}' is not a file or a foil in the project, nor a NACA designation ({e})"));
     }
     Err(format!("'{spec}' is not a file, a NACA designation, or a foil in the project"))
 }
 
-fn write_out(out: &Out, text: &str) -> Result<(), String> {
+fn write_out(out: &Out, text: &str, protected: &[&Option<PathBuf>]) -> Result<(), String> {
     match &out.out {
-        Some(p) => std::fs::write(p, text).map_err(|e| format!("{}: {e}", p.display())),
+        Some(p) => publish(p, text.as_bytes(), protected),
         None => {
             print!("{text}");
             Ok(())
@@ -768,9 +1063,8 @@ fn load_plane(src: &PlaneSrc) -> Result<(Project, Plane), String> {
             }
         }
         if found.is_none() {
-            let l = name.to_lowercase().replace([' ', '-', '_'], "");
-            if let Some(code) = l.strip_prefix("naca") {
-                found = Foil::naca(code).ok();
+            if let Some(r) = naca::foil_from_name(&name) {
+                found = r.ok();
             }
         }
         match found {
@@ -940,6 +1234,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Polar { src, x, ptype, alpha, cl, re_sweep, flap_sweep, at_alpha, hinge, details: details_dir, out } => {
+                guard_paths(&[&out.out], &[&src.project, &src.foil_file()])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let mut st = x.settings()?;
@@ -992,7 +1287,7 @@ fn real_main() -> Result<(), String> {
                         Format::Json => serde_json::to_string_pretty(&polar).unwrap(),
                         Format::Xfoil => polar.to_xfoil_text(),
                     };
-                    write_out(&out, &text)?;
+                    write_out(&out, &text, &[&src.project, &src.foil_file()])?;
                     if let Some(dir) = &details_dir {
                         let n = write_point_details(dir, &polar, &details)?;
                         eprintln!("  wrote {n} point files to {}", dir.display());
@@ -1000,6 +1295,7 @@ fn real_main() -> Result<(), String> {
                 }
             }
             FoilCmd::Point { src, x, alpha, cl, out } => {
+                guard_paths(&[&out.out], &[&src.project, &src.foil_file()])?;
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let st = x.settings()?;
@@ -1028,7 +1324,7 @@ fn real_main() -> Result<(), String> {
                             s
                         }
                     };
-                    write_out(&out, &text)?;
+                    write_out(&out, &text, &[&src.project, &src.foil_file()])?;
                 }
             }
             FoilCmd::Batch { foils, project, re, mach, ncrit, alpha, x, out_dir, save } => {
@@ -1082,8 +1378,9 @@ fn real_main() -> Result<(), String> {
                     }
                 }
             }
-            FoilCmd::Optimize { src, x, alpha, objectives, algorithm, population, iterations, bumps, amplitude, flap, seed, out, pareto } => {
-                use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings};
+            FoilCmd::Optimize { src, x, alpha, objectives, algorithm, population, iterations, shape, bumps, amplitude, cst_order, cst_delta, flap, seed, out, pareto } => {
+                guard_paths(&[&out, &pareto], &[&src.project, &src.foil_file()])?;
+                use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings, Parameterization};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let mut st = OptimSettings {
@@ -1095,8 +1392,15 @@ fn real_main() -> Result<(), String> {
                     alpha,
                     population,
                     iterations,
+                    parameterization: match shape.to_lowercase().as_str() {
+                        "hh" | "hicks-henne" | "hickshenne" => Parameterization::HicksHenne,
+                        "cst" => Parameterization::Cst,
+                        o => return Err(format!("--shape must be hh or cst, not '{o}'")),
+                    },
                     bumps_per_side: bumps,
                     max_amplitude: amplitude,
+                    cst_order,
+                    cst_max_delta: cst_delta,
                     seed,
                     ..OptimSettings::default()
                 };
@@ -1138,17 +1442,18 @@ fn real_main() -> Result<(), String> {
                         for (i, c) in r.pareto.iter().enumerate() {
                             s.push_str(&format!("{i},{:.5},{:.6},{:.3},{:.5},{:.4}\n", c.cl, c.cd, c.cl / c.cd.max(1e-12), c.cm, c.cpmin));
                         }
-                        std::fs::write(p, s).map_err(|e| e.to_string())?;
+                        publish(&p, s.as_bytes(), &[&src.project, &src.foil_file(), &out])?;
                     }
                     let mut f = best.foil.clone();
                     f.name = format!("{} opt", foil.name);
-                    match out {
-                        Some(o) => f.save(&o).map_err(|e| e.to_string())?,
+                    match &out {
+                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project, &src.foil_file()])?,
                         None => print!("{}", f.to_dat()),
                     }
                 }
             }
             FoilCmd::Inverse { src, alpha, mode, segment, scale, bump, smooth, iterations, speed_csv, out } => {
+                guard_paths(&[&out, &speed_csv], &[&src.project, &src.foil_file()])?;
                 use foiley_foil::inverse::{modify, InverseMode, ModKind, Modification};
                 let proj = load_project(&src.project)?;
                 let foil = resolve_foil(&src.foil, &proj)?;
@@ -1182,15 +1487,65 @@ fn real_main() -> Result<(), String> {
                         for (i, q) in d0.q.iter().enumerate() {
                             s.push_str(&format!("{:.6},{:.6},{:.6},{:.6}\n", d0.x[i], d0.s[i], q, t[i]));
                         }
-                        std::fs::write(path, s).map_err(|e| e.to_string())?;
+                        publish(&path, s.as_bytes(), &[&src.project, &src.foil_file(), &out])?;
                     }
-                    match out {
-                        Some(o) => f.save(&o).map_err(|e| e.to_string())?,
+                    match &out {
+                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project, &src.foil_file()])?,
                         None => print!("{}", f.to_dat()),
                     }
                 }
             }
+            FoilCmd::Generate { family, name, mut save, out } => {
+                let json_in = match &family {
+                    GenFamily::Cst { json, .. } => json.clone(),
+                    _ => None,
+                };
+                guard_paths(&[&out, &save], &[&json_in])?;
+                let recipe = gen_recipe(&family)?;
+                let f = Foil::from_recipe(&recipe, name.as_deref()).map_err(|e| e.to_string())?;
+                if let GenFamily::Kt { exact: Some(list), .. } = &family {
+                    if let foiley_foil::Recipe::KarmanTrefftz(k) = &recipe {
+                        eprintln!("  exact inviscid solution (conformal map):");
+                        for a in parse_list(list)? {
+                            let s = k.exact(a).map_err(|e| e.to_string())?;
+                            eprintln!("    alpha {a:>6.2} deg: CL {:.5}  Cm(c/4) {:.5}", s.cl, s.cm);
+                        }
+                    }
+                }
+                if let Some(path) = save.take() {
+                    let mut proj = if path.exists() { Project::load(&path)? } else { Project::new("cli") };
+                    let mut g = f.clone();
+                    g.name = proj.unique_foil_name(&g.name);
+                    eprintln!("  added {} to {}", g.name, path.display());
+                    proj.foils.push(g);
+                    proj.save(&path)?;
+                    save = Some(path);
+                }
+                // publish checks again now the project file exists
+                emit_foil(&f, &out, &[&save, &json_in])?;
+            }
+            FoilCmd::FitCst { src, order, json, out } => {
+                guard_paths(&[&out], &[&src.project, &src.foil_file()])?;
+                let proj = load_project(&src.project)?;
+                let foil = resolve_foil(&src.foil, &proj)?;
+                let (cst, fit) = foiley_foil::gen::cst::Cst::fit(&foil, order).map_err(|e| e.to_string())?;
+                eprintln!("  {}: CST order {order}, fit error rms {:.2e}, max {:.2e} (chord fractions)", foil.name, fit.rms, fit.max);
+                let recipe = foiley_foil::Recipe::Cst(cst.clone());
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&recipe).map_err(|e| e.to_string())?);
+                } else if out.is_none() {
+                    let row = |w: &[f64]| w.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(",");
+                    println!("upper {}", row(&cst.upper));
+                    println!("lower {}", row(&cst.lower));
+                    println!("te    {:.6},{:.6}", cst.te_upper, cst.te_lower);
+                }
+                if out.is_some() {
+                    let f = Foil::from_recipe(&recipe, Some(&format!("{} CST{order}", foil.name))).map_err(|e| e.to_string())?;
+                    emit_foil(&f, &out, &[&src.project, &src.foil_file()])?;
+                }
+            }
             FoilCmd::Design { src, flap, te_gap, le_radius, thickness, camber, high_points, repanel, normalize, mix, name, out } => {
+                guard_paths(&[&out], &[&src.project, &src.foil_file()])?;
                 let proj = load_project(&src.project)?;
                 let mut f = resolve_foil(&src.foil, &proj)?;
                 let e = |r: Result<Foil, foiley_foil::FoilError>| r.map_err(|e| e.to_string());
@@ -1236,8 +1591,8 @@ fn real_main() -> Result<(), String> {
                 }
                 let p = f.props();
                 eprintln!("  {}: {} points, t/c {:.2}% at {:.3}, camber {:.2}% at {:.3}", f.name, p.points, p.thickness * 100.0, p.x_thickness, p.camber * 100.0, p.x_camber);
-                match out {
-                    Some(o) => f.save(&o).map_err(|e| e.to_string())?,
+                match &out {
+                    Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project, &src.foil_file()])?,
                     None => print!("{}", f.to_dat()),
                 }
             }
@@ -1272,26 +1627,28 @@ fn real_main() -> Result<(), String> {
                 println!("  foils: {}", plane.foil_names().join(", "));
             }
             PlaneCmd::Export { src, avl, mass, stl, thin, xml } => {
+                let plane_in = Some(src.plane.clone());
+                guard_paths(&[&avl, &mass, &stl, &xml], &[&plane_in])?;
                 let (proj, plane) = load_plane(&src)?;
                 let db = proj.foil_db();
-                if let Some(p) = avl {
-                    std::fs::write(&p, foiley_plane::export::avl(&plane, &db, 0.0)).map_err(|e| e.to_string())?;
+                if let Some(p) = &avl {
+                    publish(p, foiley_plane::export::avl(&plane, &db, 0.0).as_bytes(), &[&plane_in])?;
                     let dir = p.parent().unwrap_or(Path::new("."));
                     for (name, text) in foiley_plane::export::avl_foil_files(&plane, &proj.foils) {
-                        std::fs::write(dir.join(name), text).map_err(|e| e.to_string())?;
+                        publish(&dir.join(name), text.as_bytes(), &[&plane_in, &avl, &mass, &stl, &xml])?;
                     }
                     eprintln!("  wrote {}", p.display());
                 }
-                if let Some(p) = mass {
-                    std::fs::write(&p, foiley_plane::export::avl_mass(&plane, &db)).map_err(|e| e.to_string())?;
+                if let Some(p) = &mass {
+                    publish(p, foiley_plane::export::avl_mass(&plane, &db).as_bytes(), &[&plane_in])?;
                     eprintln!("  wrote {}", p.display());
                 }
-                if let Some(p) = stl {
-                    std::fs::write(&p, foiley_plane::export::stl_mesh(&plane, &db, !thin).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                if let Some(p) = &stl {
+                    publish(p, &foiley_plane::export::stl_mesh(&plane, &db, !thin).map_err(|e| e.to_string())?, &[&plane_in])?;
                     eprintln!("  wrote {}", p.display());
                 }
-                if let Some(p) = xml {
-                    std::fs::write(&p, foiley_plane::xml::write_plane(&plane)).map_err(|e| e.to_string())?;
+                if let Some(p) = &xml {
+                    publish(p, foiley_plane::xml::write_plane(&plane).as_bytes(), &[&plane_in])?;
                     eprintln!("  wrote {}", p.display());
                 }
             }
@@ -1322,6 +1679,10 @@ fn real_main() -> Result<(), String> {
                 eprintln!("  saved {}", save.display());
             }
             PlaneCmd::Analyze { src, ptype, method, free_wake, wake_nseg, wake_relax, wake_tol, response, response_amp, response_time, response_out, range, speed, alpha, beta, list, inviscid, altitude, water, mass, cog, ground, derivatives, strict_envelope, flaps, gains, reference, auto_polars, llt_stations, strips, save, out } => {
+                // --save may name the input project (the polar is added to it);
+                // the other outputs may not overwrite either
+                let plane_in = Some(src.plane.clone());
+                guard_paths(&[&out.out, &response_out, &strips], &[&plane_in, &save])?;
                 let (mut proj, plane) = load_plane(&src)?;
                 let kind = match ptype.to_lowercase().trim_start_matches('t') {
                     "1" => PolarKind::FixedSpeed,
@@ -1425,7 +1786,7 @@ fn real_main() -> Result<(), String> {
                         Format::Csv => pol.to_csv(),
                         Format::Json => serde_json::to_string_pretty(&pol).unwrap(),
                     };
-                    write_out(&out, &text)?;
+                    write_out(&out, &text, &[&plane_in, &save])?;
                     if let Some(spec) = &response {
                         use foiley_plane::stability::{forced_response, ControlInput};
                         let (kind, arg) = spec.split_once(':').unwrap_or((spec.as_str(), "0.5"));
@@ -1450,12 +1811,12 @@ fn real_main() -> Result<(), String> {
                             csv.push_str(&format!("{t:.4},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.5},{:.4}\n", a[0], a[1], a[2] * r2d, a[3] * r2d, b[0], b[1] * r2d, b[2] * r2d, b[3] * r2d, response_amp * input.value(*t)));
                         }
                         match &response_out {
-                            Some(p) => std::fs::write(p, csv).map_err(|e| e.to_string())?,
+                            Some(p) => publish(p, csv.as_bytes(), &[&plane_in, &save, &out.out])?,
                             None => print!("{csv}"),
                         }
                     }
-                    if let Some(sp) = strips {
-                        std::fs::write(&sp, strips_csv(&pol)).map_err(|e| e.to_string())?;
+                    if let Some(sp) = &strips {
+                        publish(sp, strips_csv(&pol).as_bytes(), &[&plane_in, &save, &out.out, &response_out])?;
                     }
                     if let Some(path) = save {
                         if proj.planes.iter().all(|p| p.name != plane.name) {
@@ -1619,9 +1980,8 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
                 };
                 for name in pl.foil_names() {
                     if proj.foil(&name).is_none() {
-                        let l = name.to_lowercase().replace([' ', '-', '_'], "");
-                        if let Some(code) = l.strip_prefix("naca") {
-                            let mut f = Foil::naca(code).map_err(|e| e.to_string())?;
+                        if let Some(r) = naca::foil_from_name(&name) {
+                            let mut f = r.map_err(|e| e.to_string())?;
                             f.name = name.clone();
                             proj.foils.push(f);
                         }
