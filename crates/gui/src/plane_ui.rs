@@ -13,7 +13,7 @@ use foiley_plane::analysis::{ControlRange, ControlTarget, ExtraDrag, Method, Pla
 use foiley_plane::geom::{FuseFrame, PointMass, Wing, WingKind, WingSection};
 use foiley_plane::mesh::{Mesh, MeshOptions};
 use foiley_plane::stability::{modal_initial_state, time_response};
-use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
+use foiley_plane::{Plane, PlanePolarDef};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
@@ -127,6 +127,35 @@ fn var3(o: &PlaneOpp, i: usize) -> f64 {
         17 => o.drag,
         18 => o.root_bending,
         _ => o.x_cp,
+    }
+}
+
+struct LivePlotPoint {
+    order: f64,
+    values: [f64; VARS3.len()],
+}
+
+impl LivePlotPoint {
+    fn new(point: &PlaneOpp) -> Self {
+        Self {
+            order: point.alpha + point.velocity + point.ctrl + point.beta,
+            values: std::array::from_fn(|i| var3(point, i)),
+        }
+    }
+}
+
+enum PolarPlotPoints<'a> {
+    Completed(&'a [PlaneOpp]),
+    Running(Vec<LivePlotPoint>),
+}
+
+impl PolarPlotPoints<'_> {
+    fn coordinates(&self, x: usize, y: usize) -> Vec<[f64; 2]> {
+        let finite = |xy: &[f64; 2]| xy[0].is_finite() && xy[1].is_finite();
+        match self {
+            Self::Completed(pts) => pts.iter().map(|o| [var3(o, x), var3(o, y)]).filter(finite).collect(),
+            Self::Running(pts) => pts.iter().map(|p| [p.values[x], p.values[y]]).filter(finite).collect(),
+        }
     }
 }
 
@@ -332,9 +361,9 @@ impl App {
         });
     }
 
-    fn selected_plane_polar(&self) -> Option<PlanePolar> {
+    fn selected_plane_polar_index(&self) -> Option<usize> {
         let (pl, name) = self.pui.sel_polar.as_ref()?;
-        self.project.plane_polars.iter().find(|p| &p.plane == pl && &p.name == name).cloned()
+        self.project.plane_polars.iter().position(|p| &p.plane == pl && &p.name == name)
     }
 
     pub fn plane_analysis(&mut self, ui: &mut egui::Ui) {
@@ -697,24 +726,13 @@ impl App {
     }
 
     fn results_3d(&mut self, ui: &mut egui::Ui, plane: &Plane) {
-        // polars to plot, including live partial results of running jobs
-        let mut series: Vec<(String, Vec<PlaneOpp>, bool)> = self.project.plane_polars.iter().filter(|p| self.pui.visible.contains(&(p.plane.clone(), p.name.clone()))).map(|p| (format!("{} {}", p.plane, p.name), p.points.clone(), false)).collect();
-        for j in self.jobs.jobs() {
-            if self.current_job(j.id) && j.kind == "3D polar" && !j.status().is_finished() {
-                let pts = j.partial.lock().unwrap().plane_points.clone();
-                if !pts.is_empty() {
-                    let mut pts = pts;
-                    pts.sort_by(|a, b| (a.alpha + a.velocity + a.ctrl + a.beta).total_cmp(&(b.alpha + b.velocity + b.ctrl + b.beta)));
-                    series.push((format!("{} (running)", j.title), pts, true));
-                }
-            }
-        }
-        let sel = self.selected_plane_polar();
+        let selected = self.selected_plane_polar_index();
+        let sel = selected.map(|i| &self.project.plane_polars[i]);
         let w = ui.available_width();
         let h = ui.available_height();
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.pui.show_3d, "3D view");
-            if let Some(p) = &sel {
+            if let Some(p) = sel {
                 if !p.points.is_empty() {
                     let n = p.points.len();
                     self.pui.sel_point = self.pui.sel_point.min(n - 1);
@@ -731,6 +749,33 @@ impl App {
                 }
             }
         });
+        let preview = if self.pui.show_3d {
+            let def = sel.and_then(|p| p.def.as_ref()).unwrap_or(&self.pui.def);
+            let panel_method = def.method.is_panel();
+            let opts = foiley_plane::analysis::mesh_options(def, &Default::default(), &Default::default());
+            Some((self.ensure_mesh(opts), panel_method))
+        } else {
+            None
+        };
+        let sel = selected.map(|i| &self.project.plane_polars[i]);
+        let mut series: Vec<_> = self.project.plane_polars
+            .iter()
+            .filter(|p| self.pui.visible.contains(&(p.plane.clone(), p.name.clone())))
+            .map(|p| (format!("{} {}", p.plane, p.name), PolarPlotPoints::Completed(&p.points)))
+            .collect();
+        for j in self.jobs.jobs() {
+            if self.current_job(j.id) && j.kind == "3D polar" && !j.status().is_finished() {
+                // Snapshot the selectable plot values, then release the job lock before sorting and drawing.
+                let mut pts: Vec<_> = j.partial.lock().unwrap().plane_points
+                    .iter()
+                    .map(LivePlotPoint::new)
+                    .collect();
+                if !pts.is_empty() {
+                    pts.sort_by(|a, b| a.order.total_cmp(&b.order));
+                    series.push((format!("{} (running)", j.title), PolarPlotPoints::Running(pts)));
+                }
+            }
+        }
         let top_h = if self.pui.show_3d { h * 0.5 } else { h * 0.62 };
         let mut clicked: Option<usize> = None;
         egui::Grid::new("plots3").num_columns(2).show(ui, |ui| {
@@ -750,17 +795,17 @@ impl App {
                         plot = plot.legend(Legend::default().position(egui_plot::Corner::RightBottom));
                     }
                     plot.x_axis_label(VARS3[xv]).y_axis_label(VARS3[yv]).show(ui, |pu| {
-                        for (i, (name, pts, running)) in series.iter().enumerate() {
-                            let xy: Vec<[f64; 2]> = pts.iter().map(|o| [var3(o, xv), var3(o, yv)]).filter(|p| p[0].is_finite() && p[1].is_finite()).collect();
+                        for (i, (name, pts)) in series.iter().enumerate() {
+                            let xy = pts.coordinates(xv, yv);
                             let col = series_color(i);
                             let mut l = Line::new(name.clone(), PlotPoints::from(xy.clone())).color(col);
-                            if *running {
+                            if matches!(pts, PolarPlotPoints::Running(_)) {
                                 l = l.style(egui_plot::LineStyle::dashed_dense());
                             }
                             pu.line(l);
                             pu.points(Points::new(name.clone(), PlotPoints::from(xy)).radius(2.5_f32).color(col));
                         }
-                        if let Some(p) = &sel {
+                        if let Some(p) = sel {
                             if let Some(o) = p.points.get(self.pui.sel_point) {
                                 pu.points(Points::new("selected", PlotPoints::from(vec![[var3(o, xv), var3(o, yv)]])).radius(6.0_f32).shape(MarkerShape::Circle).filled(false).color(Color32::YELLOW));
                             }
@@ -796,7 +841,7 @@ impl App {
                     widgets::pick(ui, "spanvar", &mut self.pui.span_var, &SPANVARS);
                 });
                 Plot::new("span").height(rest - 30.0).legend(Legend::default()).x_axis_label("span position (m)").show(ui, |pu| {
-                    if let Some(p) = &sel {
+                    if let Some(p) = sel {
                         if let Some(o) = p.points.get(self.pui.sel_point) {
                             let mac = p.ref_dims.2.max(1e-9);
                             let nw = o.strips.iter().map(|s| s.wing).max().map(|m| m + 1).unwrap_or(0);
@@ -830,19 +875,16 @@ impl App {
                     }
                 });
             });
-            if self.pui.show_3d {
+            if let Some((key, panel_method)) = preview {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.pui.color_cp, "colour by Cp");
                         ui.checkbox(&mut self.pui.edges, "edges");
                     });
-                    let def = sel.as_ref().and_then(|p| p.def.clone()).unwrap_or_else(|| self.pui.def.clone());
-                    let opts = foiley_plane::analysis::mesh_options(&def, &Default::default(), &Default::default());
-                    let key = self.ensure_mesh(opts);
                     let mesh = self.pui.mesh.as_ref().filter(|m| m.0 == key).map(|m| &m.1);
                     let mut ov = Overlay { lines: vec![], points: vec![] };
-                    let mut cpv: Vec<f32> = vec![];
-                    if let (Some(p), Some(m)) = (&sel, mesh) {
+                    let mut cpv: &[f32] = &[];
+                    if let (Some(p), Some(m)) = (sel, mesh) {
                         if let Some(o) = p.points.get(self.pui.sel_point) {
                             ov.points.push((o.cog, Color32::YELLOW, "CoG".into()));
                             for l in &o.wake {
@@ -852,7 +894,7 @@ impl App {
                                 }
                             }
                             if o.cp.len() == m.panels.len() {
-                                cpv = o.cp.clone();
+                                cpv = &o.cp;
                             }
                             // lift vectors per strip
                             let lmax = o.strips.iter().map(|s| s.lift_per_span.abs()).fold(0.0, f64::max).max(1e-9);
@@ -864,11 +906,11 @@ impl App {
                         }
                     }
                     let field = if self.pui.color_cp && !cpv.is_empty() {
-                        let mut v: Vec<f32> = cpv.iter().cloned().filter(|x| x.is_finite()).collect();
+                        let mut v: Vec<f32> = cpv.iter().copied().filter(|x| x.is_finite()).collect();
                         v.sort_by(|a, b| a.total_cmp(b));
                         let lo = v.get(v.len() / 50).cloned().unwrap_or(-1.0);
                         let hi = v.get(v.len() - 1 - v.len() / 50).cloned().unwrap_or(1.0);
-                        Some(ColorField { values: &cpv, min: lo, max: hi, label: if def.method.is_panel() { "Cp".into() } else { "dCp (loading)".into() } })
+                        Some(ColorField { values: cpv, min: lo, max: hi, label: if panel_method { "Cp".into() } else { "dCp (loading)".into() } })
                     } else {
                         None
                     };
@@ -879,7 +921,7 @@ impl App {
     }
 
     pub fn stability(&mut self, ui: &mut egui::Ui) {
-        let stab_polars: Vec<PlanePolar> = self.project.plane_polars.iter().filter(|p| p.points.iter().any(|o| o.stability.is_some() || o.stability_error.is_some())).cloned().collect();
+        let stab_polars: Vec<_> = self.project.plane_polars.iter().filter(|p| p.points.iter().any(|o| o.stability.is_some() || o.stability_error.is_some())).collect();
         if stab_polars.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
@@ -894,7 +936,7 @@ impl App {
             return;
         }
         let key = self.pui.sel_polar.clone().filter(|k| stab_polars.iter().any(|p| (p.plane.clone(), p.name.clone()) == *k)).unwrap_or_else(|| (stab_polars[0].plane.clone(), stab_polars[0].name.clone()));
-        let pol = stab_polars.iter().find(|p| (p.plane.clone(), p.name.clone()) == key).unwrap().clone();
+        let pol = stab_polars.iter().find(|p| p.plane == key.0 && p.name == key.1).unwrap();
         let pts: Vec<&PlaneOpp> = pol.points.iter().filter(|o| o.stability.is_some()).collect();
         let missing: Vec<&PlaneOpp> = pol.points.iter().filter(|o| o.stability.is_none() && o.stability_error.is_some()).collect();
         let missing_text = missing.iter().map(|o| format!("alpha {:.2}  V {:.2}  ctrl {:.3}: {}", o.alpha, o.velocity, o.ctrl, o.stability_error.as_deref().unwrap_or(""))).collect::<Vec<_>>().join("\n");
@@ -1525,6 +1567,28 @@ fn summary(ui: &mut egui::Ui, p: &Plane, db: &foiley_plane::FoilDb) {
         row("Ixz", format!("{:.5} kg m2", i.ixz));
         row("foils used", p.foil_names().join(", "));
     });
+}
+
+#[cfg(test)]
+mod plot_regressions {
+    use super::*;
+
+    #[test]
+    fn running_points_keep_order_and_plot_the_same_values_as_completed_points() {
+        let completed = [
+            PlaneOpp { alpha: -2.0, velocity: 11.0, cl: 0.15, cd: 0.02, ..Default::default() },
+            PlaneOpp { alpha: 3.0, velocity: 11.0, beta: 2.0, ctrl: 0.5, cl: 0.7, cd: 0.04, cy: Some(0.1), ..Default::default() },
+        ];
+        let mut points: Vec<_> = completed.iter().rev().map(LivePlotPoint::new).collect();
+        points.sort_by(|a, b| a.order.total_cmp(&b.order));
+        let running = PolarPlotPoints::Running(points);
+        let completed = PolarPlotPoints::Completed(&completed);
+
+        for (y, label) in VARS3.iter().enumerate() {
+            assert_eq!(running.coordinates(0, y), completed.coordinates(0, y), "{label}");
+        }
+        assert_eq!(running.coordinates(0, 8), [[3.0, 0.1]]);
+    }
 }
 
 #[cfg(test)]
