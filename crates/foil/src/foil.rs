@@ -61,6 +61,46 @@ fn quiet_engine() -> XFoil {
     xf
 }
 
+struct SurfaceSpline {
+    x: Vec<f64>,
+    y: Vec<f64>,
+    s: Vec<f64>,
+    xp: Vec<f64>,
+    yp: Vec<f64>,
+    ile: usize,
+}
+
+impl SurfaceSpline {
+    fn new(foil: &Foil) -> Self {
+        let n = foil.n();
+        let x = one_based(&foil.x);
+        let y = one_based(&foil.y);
+        let mut s = vec![0.0; n + 1];
+        let mut xp = vec![0.0; n + 1];
+        let mut yp = vec![0.0; n + 1];
+        scalc(&x, &y, &mut s, n);
+        segspl(&x, &mut xp, &s, n);
+        segspl(&y, &mut yp, &s, n);
+        Self { x, y, s, xp, yp, ile: foil.le_index() + 1 }
+    }
+
+    fn surface_y(&self, xc: f64) -> (f64, f64) {
+        let Self { x, y, s, xp, yp, ile } = self;
+        let ile = *ile;
+        let n = x.len() - 1;
+        let xmin = x[ile];
+        let xmax = x[1].max(x[n]);
+        let xi = xmin + xc.clamp(0.0, 1.0) * (xmax - xmin);
+        let mut su = s[1] + (s[ile] - s[1]) * (1.0 - xc);
+        let mut sl = s[ile] + (s[n] - s[ile]) * xc;
+        sinvrt(&mut su, xi, x, xp, s, n);
+        sinvrt(&mut sl, xi, x, xp, s, n);
+        let su = su.clamp(s[1], s[ile]);
+        let sl = sl.clamp(s[ile], s[n]);
+        (seval(su, y, yp, s, n), seval(sl, y, yp, s, n))
+    }
+}
+
 impl Foil {
     pub fn new(name: impl Into<String>, x: Vec<f64>, y: Vec<f64>) -> Result<Foil, FoilError> {
         let f = Foil { name: name.into(), x, y, hinge: None, note: String::new() };
@@ -282,26 +322,7 @@ impl Foil {
     /// the foil's own x range), by spline inversion.
     pub fn surface_y(&self, xc: f64) -> (f64, f64) {
         let _q = foiley::quiet_scope();
-        let n = self.n();
-        let x = one_based(&self.x);
-        let y = one_based(&self.y);
-        let mut s = vec![0.0; n + 1];
-        let mut xp = vec![0.0; n + 1];
-        let mut yp = vec![0.0; n + 1];
-        scalc(&x, &y, &mut s, n);
-        segspl(&x, &mut xp, &s, n);
-        segspl(&y, &mut yp, &s, n);
-        let ile = self.le_index() + 1;
-        let xmin = self.x[ile - 1];
-        let xmax = self.x[0].max(self.x[n - 1]);
-        let xi = xmin + xc.clamp(0.0, 1.0) * (xmax - xmin);
-        let mut su = s[1] + (s[ile] - s[1]) * (1.0 - xc);
-        let mut sl = s[ile] + (s[n] - s[ile]) * xc;
-        sinvrt(&mut su, xi, &x, &xp, &s, n);
-        sinvrt(&mut sl, xi, &x, &xp, &s, n);
-        let su = su.clamp(s[1], s[ile]);
-        let sl = sl.clamp(s[ile], s[n]);
-        (seval(su, &y, &yp, &s, n), seval(sl, &y, &yp, &s, n))
+        SurfaceSpline::new(self).surface_y(xc)
     }
 
     /// Camber and thickness lines at `m+1` cosine-spaced stations:
@@ -310,8 +331,10 @@ impl Foil {
         let xs = foiley_core::interp::distribution(foiley_core::Spacing::Cosine, m);
         let mut c = Vec::with_capacity(xs.len());
         let mut t = Vec::with_capacity(xs.len());
+        let _q = foiley::quiet_scope();
+        let spline = SurfaceSpline::new(self);
         for &xc in &xs {
-            let (yu, yl) = self.surface_y(xc);
+            let (yu, yl) = spline.surface_y(xc);
             c.push(0.5 * (yu + yl));
             t.push(yu - yl);
         }
@@ -547,6 +570,20 @@ mod tests {
         assert!((p.x_camber - 0.4).abs() < 0.03, "{p:?}");
         let (u, l) = f.surface_y(0.3);
         assert!(u > 0.07 && l < -0.03, "{u} {l}");
+    }
+
+    #[test]
+    fn batched_surface_samples_match_single_station_bits() {
+        for code in ["2412", "0009"] {
+            let f = Foil::naca(code).unwrap().normalized();
+            let (xs, camber, thickness) = f.camber_thickness(120);
+            assert_eq!(xs.len(), 121);
+            for (i, &x) in xs.iter().enumerate() {
+                let (u, l) = f.surface_y(x);
+                assert_eq!(camber[i].to_bits(), (0.5 * (u + l)).to_bits());
+                assert_eq!(thickness[i].to_bits(), (u - l).to_bits());
+            }
+        }
     }
     #[test]
     fn dat_roundtrip_and_ops() {
