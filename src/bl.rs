@@ -663,6 +663,10 @@ impl XFoil {
 
     /// Set up global Newton system (SETBL).
     pub fn setbl(&mut self) {
+        self.setbl_with_uem(false);
+    }
+
+    pub(crate) fn setbl_with_uem(&mut self, reuse_uem: bool) {
         let clmr = if self.lalfa { self.cl } else { self.clspec };
         let mut re_clmr = 0.0;
         let ma_clmr = self.mrcl(clmr, &mut re_clmr);
@@ -703,7 +707,9 @@ impl XFoil {
         }
         self.mrchdu();
 
-        self.build_uem();
+        if !reuse_uem {
+            self.build_uem();
+        }
 
         let nsys = self.nsys;
         let mut usav = [vec![0.0; self.nbl[1] + 1], vec![0.0; self.nbl[1] + 1], vec![0.0; self.nbl[2] + 1]];

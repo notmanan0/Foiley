@@ -876,9 +876,13 @@ impl XFoil {
         }
         let mut conv = false;
         self.viscal_iters = 0;
+        // DIJ is fixed during this loop. Always assemble UEM on entry, after
+        // any wake rebuild or precomputed wake installation. STMOVE changes
+        // the station mapping only when stagnation crosses a panel boundary.
+        let mut reuse_uem = false;
         for iter in 1..=niter {
             self.viscal_iters = iter;
-            self.setbl();
+            self.setbl_with_uem(reuse_uem);
             self.blsolv();
             self.update();
             if self.lalfa {
@@ -893,7 +897,9 @@ impl XFoil {
             }
             self.qvfue();
             self.gamqv();
+            let previous_ist = self.ist;
             self.stmove();
+            reuse_uem = self.ist == previous_ist;
             self.clcalc();
             self.cdcalc();
             if self.verbose {
