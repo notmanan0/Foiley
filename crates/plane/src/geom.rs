@@ -151,6 +151,31 @@ impl Wing {
         }
     }
 
+    /// Foil(s) at signed developed span position `span_pos`:
+    /// `(inner_foil, outer_foil, t)` where `t` in `0..=1` is the linear
+    /// interpolation fraction from `inner_foil` to `outer_foil`.
+    pub fn foil_at(&self, span_pos: f64) -> Option<(&str, &str, f64)> {
+        if self.sections.len() < 2 || !span_pos.is_finite() {
+            return None;
+        }
+        let left = span_pos < 0.0;
+        let ya = span_pos.abs();
+        let s = &self.sections;
+        let mut i = 0;
+        while i + 2 < s.len() && s[i + 1].y < ya {
+            i += 1;
+        }
+        let (a, b) = (&s[i], &s[i + 1]);
+        let t = if (b.y - a.y).abs() > 1e-12 { ((ya - a.y) / (b.y - a.y)).clamp(0.0, 1.0) } else { 0.0 };
+        Some((self.foil(i, left), self.foil(i + 1, left), t))
+    }
+
+    /// Dominant airfoil name at signed developed span position `span_pos`.
+    pub fn dominant_foil_at(&self, span_pos: f64) -> Option<&str> {
+        let (a, b, t) = self.foil_at(span_pos)?;
+        Some(if t < 0.5 { a } else { b })
+    }
+
     /// Junction "up" directions (bisectors of adjacent panel normals).
     fn junction_ups(&self) -> Vec<Vec3> {
         let n = self.sections.len();

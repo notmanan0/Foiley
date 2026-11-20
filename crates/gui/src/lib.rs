@@ -55,7 +55,7 @@ pub enum Pending {
     BaseMeshHash,
     /// an inverse-design job, with what it was computed from
     Inverse(crate::foil_ui::InvKey),
-    Optimise,
+    Optimise { id: JobId, meta: Box<crate::foil_ui::OptimRunMeta> },
     /// apply an imported CAD body to the plane of this name
     CadImport { plane: String },
 }
@@ -309,13 +309,20 @@ impl App {
         self.pui.invalidate_mesh_key(&self.jobs);
     }
 
-    /// Rename foil `old` to `new` everywhere, including in running 3D analyses.
+    /// Rename foil `old` to `new` everywhere, including in running 3D analyses
+    /// and optimiser origins/results.
     fn rename_foil(&mut self, old: &str, new: &str) {
         self.project.rename_foil(old, new);
         let renames = HashMap::from([(old.to_owned(), new.to_owned())]);
         for target in polar_targets(&mut self.pending) {
             target.renamed.follow_foil_renames(&renames);
         }
+        for pending in &mut self.pending {
+            if let Pending::Optimise { meta, .. } = &mut pending.action {
+                meta.follow_foil_rename(old, new);
+            }
+        }
+        self.fui.follow_foil_rename(old, new);
     }
 
     fn invalidate_preview_inputs(&mut self) {
@@ -572,8 +579,18 @@ impl App {
             let Some(job) = job else { continue };
             match (st, out) {
                 (JobStatus::Done, Some(out)) | (JobStatus::Cancelled, Some(out)) => self.apply_output(generation, &job.title, what, out),
-                (JobStatus::Failed(e), _) => self.notify(format!("{} failed: {e}", job.title), true),
-                (JobStatus::Cancelled, None) => self.notify(format!("{} cancelled", job.title), false),
+                (JobStatus::Failed(e), _) => {
+                    if self.fui.opt_job.as_ref().is_some_and(|(jid, _)| *jid == id) {
+                        self.fui.opt_job = None;
+                    }
+                    self.notify(format!("{} failed: {e}", job.title), true);
+                }
+                (JobStatus::Cancelled, None) => {
+                    if self.fui.opt_job.as_ref().is_some_and(|(jid, _)| *jid == id) {
+                        self.fui.opt_job = None;
+                    }
+                    self.notify(format!("{} cancelled", job.title), false);
+                }
                 _ => {}
             }
         }
@@ -657,13 +674,38 @@ impl App {
                     }
                 }
             }
-            (Pending::Optimise, JobOutput::Optimise(r)) => {
-                let msg = match &r.best {
-                    Some(b) => format!("{title}: best CL {:.4} CD {:.5} after {} evaluations", b.cl, b.cd, r.evaluations),
-                    None => format!("{title}: no feasible design"),
+            (Pending::Optimise { id: job_id, meta }, JobOutput::Optimise(r)) => {
+                // Only accept the result if this job is still the active optimiser job
+                // (applying new 3D points or starting another run supersedes it).
+                if self.fui.opt_job.as_ref().map(|(jid, _)| *jid) != Some(job_id) {
+                    return;
+                }
+                self.fui.opt_job = None;
+                let (msg, is_err) = match &r.best {
+                    Some(b) if !b.op_points.is_empty() => {
+                        let summary: Vec<String> = b
+                            .op_points
+                            .iter()
+                            .enumerate()
+                            .map(|(i, ev)| {
+                                let delta = r
+                                    .baseline
+                                    .as_ref()
+                                    .and_then(|base| base.op_points.get(i))
+                                    .filter(|o| o.converged && o.cd > 1e-9)
+                                    .map(|o| format!(" ({:+.1}%)", (ev.cd - o.cd) / o.cd * 100.0))
+                                    .unwrap_or_default();
+                                format!("{} CD {:.5}{delta}", ev.label, ev.cd)
+                            })
+                            .collect();
+                        (format!("{title}: {} ({} evals)", summary.join(", "), r.evaluations), false)
+                    }
+                    Some(b) => (format!("{title}: best CL {:.4} CD {:.5} after {} evaluations", b.cl, b.cd, r.evaluations), false),
+                    None => (format!("{title}: no design satisfied all constraints"), true),
                 };
-                self.fui.opt_result = Some(r);
-                self.notify(msg, false);
+                self.fui.opt_sel_pareto = None;
+                self.fui.opt_result = Some((r, *meta));
+                self.notify(msg, is_err);
             }
             (Pending::CadImport { plane }, JobOutput::CadImport(r)) => match self.project.planes.iter().position(|p| p.name == plane) {
                 Some(i) => {

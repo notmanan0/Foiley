@@ -1,6 +1,6 @@
 //! Foil design and 2D analysis modules.
 
-use crate::widgets::{self, check, heading, hint, int, int_keep, num, num_keep, section, series_color};
+use crate::widgets::{self, check, heading, hint, int, int_keep, num, num_keep, num_u, section, series_color};
 use crate::{App, Pending};
 use eframe::egui::{self, Color32, RichText};
 use egui_plot::{Legend, Line, Plot, PlotPoints, Points};
@@ -14,10 +14,10 @@ use foiley_foil::gen::cst::{Cst, CstFit};
 use foiley_foil::gen::kt::KarmanTrefftz;
 use foiley_foil::gen::parsec::Parsec;
 use foiley_foil::gen::plate::{Plate, PlateCamber, PlateEdge};
-use foiley_foil::optim::{Algorithm, Goal, OptimResult, OptimSettings, Parameterization};
+use foiley_foil::optim::{Algorithm, Candidate, DragGoal, Goal, OperatingPoint, OptimResult, OptimSettings, Parameterization, SparConstraint};
 use foiley_foil::Recipe;
 use foiley_app::JobId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 struct PolarLabel {
     key: (String, String),
@@ -145,6 +145,77 @@ impl GenUi {
     }
 }
 
+/// UI state for "Use points from 3D analysis" inside the optimiser.
+#[derive(Clone, Debug, Default)]
+pub struct From3dPicker {
+    pub force_open: Option<bool>,
+    pub polar: Option<(String, String)>,
+    pub wing: usize,
+    pub span_pos: Option<f64>,
+    pub selected_points: BTreeSet<usize>,
+}
+
+/// Which 3D plane, polar and wing station an operating-point table came from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SectionOptimOrigin {
+    pub plane: String,
+    pub polar_name: String,
+    pub polar_def: Option<foiley_plane::PlanePolarDef>,
+    pub wing: usize,
+    pub wing_name: String,
+    pub span_pos: f64,
+    pub foil: String,
+    /// Resolved 2D analysis settings of `foil` in the source 3D polar (Mach,
+    /// Ncrit, trips, wake controls) so the optimiser and comparison rerun keep
+    /// identical transition settings.
+    pub source_analysis: Option<AnalysisSettings>,
+}
+
+/// Frozen metadata captured when an optimiser job is submitted, keeping the
+/// result, spar constraint, base foil name and 3D origin bound to that run.
+#[derive(Clone, Debug)]
+pub struct OptimRunMeta {
+    pub base_foil: String,
+    pub spar: Option<SparConstraint>,
+    pub origin: Option<SectionOptimOrigin>,
+    pub all_target_goals: bool,
+}
+
+impl OptimRunMeta {
+    pub fn follow_foil_rename(&mut self, old: &str, new: &str) {
+        if self.base_foil == old {
+            self.base_foil = new.to_string();
+        }
+        if let Some(o) = &mut self.origin {
+            if o.foil == old {
+                o.foil = new.to_string();
+            }
+        }
+    }
+
+    pub fn follow_plane_rename(&mut self, old: &str, new: &str) {
+        if let Some(o) = &mut self.origin {
+            if o.plane == old {
+                o.plane = new.to_string();
+            }
+        }
+    }
+}
+
+type Apply3dRequest = ((String, String), usize, f64, BTreeSet<usize>);
+
+/// Safe default spar minimum thickness (`0.5%` ..= `cur_t`) for any valid foil,
+/// including thin sections below 4% thickness.
+fn default_spar_min(cur_t: f64) -> f64 {
+    if cur_t.is_finite() && cur_t > 0.005 {
+        let stepped = ((cur_t * 200.0).floor() / 200.0) - 0.005;
+        let floor = (cur_t * 0.85).max(0.005);
+        stepped.max(floor).clamp(0.005, cur_t)
+    } else {
+        0.005
+    }
+}
+
 pub struct FoilUi {
     pub visible: HashSet<(String, String)>,
     pub settings: AnalysisSettings,
@@ -187,13 +258,66 @@ pub struct FoilUi {
     /// Name and node hash of the foil the preview was made from.
     pub preview_for: Option<(String, u64)>,
     pub opt: OptimSettings,
-    pub opt_job: Option<JobId>,
-    pub opt_result: Option<OptimResult>,
+    pub opt_multipoint: bool,
+    pub opt_points_saved: Vec<OperatingPoint>,
+    pub opt_force_open: Option<bool>,
+    pub opt_scroll_to: bool,
+    pub opt_sel_pareto: Option<usize>,
+    pub opt_save_name: String,
+    pub opt_from_3d: From3dPicker,
+    pub opt_3d_origin: Option<SectionOptimOrigin>,
+    pub opt_job: Option<(JobId, OptimRunMeta)>,
+    pub opt_result: Option<(OptimResult, OptimRunMeta)>,
     pub gen: GenUi,
+}
+
+impl FoilUi {
+    pub fn follow_foil_rename(&mut self, old: &str, new: &str) {
+        if let Some(o) = &mut self.opt_3d_origin {
+            if o.foil == old {
+                o.foil = new.to_string();
+            }
+        }
+        if let Some((_, m)) = &mut self.opt_job {
+            m.follow_foil_rename(old, new);
+        }
+        if let Some((_, m)) = &mut self.opt_result {
+            m.follow_foil_rename(old, new);
+        }
+    }
+
+    pub fn follow_plane_rename(&mut self, old: &str, new: &str) {
+        if let Some((pl, _)) = &mut self.opt_from_3d.polar {
+            if pl == old {
+                *pl = new.to_string();
+            }
+        }
+        if let Some(o) = &mut self.opt_3d_origin {
+            if o.plane == old {
+                o.plane = new.to_string();
+            }
+        }
+        if let Some((_, m)) = &mut self.opt_job {
+            m.follow_plane_rename(old, new);
+        }
+        if let Some((_, m)) = &mut self.opt_result {
+            m.follow_plane_rename(old, new);
+        }
+    }
 }
 
 impl Default for FoilUi {
     fn default() -> Self {
+        let opt = OptimSettings {
+            parameterization: Parameterization::Cst,
+            cst_order: 4,
+            cst_max_delta: 0.05,
+            operating_points: OptimSettings::default_operating_points(),
+            spar: None,
+            population: 12,
+            iterations: 25,
+            ..OptimSettings::default()
+        };
         FoilUi {
             visible: HashSet::new(),
             settings: AnalysisSettings::default(),
@@ -233,7 +357,15 @@ impl Default for FoilUi {
             inv_iter: 10,
             inv_src: None,
             preview_for: None,
-            opt: OptimSettings::default(),
+            opt,
+            opt_multipoint: true,
+            opt_points_saved: Vec::new(),
+            opt_force_open: None,
+            opt_scroll_to: false,
+            opt_sel_pareto: None,
+            opt_save_name: String::new(),
+            opt_from_3d: From3dPicker::default(),
+            opt_3d_origin: None,
             opt_job: None,
             opt_result: None,
             gen: GenUi::default(),
@@ -474,7 +606,7 @@ impl App {
     }
 
     pub fn foil_design(&mut self, ui: &mut egui::Ui) {
-        egui::SidePanel::left("foil_design_left").resizable(true).default_width(340.0).show_inside(ui, |ui| {
+        egui::SidePanel::left("foil_design_left").resizable(true).default_width(390.0).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 heading(ui, "Foil");
                 self.foil_picker(ui);
@@ -669,85 +801,28 @@ impl App {
                         }
                     }
                 });
-                section(ui, "Optimiser (MOPSO / genetic)", false, |ui| {
-                    hint(ui, "The shape of both surfaces (and optionally a flap) is optimised with XFoil at one operating point. Hicks-Henne bumps change it locally; CST weights change thickness, camber and LE radius globally without waviness. Every evaluation runs in the background.");
-                    let o = &mut self.fui.opt;
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut o.algorithm, Algorithm::Mopso, "particle swarm (MOPSO)");
-                        ui.selectable_value(&mut o.algorithm, Algorithm::Genetic, "genetic");
+                let mut save_and_rerun: Option<(Candidate, OptimRunMeta)> = None;
+                let mut save_new_cand: Option<(Candidate, OptimRunMeta)> = None;
+                let force_open = self.fui.opt_force_open.take();
+                let opt_header = egui::CollapsingHeader::new(RichText::new("Optimiser (MOPSO / genetic)").strong())
+                    .default_open(false)
+                    .open(force_open)
+                    .show(ui, |ui| {
+                        self.optimiser_ui(ui, &foil, &mut preview, &mut save_new_cand, &mut save_and_rerun);
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("shape variables");
-                        ui.selectable_value(&mut o.parameterization, Parameterization::HicksHenne, "Hicks-Henne bumps");
-                        ui.selectable_value(&mut o.parameterization, Parameterization::Cst, "CST weights");
-                    });
-                    egui::Grid::new("opt").num_columns(2).show(ui, |ui| {
-                        num(ui, "alpha (deg)", &mut o.alpha, 0.1, -10.0..=20.0, "operating point angle of attack");
-                        let sp = o.analysis.re * 0.01;
-                        num(ui, "Reynolds", &mut o.analysis.re, sp, 1e4..=1e8, "");
-                        num(ui, "Ncrit", &mut o.analysis.ncrit, 0.1, 0.5..=15.0, "");
-                        int(ui, "population", &mut o.population, 4..=100, "candidates per iteration (7-15 recommended)");
-                        int(ui, "iterations", &mut o.iterations, 1..=500, "");
-                        if o.parameterization == Parameterization::Cst {
-                            int(ui, "CST order", &mut o.cst_order, 1..=12, "order + 1 weight changes on each surface");
-                            num(ui, "max weight change", &mut o.cst_max_delta, 0.002, 0.002..=0.3, "largest change of a CST weight (0.05 moves a 12% section by roughly 0.5% of chord)");
-                        } else {
-                            int(ui, "bumps per side", &mut o.bumps_per_side, 1..=10, "Hicks-Henne functions on each surface");
-                            num(ui, "max bump (c)", &mut o.max_amplitude, 0.001, 0.0005..=0.05, "maximum bump amplitude, fraction of chord");
-                        }
-                        let mut fl = o.flap.is_some();
-                        if check(ui, "optimise a TE flap angle", &mut fl, "adds the flap deflection as a design variable") {
-                            o.flap = if fl { Some((0.0, 10.0)) } else { None };
-                        }
-                        if let Some((a, b)) = &mut o.flap {
-                            num(ui, "  flap min (deg)", a, 0.5, -30.0..=30.0, "");
-                            num(ui, "  flap max (deg)", b, 0.5, -30.0..=30.0, "");
-                        }
-                    });
-                    ui.label(RichText::new("objectives").strong());
-                    for (k, spec) in o.objectives.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut spec.enabled, spec.objective.label());
-                            let mut gi = match spec.goal {
-                                Goal::Minimise => 0,
-                                Goal::Maximise => 1,
-                                Goal::Target { .. } => 2,
-                            };
-                            if widgets::pick(ui, &format!("goal{k}"), &mut gi, &["minimise", "maximise", "target"]) {
-                                spec.goal = match gi {
-                                    0 => Goal::Minimise,
-                                    1 => Goal::Maximise,
-                                    _ => Goal::Target { value: 0.0, tolerance: 1e-3 },
-                                };
-                            }
-                            if let Goal::Target { value, tolerance } = &mut spec.goal {
-                                ui.add(egui::DragValue::new(value).speed(0.001).prefix("= "));
-                                ui.add(egui::DragValue::new(tolerance).speed(0.0001).prefix("+/- "));
-                            }
-                        });
-                    }
-                    let running = self.fui.opt_job.and_then(|id| self.jobs.get(id)).map(|j| !j.status().is_finished()).unwrap_or(false);
-                    ui.add_enabled_ui(!running, |ui| {
-                        if ui.button(RichText::new("Run optimiser").strong()).clicked() {
-                            let k = JobKind::Optimise { foil: foil.clone(), settings: self.fui.opt.clone() };
-                            let j = self.jobs.submit(format!("optimise {}", foil.name), k);
-                            self.fui.opt_job = Some(j.id);
-                            self.fui.opt_result = None;
-                            self.track_job(j.id, Pending::Optimise);
-                        }
-                    });
-                    let live = self.fui.opt_job.and_then(|id| self.jobs.get(id)).and_then(|j| j.partial.lock().unwrap().optim.clone()).or_else(|| self.fui.opt_result.clone());
-                    if let Some(r) = live {
-                        if let Some(b) = &r.best {
-                            ui.label(format!("best: CL {:.4}  CD {:.5}  CL/CD {:.1}  Cm {:.4}  ({} evaluations, {} Pareto)", b.cl, b.cd, b.cl / b.cd.max(1e-12), b.cm, r.evaluations, r.pareto.len()));
-                            if ui.button("Preview best design").clicked() {
-                                let mut f = b.foil.clone();
-                                f.note = format!("optimised: CL {:.3} CD {:.5}", b.cl, b.cd);
-                                preview = Some(Ok(f));
-                            }
-                        }
-                    }
-                });
+                if self.fui.opt_scroll_to {
+                    opt_header.header_response.scroll_to_me(Some(egui::Align::TOP));
+                    self.fui.opt_scroll_to = false;
+                }
+                if let Some((cand, meta)) = save_new_cand {
+                    let name = self.save_optim_candidate(&cand, &meta.base_foil);
+                    self.sel_foil = Some(name.clone());
+                    self.fui.preview = None;
+                    self.notify(format!("saved optimised foil '{name}'"), false);
+                }
+                if let Some((cand, meta)) = save_and_rerun {
+                    self.save_and_rerun_3d_study(&cand, &meta);
+                }
                 if let Some(r) = preview {
                     match r {
                         Ok(p) => {
@@ -805,12 +880,15 @@ impl App {
             let foil = self.selected_foil();
             let pv = self.fui.preview.clone();
             let new_foil = self.fui.gen.shown().cloned();
-            let live = self.fui.opt_job.and_then(|id| self.jobs.get(id)).and_then(|j| j.partial.lock().unwrap().optim.clone()).or_else(|| self.fui.opt_result.clone());
+            let live = self.live_optim();
+            let sel_cand = live.as_ref().and_then(|(r, _)| selected_optim_candidate(r, self.fui.opt_sel_pareto)).cloned();
+            let active_spar = live.as_ref().and_then(|(_, m)| m.spar).or(self.fui.opt.spar);
             let extra = self.fui.qdist.is_some() || live.is_some();
             let h = ui.available_height();
-            Plot::new("foilshape").data_aspect(1.0).height(if extra { h * 0.55 } else { h }).legend(Legend::default()).show(ui, |pu| {
-                if let Some(best) = live.as_ref().and_then(|r| r.best.as_ref()) {
-                    pu.line(Line::new("optimiser best", PlotPoints::from(foil_lines(&best.foil))).color(Color32::from_rgb(90, 220, 120)).width(1.5_f32));
+            let plot_h = if extra { (h * 0.50).max(140.0) } else { h };
+            Plot::new("foilshape").data_aspect(1.0).height(plot_h).legend(Legend::default()).show(ui, |pu| {
+                if let Some(cand) = &sel_cand {
+                    pu.line(Line::new("optimiser candidate", PlotPoints::from(foil_lines(&cand.foil))).color(Color32::from_rgb(90, 220, 120)).width(1.8_f32));
                 }
                 if let Some(f) = &foil {
                     pu.line(Line::new(f.name.clone(), PlotPoints::from(foil_lines(f))).color(series_color(0)).width(2.0_f32));
@@ -821,6 +899,15 @@ impl App {
                         let (u, l) = f.surface_y(x);
                         pu.points(Points::new("hinge", PlotPoints::from(vec![[x, l + yr * (u - l)]])).radius(5.0_f32).color(Color32::YELLOW));
                     }
+                    if let Some(sp) = active_spar {
+                        let ref_foil = sel_cand.as_ref().map(|c| &c.foil).unwrap_or(f);
+                        let (u, l) = ref_foil.surface_y(sp.x);
+                        let mid = 0.5 * (u + l);
+                        let half = 0.5 * sp.min_thickness;
+                        let spar_pts = vec![[sp.x, mid - half], [sp.x, mid + half]];
+                        pu.line(Line::new(format!("spar min {:.1}%", sp.min_thickness * 100.0), PlotPoints::from(spar_pts.clone())).color(Color32::from_rgb(255, 210, 70)).width(3.0_f32));
+                        pu.points(Points::new("spar limits", PlotPoints::from(spar_pts)).radius(3.5_f32).color(Color32::from_rgb(255, 210, 70)));
+                    }
                 }
                 if let Some(p) = &pv {
                     pu.line(Line::new("preview", PlotPoints::from(foil_lines(p))).color(Color32::from_rgb(255, 160, 60)).width(2.0_f32));
@@ -830,14 +917,14 @@ impl App {
                 }
             });
             if extra {
-                ui.horizontal(|ui| {
-                    let w = ui.available_width();
-                    let hh = ui.available_height();
+                let w = ui.available_width();
+                let hh = ui.available_height().max(130.0);
+                ui.allocate_ui_with_layout(egui::vec2(w, hh), egui::Layout::left_to_right(egui::Align::TOP), |ui| {
                     if let Some(d) = &self.fui.qdist {
-                        ui.vertical(|ui| {
-                            ui.set_width(if live.is_some() { w * 0.5 } else { w });
+                        let qw = if live.is_some() { w * 0.40 } else { w };
+                        ui.allocate_ui_with_layout(egui::vec2(qw, hh), egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             ui.label(RichText::new(format!("Surface speed Q/Vinf at alpha {:.2} (CL {:.3})", d.alpha, d.cl)).strong());
-                            Plot::new("qdist").height(hh - 24.0).legend(Legend::default()).x_axis_label("x/c").show(ui, |pu| {
+                            Plot::new("qdist").height((hh - 24.0).max(80.0)).legend(Legend::default()).x_axis_label("x/c").show(ui, |pu| {
                                 let side = |upper: bool, q: &[f64]| -> Vec<[f64; 2]> { (0..d.q.len()).filter(|&i| d.is_upper(i) == upper).map(|i| [d.x[i], q[i].abs()]).collect() };
                                 pu.line(Line::new("upper", PlotPoints::from(side(true, &d.q))).color(series_color(0)));
                                 pu.line(Line::new("lower", PlotPoints::from(side(false, &d.q))).color(series_color(1)));
@@ -849,15 +936,9 @@ impl App {
                             });
                         });
                     }
-                    if let Some(r) = &live {
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new("Optimiser: best score per iteration").strong());
-                            Plot::new("opthist").height(hh - 24.0).x_axis_label("iteration").show(ui, |pu| {
-                                let pts: Vec<[f64; 2]> = r.history.iter().map(|(i, v)| [*i as f64, *v]).collect();
-                                pu.line(Line::new("best", PlotPoints::from(pts.clone())).color(series_color(2)));
-                                pu.points(Points::new("best", PlotPoints::from(pts)).radius(3.0_f32).color(series_color(2)));
-                            });
-                        });
+                    if let Some((r, meta)) = &live {
+                        let avail_w = if self.fui.qdist.is_some() { (w * 0.58).max(200.0) } else { w };
+                        self.optim_results_panel(ui, r, meta, avail_w, hh);
                     }
                 });
             }
@@ -1264,11 +1345,971 @@ impl App {
             });
         });
     }
+
+    /// Currently displayed optimiser result (live running partial or finished
+    /// result) paired with the frozen metadata of the job that produced it.
+    fn live_optim(&self) -> Option<(OptimResult, OptimRunMeta)> {
+        if let Some((id, meta)) = &self.fui.opt_job {
+            if let Some(r) = self.jobs.get(*id).and_then(|j| j.partial.lock().unwrap().optim.clone()) {
+                return Some((r, meta.clone()));
+            }
+        }
+        self.fui.opt_result.clone()
+    }
+
+    /// Resolve the 2D analysis settings (Mach, Ncrit, bottom Ncrit, trips, wake
+    /// controls) of the polar family actually used for `foil_name` in `polar`.
+    fn resolve_source_foil_analysis(&mut self, polar: &foiley_plane::PlanePolar, foil_name: &str) -> Option<AnalysisSettings> {
+        if foil_name.is_empty() {
+            return None;
+        }
+        let sel = polar.def.as_ref().map(|d| d.family).unwrap_or_default();
+        let db = self.foil_db();
+        let base = AnalysisSettings::default();
+        if let Ok(Some(id)) = db.resolve(foil_name, &sel) {
+            let fam = db.family(id);
+            let k = fam.key;
+            let mut st = fam.polars.first().and_then(|p| p.settings.clone()).unwrap_or(base);
+            st.mach = k.mach;
+            st.ncrit = k.ncrit;
+            st.ncrit_bot = k.ncrit_bot;
+            st.xtr_top = k.xtr_top;
+            st.xtr_bot = k.xtr_bot;
+            return Some(st);
+        }
+        // Fallback: if the polar definition specifies explicit family settings, carry them.
+        if sel != foiley_plane::FamilySelector::default() {
+            return Some(AnalysisSettings {
+                mach: sel.mach.unwrap_or(base.mach),
+                ncrit: sel.ncrit.unwrap_or(base.ncrit),
+                ncrit_bot: sel.ncrit_bot,
+                xtr_top: sel.xtr_top.unwrap_or(base.xtr_top),
+                xtr_bot: sel.xtr_bot.unwrap_or(base.xtr_bot),
+                ..base
+            });
+        }
+        None
+    }
+
+    /// Jump from 3D analysis to the 2D airfoil optimiser, pre-loading slow flight,
+    /// cruise and fast glide from `(wing, span_pos)` on `polar_key`.
+    pub(crate) fn open_section_optimiser(&mut self, polar_key: (String, String), wing: usize, span_pos: f64) {
+        let Some(polar) = self.project.plane_polars.iter().find(|p| p.plane == polar_key.0 && p.name == polar_key.1).cloned() else {
+            return;
+        };
+        let plane = self.project.planes.iter().find(|pl| pl.name == polar.plane);
+        let stations = polar.wing_stations(plane, wing);
+        let station = stations
+            .iter()
+            .min_by(|a, b| (a.span_pos - span_pos).abs().total_cmp(&(b.span_pos - span_pos).abs()))
+            .cloned();
+        let actual_y = station.as_ref().map(|s| s.span_pos).unwrap_or(span_pos);
+        let regimes = polar.pick_flight_regimes(wing, actual_y);
+        let selected: BTreeSet<usize> = regimes.iter().map(|r| r.point_index).collect();
+
+        self.fui.opt_from_3d.polar = Some(polar_key.clone());
+        self.fui.opt_from_3d.wing = wing;
+        self.fui.opt_from_3d.span_pos = Some(actual_y);
+        self.fui.opt_from_3d.selected_points = selected.clone();
+        self.fui.opt_from_3d.force_open = Some(true);
+        self.fui.opt_multipoint = true;
+        self.fui.opt_force_open = Some(true);
+        self.fui.opt_scroll_to = true;
+        self.module = crate::Module::FoilDesign;
+
+        if selected.is_empty() {
+            self.notify("selected 3D polar has no valid operating points at this station", true);
+            return;
+        }
+        self.apply_3d_station_points(&polar_key, wing, actual_y, &selected);
+    }
+
+    /// Populate `self.fui.opt.operating_points` from the selected points of a 3D polar
+    /// at `(wing, span_pos)`, aligning the selected foil and 2D flow settings.
+    fn apply_3d_station_points(&mut self, polar_key: &(String, String), wing: usize, span_pos: f64, selected_points: &BTreeSet<usize>) {
+        let Some(polar) = self.project.plane_polars.iter().find(|p| p.plane == polar_key.0 && p.name == polar_key.1).cloned() else {
+            return;
+        };
+        let plane = self.project.planes.iter().find(|pl| pl.name == polar.plane);
+        let stations = polar.wing_stations(plane, wing);
+        let station = stations
+            .iter()
+            .min_by(|a, b| (a.span_pos - span_pos).abs().total_cmp(&(b.span_pos - span_pos).abs()))
+            .cloned();
+        let actual_y = station.as_ref().map(|s| s.span_pos).unwrap_or(span_pos);
+        let wing_name = station.as_ref().map(|s| s.wing_name.clone()).unwrap_or_else(|| format!("wing {wing}"));
+        let foil_name = station.as_ref().and_then(|s| s.foil.clone()).unwrap_or_default();
+
+        // Keep exact regime ordering, labels and default goals when the selected
+        // points match `pick_flight_regimes` (guaranteed agreement with CLI).
+        let regimes = polar.pick_flight_regimes(wing, actual_y);
+        let regime_set: BTreeSet<usize> = regimes.iter().map(|r| r.point_index).collect();
+        let rows: Vec<OperatingPoint> = if !regimes.is_empty() && *selected_points == regime_set {
+            regimes.iter().map(|sp| sp.to_default_operating_point()).collect()
+        } else {
+            let regime_map: HashMap<usize, (String, DragGoal)> = regimes.into_iter().map(|r| (r.point_index, (r.label, r.default_goal))).collect();
+            let mut pts: Vec<foiley_plane::StationPoint> = selected_points
+                .iter()
+                .filter_map(|&idx| {
+                    let fallback = polar.points.get(idx).map(|o| format!("a={:.1} V={:.1}", o.alpha, o.velocity)).unwrap_or_default();
+                    let (label, goal) = regime_map.get(&idx).cloned().unwrap_or((fallback, DragGoal::Minimise));
+                    let mut sp = polar.station_point(idx, wing, actual_y, label)?;
+                    sp.default_goal = goal;
+                    Some(sp)
+                })
+                .collect();
+            if pts.is_empty() {
+                self.notify("pick at least one 3D operating point first", true);
+                return;
+            }
+            // Order consistently with the polar's flight envelope (ascending speed
+            // when speed varies, otherwise descending whole-aircraft CL).
+            let (v_min, v_max) = pts.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), p| (lo.min(p.velocity), hi.max(p.velocity)));
+            let v_varies = (v_max - v_min) / v_max.max(1e-9) > 0.05;
+            if v_varies {
+                pts.sort_by(|a, b| a.velocity.total_cmp(&b.velocity).then_with(|| b.plane_cl.total_cmp(&a.plane_cl)));
+            } else {
+                pts.sort_by(|a, b| b.plane_cl.total_cmp(&a.plane_cl));
+            }
+            let any_cap = pts.iter().any(|p| p.default_goal.is_cap());
+            let n = pts.len();
+            pts.iter()
+                .enumerate()
+                .map(|(i, sp)| {
+                    let goal = if any_cap {
+                        sp.default_goal
+                    } else if n >= 2 && i == 0 {
+                        DragGoal::AtMostOriginal
+                    } else {
+                        DragGoal::Minimise
+                    };
+                    sp.to_operating_point(goal, 1.0)
+                })
+                .collect()
+        };
+        let n = rows.len();
+
+        // Detach any previous optimiser job/result so an earlier candidate can
+        // never be installed onto this newly loaded wing station.
+        if let Some((old_id, _)) = self.fui.opt_job.take() {
+            if let Some(j) = self.jobs.get(old_id) {
+                if !j.status().is_finished() {
+                    j.cancel();
+                }
+            }
+        }
+        self.fui.opt.operating_points = rows;
+        self.fui.opt_multipoint = true;
+        self.fui.opt_sel_pareto = None;
+        self.fui.opt_result = None;
+
+        let source_analysis = self.resolve_source_foil_analysis(&polar, &foil_name);
+        if !foil_name.is_empty() && self.project.foil(&foil_name).is_some() {
+            self.sel_foil = Some(foil_name.clone());
+            self.fui.preview = None;
+            self.fui.opt_save_name = self.project.unique_foil_name(&format!("{foil_name} opt"));
+            // Inherit resolved Mach/Ncrit/trips/wake controls so 2D and 3D agree.
+            if let Some(src) = &source_analysis {
+                self.fui.opt.analysis.mach = src.mach;
+                self.fui.opt.analysis.ncrit = src.ncrit;
+                self.fui.opt.analysis.ncrit_bot = src.ncrit_bot;
+                self.fui.opt.analysis.xtr_top = src.xtr_top;
+                self.fui.opt.analysis.xtr_bot = src.xtr_bot;
+                self.fui.opt.analysis.wake_length = src.wake_length;
+                self.fui.opt.analysis.wake_dissipation = src.wake_dissipation;
+            }
+            // Set a practical default spar thickness constraint without panicking on thin foils.
+            if let Some(f) = self.project.foil(&foil_name) {
+                let spar_x = self.fui.opt.spar.map(|sp| sp.x).unwrap_or(0.30);
+                let cur_t = f.thickness_at(spar_x);
+                if cur_t > 0.005 {
+                    let default_min = default_spar_min(cur_t);
+                    match &mut self.fui.opt.spar {
+                        None => self.fui.opt.spar = Some(SparConstraint { x: spar_x, min_thickness: default_min }),
+                        Some(sp) if sp.min_thickness > cur_t + 1e-4 => sp.min_thickness = default_min,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.fui.opt_3d_origin = Some(SectionOptimOrigin {
+            plane: polar.plane.clone(),
+            polar_name: polar.name.clone(),
+            polar_def: polar.def.clone(),
+            wing,
+            wing_name: wing_name.clone(),
+            span_pos: actual_y,
+            foil: foil_name,
+            source_analysis,
+        });
+        self.notify(format!("loaded {} operating points from {} ({wing_name} y = {:.3} m)", n, polar.name, actual_y), false);
+    }
+
+    fn save_optim_candidate(&mut self, cand: &Candidate, base_name: &str) -> String {
+        self.snapshot_foil_geometry();
+        let desired = if self.fui.opt_save_name.trim().is_empty() {
+            format!("{base_name} opt")
+        } else {
+            self.fui.opt_save_name.trim().to_string()
+        };
+        let name = self.project.unique_foil_name(&desired);
+        let mut f = cand.foil.clone();
+        f.name = name.clone();
+        if !cand.op_points.is_empty() {
+            let summary: Vec<String> = cand.op_points.iter().map(|e| format!("{} CD {:.5}", e.label, e.cd)).collect();
+            f.note = format!("optimised from {base_name}: {}", summary.join(", "));
+        } else {
+            f.note = format!("optimised from {base_name}: CL {:.3} CD {:.5}", cand.cl, cand.cd);
+        }
+        self.project.foils.push(f);
+        self.fui.opt_save_name = self.project.unique_foil_name(&format!("{base_name} opt"));
+        name
+    }
+
+    /// Check whether `origin` still points to a valid source plane, wing,
+    /// matching wing section foil, and 3D polar definition.
+    fn validate_rerun_origin(&self, origin: &SectionOptimOrigin, base_name: &str) -> Result<(foiley_plane::Plane, foiley_plane::PlanePolarDef, usize, String), String> {
+        let source_plane = self
+            .project
+            .planes
+            .iter()
+            .find(|p| p.name == origin.plane)
+            .cloned()
+            .ok_or_else(|| format!("source plane '{}' is no longer in the project", origin.plane))?;
+        let source_polar = self.project.plane_polars.iter().find(|p| p.plane == origin.plane && p.name == origin.polar_name);
+        let def = source_polar
+            .and_then(|p| p.def.clone())
+            .or_else(|| origin.polar_def.clone())
+            .ok_or_else(|| format!("source 3D polar '{}' definition is no longer available", origin.polar_name))?;
+        let target_wing = if def.method == foiley_plane::Method::Llt && origin.wing == 0 {
+            source_plane.wings.iter().position(|w| w.kind == foiley_plane::WingKind::Main).unwrap_or(0)
+        } else {
+            origin.wing
+        };
+        let wing = source_plane
+            .wings
+            .get(target_wing)
+            .ok_or_else(|| format!("wing {} no longer exists on '{}'", target_wing, source_plane.name))?;
+        let target_foil = if origin.foil.is_empty() { base_name.to_string() } else { origin.foil.clone() };
+        let has_match = wing.sections.iter().any(|sec| sec.foil_right == target_foil || sec.foil_left == target_foil);
+        if !has_match {
+            return Err(format!("wing '{}' on '{}' no longer uses foil '{}'", wing.name, source_plane.name, target_foil));
+        }
+        Ok((source_plane, def, target_wing, target_foil))
+    }
+
+    /// Save the candidate as a new foil, duplicate the source 3D plane using that
+    /// foil on the optimised wing, keep the original 3D polar visible, and rerun
+    /// the same 3D analysis with matching transition settings so whole-aircraft
+    /// performance can be compared directly.
+    fn save_and_rerun_3d_study(&mut self, cand: &Candidate, meta: &OptimRunMeta) {
+        if !cand.constraints_met() {
+            self.notify("candidate violates a drag cap or spar constraint and cannot be saved for rerun", true);
+            return;
+        }
+        let Some(origin) = meta.origin.clone() else {
+            self.notify("no source 3D study linked to this run; save the foil and assign it in Plane design", true);
+            return;
+        };
+        let (source_plane, def, target_wing, target_foil) = match self.validate_rerun_origin(&origin, &meta.base_foil) {
+            Ok(v) => v,
+            Err(e) => {
+                self.notify(e, true);
+                return;
+            }
+        };
+
+        let new_foil = self.save_optim_candidate(cand, &meta.base_foil);
+        let mut new_plane = source_plane.clone();
+        new_plane.name = self.project.unique_plane_name(&format!("{} ({new_foil})", source_plane.name));
+
+        let mut swapped = 0usize;
+        if let Some(w) = new_plane.wings.get_mut(target_wing) {
+            for sec in &mut w.sections {
+                if sec.foil_right == target_foil {
+                    sec.foil_right = new_foil.clone();
+                    swapped += 1;
+                }
+                if sec.foil_left == target_foil {
+                    sec.foil_left = new_foil.clone();
+                    swapped += 1;
+                }
+            }
+        }
+        if swapped == 0 {
+            self.notify(format!("no wing section matched '{target_foil}'"), true);
+            return;
+        }
+        self.project.planes.push(new_plane.clone());
+        self.sel_plane = self.project.planes.len() - 1;
+        // Keep the original 3D polar visible for direct comparison on every plot.
+        if self.project.plane_polars.iter().any(|p| p.plane == origin.plane && p.name == origin.polar_name) {
+            self.pui.visible.insert((origin.plane.clone(), origin.polar_name.clone()));
+        }
+        let mut foil_defaults = HashMap::new();
+        if let Some(src_an) = origin.source_analysis.clone() {
+            foil_defaults.insert(new_foil.clone(), src_an);
+        }
+        let auto_polars = self.pui.auto_polars.max(6);
+        let def_name = if def.name.is_empty() { def.auto_name() } else { def.name.clone() };
+        self.module = crate::Module::PlaneAnalysis;
+        self.notify(format!("saved '{new_foil}' -> rerunning {def_name} on '{}'", new_plane.name), false);
+        self.run_3d_with_def(&new_plane, def, auto_polars, &foil_defaults);
+    }
+
+    fn optimiser_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        foil: &Foil,
+        preview: &mut Option<Result<Foil, String>>,
+        save_new_cand: &mut Option<(Candidate, OptimRunMeta)>,
+        save_and_rerun: &mut Option<(Candidate, OptimRunMeta)>,
+    ) {
+        hint(ui, "Optimise the foil shape with XFoil across one or several operating points (Re, target CL) with drag goals and a spar thickness floor. Every evaluation runs in the background.");
+
+        // Mode toggle: Operating-point table (multi-point) vs Single alpha
+        let prev_mp = self.fui.opt_multipoint;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.fui.opt_multipoint, true, "Operating points");
+            ui.selectable_value(&mut self.fui.opt_multipoint, false, "Single alpha");
+        });
+        if self.fui.opt_multipoint != prev_mp {
+            if self.fui.opt_multipoint {
+                self.fui.opt.operating_points = if self.fui.opt_points_saved.is_empty() {
+                    OptimSettings::default_operating_points()
+                } else {
+                    std::mem::take(&mut self.fui.opt_points_saved)
+                };
+            } else {
+                self.fui.opt_points_saved = std::mem::take(&mut self.fui.opt.operating_points);
+            }
+        }
+
+        // "Use points from 3D analysis" panel
+        if self.fui.opt_multipoint {
+            self.picker_3d_ui(ui);
+        }
+
+        // Operating-point table (multi-point mode)
+        if self.fui.opt_multipoint {
+            ui.add_space(4.0);
+            ui.label(RichText::new("Operating points").strong());
+            let mut remove_row: Option<usize> = None;
+            egui::ScrollArea::horizontal().id_salt("opt_table_scroll").show(ui, |ui| {
+                egui::Grid::new("opt_pts").striped(true).spacing([4.0, 3.0]).show(ui, |ui| {
+                    for h in ["", "Point", "Re", "CL", "Drag goal", "Wt", ""] {
+                        ui.label(RichText::new(h).small().strong());
+                    }
+                    ui.end_row();
+                    let n = self.fui.opt.operating_points.len();
+                    for (i, op) in self.fui.opt.operating_points.iter_mut().enumerate() {
+                        ui.checkbox(&mut op.enabled, "");
+                        ui.add(egui::TextEdit::singleline(&mut op.label).desired_width(68.0).hint_text(format!("OP {}", i + 1)));
+                        let re_sp = (op.re * 0.01).max(100.0);
+                        ui.add(egui::DragValue::new(&mut op.re).speed(re_sp).range(1e3..=1e8).max_decimals(0));
+                        ui.add(egui::DragValue::new(&mut op.cl).speed(0.01).range(-2.0..=2.5).fixed_decimals(3));
+                        ui.horizontal(|ui| {
+                            let mut gi = match op.goal {
+                                DragGoal::Minimise => 0,
+                                DragGoal::AtMostOriginal => 1,
+                                DragGoal::AtMost { .. } => 2,
+                                DragGoal::Target { .. } => 3,
+                            };
+                            if widgets::pick(ui, &format!("dgoal{i}"), &mut gi, &["minimise", "<= original", "<= max CD", "target CD"]) {
+                                op.goal = match gi {
+                                    0 => DragGoal::Minimise,
+                                    1 => DragGoal::AtMostOriginal,
+                                    2 => DragGoal::AtMost { cd: 0.012 },
+                                    _ => DragGoal::Target { cd: 0.008 },
+                                };
+                            }
+                            match &mut op.goal {
+                                DragGoal::AtMost { cd } | DragGoal::Target { cd } => {
+                                    ui.add(egui::DragValue::new(cd).speed(0.0001).range(0.0005..=0.5).fixed_decimals(5));
+                                }
+                                _ => {}
+                            }
+                        });
+                        ui.add(egui::DragValue::new(&mut op.weight).speed(0.1).range(0.1..=20.0).fixed_decimals(1));
+                        if n > 1 && ui.small_button("x").on_hover_text("remove row").clicked() {
+                            remove_row = Some(i);
+                        } else {
+                            ui.label("");
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            if let Some(i) = remove_row {
+                self.fui.opt.operating_points.remove(i);
+            }
+            ui.horizontal(|ui| {
+                if ui.small_button("+ Add point").clicked() {
+                    let next = self.fui.opt.operating_points.last().cloned().unwrap_or_default();
+                    self.fui.opt.operating_points.push(OperatingPoint { label: String::new(), ..next });
+                }
+                if ui.small_button("Glider defaults").on_hover_text("slow flight (<= orig), cruise (min), fast glide (min)").clicked() {
+                    self.fui.opt.operating_points = OptimSettings::default_operating_points();
+                    self.fui.opt_3d_origin = None;
+                }
+            });
+        }
+
+        // Minimum thickness at spar
+        ui.add_space(4.0);
+        let mut spar_on = self.fui.opt.spar.is_some();
+        if ui.checkbox(&mut spar_on, RichText::new("Minimum thickness at spar").strong()).on_hover_text("reject candidates thinner than this at the spar chord station before calling XFoil").changed() {
+            if spar_on {
+                let cur = foil.thickness_at(0.30);
+                let min_t = default_spar_min(cur);
+                self.fui.opt.spar = Some(SparConstraint { x: 0.30, min_thickness: min_t });
+            } else {
+                self.fui.opt.spar = None;
+            }
+        }
+        if let Some(sp) = &mut self.fui.opt.spar {
+            let cur_t = foil.thickness_at(sp.x);
+            egui::Grid::new("opt_spar").num_columns(2).show(ui, |ui| {
+                num(ui, "  spar x/c", &mut sp.x, 0.01, 0.05..=0.80, "chordwise spar location");
+                let mut min_pct = sp.min_thickness * 100.0;
+                if num_u(ui, "  min thickness", &mut min_pct, 0.1, 0.5..=35.0, " %c", "minimum airfoil thickness t/c at spar x/c") {
+                    sp.min_thickness = min_pct / 100.0;
+                }
+            });
+            ui.horizontal(|ui| {
+                hint(ui, &format!("{} thickness at x/c {:.2}: {:.2}%", foil.name, sp.x, cur_t * 100.0));
+                if cur_t > 0.005 && ui.small_button("match").on_hover_text("set minimum thickness to the current foil's thickness at this spar station").clicked() {
+                    sp.min_thickness = ((cur_t * 1000.0).floor() / 1000.0).max(0.005);
+                }
+            });
+            if sp.min_thickness > cur_t + 1e-4 {
+                ui.label(RichText::new("current foil is thinner than the spar floor (click 'match' or lower min thickness)").small().color(Color32::from_rgb(235, 165, 70)));
+            }
+        }
+
+        ui.separator();
+        let o = &mut self.fui.opt;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut o.algorithm, Algorithm::Mopso, "particle swarm (MOPSO)");
+            ui.selectable_value(&mut o.algorithm, Algorithm::Genetic, "genetic");
+        });
+        ui.horizontal(|ui| {
+            ui.label("shape variables");
+            ui.selectable_value(&mut o.parameterization, Parameterization::Cst, "CST weights");
+            ui.selectable_value(&mut o.parameterization, Parameterization::HicksHenne, "Hicks-Henne bumps");
+        });
+        egui::Grid::new("opt").num_columns(2).show(ui, |ui| {
+            if !self.fui.opt_multipoint {
+                num(ui, "alpha (deg)", &mut o.alpha, 0.1, -10.0..=20.0, "operating point angle of attack");
+                let sp = o.analysis.re * 0.01;
+                num(ui, "Reynolds", &mut o.analysis.re, sp, 1e4..=1e8, "");
+            }
+            num(ui, "Ncrit", &mut o.analysis.ncrit, 0.1, 0.5..=15.0, "");
+            num(ui, "Mach", &mut o.analysis.mach, 0.01, 0.0..=0.8, "");
+            int(ui, "population", &mut o.population, 4..=100, "candidates per iteration (8-16 recommended)");
+            int(ui, "iterations", &mut o.iterations, 1..=500, "");
+            if o.parameterization == Parameterization::Cst {
+                int(ui, "CST order", &mut o.cst_order, 1..=12, "order + 1 weight changes on each surface");
+                num(ui, "max weight change", &mut o.cst_max_delta, 0.002, 0.002..=0.3, "largest change of a CST weight (0.05 moves a 12% section by roughly 0.5% of chord)");
+            } else {
+                int(ui, "bumps per side", &mut o.bumps_per_side, 1..=10, "Hicks-Henne functions on each surface");
+                num(ui, "max bump (c)", &mut o.max_amplitude, 0.001, 0.0005..=0.05, "maximum bump amplitude, fraction of chord");
+            }
+            let mut fl = o.flap.is_some();
+            if check(ui, "optimise a TE flap angle", &mut fl, "adds the flap deflection as a design variable") {
+                o.flap = if fl { Some((0.0, 10.0)) } else { None };
+            }
+            if let Some((a, b)) = &mut o.flap {
+                num(ui, "  flap min (deg)", a, 0.5, -30.0..=30.0, "");
+                num(ui, "  flap max (deg)", b, 0.5, -30.0..=30.0, "");
+            }
+        });
+
+        if !self.fui.opt_multipoint {
+            ui.label(RichText::new("objectives").strong());
+            for (k, spec) in self.fui.opt.objectives.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut spec.enabled, spec.objective.label());
+                    let mut gi = match spec.goal {
+                        Goal::Minimise => 0,
+                        Goal::Maximise => 1,
+                        Goal::Target { .. } => 2,
+                    };
+                    if widgets::pick(ui, &format!("goal{k}"), &mut gi, &["minimise", "maximise", "target"]) {
+                        spec.goal = match gi {
+                            0 => Goal::Minimise,
+                            1 => Goal::Maximise,
+                            _ => Goal::Target { value: 0.0, tolerance: 1e-3 },
+                        };
+                    }
+                    if let Goal::Target { value, tolerance } = &mut spec.goal {
+                        ui.add(egui::DragValue::new(value).speed(0.001).prefix("= "));
+                        ui.add(egui::DragValue::new(tolerance).speed(0.0001).prefix("+/- "));
+                    }
+                });
+            }
+        }
+
+        let running = self.fui.opt_job.as_ref().and_then(|(id, _)| self.jobs.get(*id)).map(|j| !j.status().is_finished()).unwrap_or(false);
+        ui.add_enabled_ui(!running, |ui| {
+            if ui.button(RichText::new("Run optimiser").strong()).clicked() {
+                let st = self.fui.opt.clone();
+                if let Err(e) = st.validate().and_then(|_| st.analysis.validate()) {
+                    self.notify(e, true);
+                } else {
+                    if self.fui.opt_save_name.trim().is_empty() {
+                        self.fui.opt_save_name = self.project.unique_foil_name(&format!("{} opt", foil.name));
+                    }
+                    let enabled_ops = st.enabled_operating_points();
+                    let obj_ops: Vec<_> = enabled_ops.iter().filter(|o| !o.goal.is_cap()).collect();
+                    let all_target_goals = !obj_ops.is_empty() && obj_ops.iter().all(|o| matches!(o.goal, DragGoal::Target { .. }));
+                    // Only attach the 3D origin if this run actually optimises the linked station's foil.
+                    let origin = self
+                        .fui
+                        .opt_3d_origin
+                        .clone()
+                        .filter(|orig| orig.foil.is_empty() || orig.foil == foil.name);
+                    let meta = OptimRunMeta {
+                        base_foil: foil.name.clone(),
+                        spar: st.spar,
+                        origin,
+                        all_target_goals,
+                    };
+                    let k = JobKind::Optimise { foil: foil.clone(), settings: st };
+                    let j = self.jobs.submit(format!("optimise {}", foil.name), k);
+                    self.fui.opt_job = Some((j.id, meta.clone()));
+                    self.fui.opt_result = None;
+                    self.fui.opt_sel_pareto = None;
+                    self.track_job(j.id, Pending::Optimise { id: j.id, meta: Box::new(meta) });
+                }
+            }
+        });
+
+        let live = self.live_optim();
+        if let Some((r, meta)) = live {
+            if let Some(cand) = selected_optim_candidate(&r, self.fui.opt_sel_pareto).cloned() {
+                ui.separator();
+                if cand.op_points.is_empty() {
+                    ui.label(format!("best: CL {:.4}  CD {:.5}  CL/CD {:.1}  Cm {:.4}  ({} evals, {} Pareto)", cand.cl, cand.cd, cand.cl / cand.cd.max(1e-12), cand.cm, r.evaluations, r.pareto.len()));
+                } else {
+                    ui.label(format!("{} evals, {} Pareto (from {}) — see comparison table", r.evaluations, r.pareto.len(), meta.base_foil));
+                }
+                if self.fui.opt_save_name.trim().is_empty() {
+                    self.fui.opt_save_name = self.project.unique_foil_name(&format!("{} opt", meta.base_foil));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.fui.opt_save_name).desired_width(130.0).hint_text("new foil name"));
+                    if ui.button("Save as new foil").on_hover_text("add the candidate airfoil to the project").clicked() {
+                        *save_new_cand = Some((cand.clone(), meta.clone()));
+                    }
+                    if ui.button("Preview").on_hover_text("show the candidate as the orange preview").clicked() {
+                        let mut f = cand.foil.clone();
+                        f.note = format!("optimised candidate (CL {:.3} CD {:.5})", cand.cl, cand.cd);
+                        *preview = Some(Ok(f));
+                    }
+                });
+                if let Some(origin) = &meta.origin {
+                    match self.validate_rerun_origin(origin, &meta.base_foil) {
+                        Ok(_) => {
+                            if ui
+                                .button(RichText::new("Save foil & rerun 3D study").strong())
+                                .on_hover_text(format!("save as a new foil, duplicate '{}' with it on '{}', and rerun '{}' alongside the original polar", origin.plane, origin.wing_name, origin.polar_name))
+                                .clicked()
+                            {
+                                *save_and_rerun = Some((cand, meta));
+                            }
+                        }
+                        Err(reason) => {
+                            ui.add_enabled(false, egui::Button::new("Save foil & rerun 3D study")).on_disabled_hover_text(reason);
+                        }
+                    }
+                }
+            } else if !running {
+                ui.separator();
+                ui.label(RichText::new("No candidate satisfied all drag caps and spar constraints.").small().color(Color32::from_rgb(235, 90, 75)));
+            }
+        }
+    }
+
+    /// "Use points from 3D analysis" sub-panel inside the optimiser.
+    fn picker_3d_ui(&mut self, ui: &mut egui::Ui) {
+        let force_open = self.fui.opt_from_3d.force_open.take();
+        let polars: Vec<(String, String)> = self
+            .project
+            .plane_polars
+            .iter()
+            .filter(|p| p.points.iter().any(|o| !o.strips.is_empty()))
+            .map(|p| (p.plane.clone(), p.name.clone()))
+            .collect();
+        let mut go_3d = false;
+        let mut apply_req: Option<Apply3dRequest> = None;
+
+        egui::CollapsingHeader::new(RichText::new("Use points from 3D analysis").strong())
+            .default_open(false)
+            .open(force_open)
+            .show(ui, |ui| {
+                if polars.is_empty() {
+                    hint(ui, "Run a 3D analysis first (e.g. a T2 fixed-lift or T3 glide polar on the glider) to extract local Re and CL from a wing station.");
+                    if ui.button("Go to 3D analysis").clicked() {
+                        go_3d = true;
+                    }
+                    return;
+                }
+                // Keep selected polar valid
+                if self.fui.opt_from_3d.polar.as_ref().is_none_or(|k| !polars.contains(k)) {
+                    let prefer = self.pui.sel_polar.clone().filter(|k| polars.contains(k)).unwrap_or_else(|| polars[0].clone());
+                    self.fui.opt_from_3d.polar = Some(prefer);
+                    self.fui.opt_from_3d.span_pos = None;
+                    self.fui.opt_from_3d.selected_points.clear();
+                }
+                let polar_key = self.fui.opt_from_3d.polar.clone().unwrap();
+                let mut polar_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("3D polar");
+                    egui::ComboBox::from_id_salt("opt3d_pol")
+                        .width(210.0)
+                        .selected_text(format!("{} / {}", polar_key.0, polar_key.1))
+                        .show_ui(ui, |ui| {
+                            for k in &polars {
+                                if ui.selectable_label(k == &polar_key, format!("{} / {}", k.0, k.1)).clicked() && k != &polar_key {
+                                    self.fui.opt_from_3d.polar = Some(k.clone());
+                                    polar_changed = true;
+                                }
+                            }
+                        });
+                });
+                if polar_changed {
+                    self.fui.opt_from_3d.span_pos = None;
+                    self.fui.opt_from_3d.selected_points.clear();
+                }
+                let polar_key = self.fui.opt_from_3d.polar.clone().unwrap();
+                let Some(polar) = self.project.plane_polars.iter().find(|p| p.plane == polar_key.0 && p.name == polar_key.1) else {
+                    return;
+                };
+                let plane = self.project.planes.iter().find(|pl| pl.name == polar.plane);
+                let wings = polar.strip_wings();
+                if wings.is_empty() {
+                    hint(ui, "This polar has no saved strip distributions.");
+                    return;
+                }
+                if !wings.contains(&self.fui.opt_from_3d.wing) {
+                    self.fui.opt_from_3d.wing = wings[0];
+                    self.fui.opt_from_3d.span_pos = None;
+                }
+                if wings.len() > 1 {
+                    let cur_w = self.fui.opt_from_3d.wing;
+                    let cur_name = polar.wing_name_for_strip(plane, cur_w);
+                    ui.horizontal(|ui| {
+                        ui.label("wing");
+                        egui::ComboBox::from_id_salt("opt3d_wing").selected_text(cur_name).show_ui(ui, |ui| {
+                            for &wi in &wings {
+                                let wname = polar.wing_name_for_strip(plane, wi);
+                                if ui.selectable_value(&mut self.fui.opt_from_3d.wing, wi, wname).changed() {
+                                    self.fui.opt_from_3d.span_pos = None;
+                                }
+                            }
+                        });
+                    });
+                }
+                let wing = self.fui.opt_from_3d.wing;
+                let stations = polar.wing_stations(plane, wing);
+                if stations.is_empty() {
+                    return;
+                }
+                let sel_st_idx = match self.fui.opt_from_3d.span_pos {
+                    Some(y) => stations.iter().enumerate().min_by(|a, b| (a.1.span_pos - y).abs().total_cmp(&(b.1.span_pos - y).abs())).map(|(i, _)| i).unwrap_or(0),
+                    None => {
+                        let idx = stations
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, s)| s.span_pos >= 0.0)
+                            .min_by(|a, b| (a.1.span_frac - 0.45).abs().total_cmp(&(b.1.span_frac - 0.45).abs()))
+                            .map(|(i, _)| i)
+                            .unwrap_or(stations.len() / 2);
+                        self.fui.opt_from_3d.span_pos = Some(stations[idx].span_pos);
+                        idx
+                    }
+                };
+                let st = &stations[sel_st_idx];
+                let actual_y = st.span_pos;
+                ui.horizontal(|ui| {
+                    ui.label("station");
+                    let cur_txt = format!("y {:+.3} m ({:.0}%, c {:.3} m)", st.span_pos, st.span_frac * 100.0, st.chord);
+                    egui::ComboBox::from_id_salt("opt3d_st").width(210.0).selected_text(cur_txt).show_ui(ui, |ui| {
+                        for s in &stations {
+                            let foil_s = s.foil.as_deref().unwrap_or("");
+                            let txt = format!("y {:+.3} m ({:.0}%, c {:.3} m) {foil_s}", s.span_pos, s.span_frac * 100.0, s.chord);
+                            if ui.selectable_label((s.span_pos - actual_y).abs() < 1e-6, txt).clicked() {
+                                self.fui.opt_from_3d.span_pos = Some(s.span_pos);
+                            }
+                        }
+                    });
+                });
+                if let Some(f) = &st.foil {
+                    if let Some((a, b, t)) = &st.foil_blend {
+                        hint(ui, &format!("station foil: {:.0}% {a} / {:.0}% {b} (dominant: {f}; rerun replaces sections using {f})", (1.0 - t) * 100.0, t * 100.0));
+                    } else {
+                        hint(ui, &format!("station foil: {f}"));
+                    }
+                }
+                // Default point selection if empty: slow / cruise / fast
+                if self.fui.opt_from_3d.selected_points.is_empty() {
+                    for r in polar.pick_flight_regimes(wing, actual_y) {
+                        self.fui.opt_from_3d.selected_points.insert(r.point_index);
+                    }
+                }
+                let regime_tags: HashMap<usize, String> = polar
+                    .pick_flight_regimes(wing, actual_y)
+                    .into_iter()
+                    .map(|r| (r.point_index, r.label))
+                    .collect();
+
+                ui.horizontal(|ui| {
+                    if ui.small_button("Pick slow / cruise / fast").clicked() {
+                        self.fui.opt_from_3d.selected_points = regime_tags.keys().copied().collect();
+                    }
+                    if ui.small_button("Clear").clicked() {
+                        self.fui.opt_from_3d.selected_points.clear();
+                    }
+                });
+
+                egui::ScrollArea::vertical().id_salt("opt3d_pts").max_height(135.0).show(ui, |ui| {
+                    egui::Grid::new("opt3d_grid").striped(true).spacing([6.0, 2.0]).show(ui, |ui| {
+                        for h in ["", "alpha", "V", "L/D", "local Cl", "local Re", ""] {
+                            ui.label(RichText::new(h).small().strong());
+                        }
+                        ui.end_row();
+                        for (idx, opp) in polar.points.iter().enumerate() {
+                            let Some(sr) = polar.strip_at(idx, wing, actual_y) else { continue };
+                            let mut on = self.fui.opt_from_3d.selected_points.contains(&idx);
+                            if ui.checkbox(&mut on, "").changed() {
+                                if on {
+                                    self.fui.opt_from_3d.selected_points.insert(idx);
+                                } else {
+                                    self.fui.opt_from_3d.selected_points.remove(&idx);
+                                }
+                            }
+                            ui.label(RichText::new(format!("{:.1}°", opp.alpha)).small());
+                            ui.label(RichText::new(format!("{:.1}", opp.velocity)).small());
+                            ui.label(RichText::new(format!("{:.1}", opp.ld())).small());
+                            ui.label(RichText::new(format!("{:.3}", sr.cl)).small());
+                            ui.label(RichText::new(format!("{:.0}k", sr.re / 1e3)).small());
+                            let tag_txt = regime_tags.get(&idx).map(|s| s.as_str()).unwrap_or("");
+                            if sr.out_of_polar {
+                                let env = foiley_plane::foildb::Envelope::from_u8(sr.envelope).label();
+                                let combined = if tag_txt.is_empty() { "clamped".into() } else { format!("{tag_txt} (!)") };
+                                ui.label(RichText::new(combined).small().color(Color32::from_rgb(235, 165, 70)))
+                                    .on_hover_text(format!("2D polar lookup at this station was {env}"));
+                            } else if !tag_txt.is_empty() {
+                                ui.label(RichText::new(tag_txt).small().color(Color32::from_rgb(120, 200, 255)));
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+
+                let n_sel = self.fui.opt_from_3d.selected_points.len();
+                if ui.add_enabled(n_sel > 0, egui::Button::new(format!("Use {n_sel} selected point(s)"))).clicked() {
+                    apply_req = Some((polar_key, wing, actual_y, self.fui.opt_from_3d.selected_points.clone()));
+                }
+            });
+
+        if go_3d {
+            self.module = crate::Module::PlaneAnalysis;
+        }
+        if let Some((pk, wing, y, pts)) = apply_req {
+            self.apply_3d_station_points(&pk, wing, y, &pts);
+        }
+    }
+
+    /// Bottom central panel for optimiser results: original-vs-candidate drag
+    /// comparison table (every operating-point row + spar thickness) alongside
+    /// the iteration convergence history plot.
+    fn optim_results_panel(&mut self, ui: &mut egui::Ui, r: &OptimResult, meta: &OptimRunMeta, w: f32, hh: f32) {
+        let is_multi = r.baseline.as_ref().is_some_and(|b| !b.op_points.is_empty())
+            || r.best.as_ref().is_some_and(|b| !b.op_points.is_empty());
+
+        if !is_multi {
+            ui.allocate_ui_with_layout(egui::vec2(w, hh), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                ui.label(RichText::new("Optimiser: best score per iteration").strong());
+                Plot::new("opthist").height((hh - 24.0).max(80.0)).x_axis_label("iteration").show(ui, |pu| {
+                    let pts: Vec<[f64; 2]> = r.history.iter().map(|(i, v)| [*i as f64, *v]).collect();
+                    pu.line(Line::new("best", PlotPoints::from(pts.clone())).color(series_color(2)));
+                    pu.points(Points::new("best", PlotPoints::from(pts)).radius(3.0_f32).color(series_color(2)));
+                });
+            });
+            return;
+        }
+
+        let cand = selected_optim_candidate(r, self.fui.opt_sel_pareto);
+        let table_w = (w * 0.64).clamp(260.0, (w - 140.0).max(260.0));
+        let plot_w = (w - table_w - 10.0).max(120.0);
+
+        ui.allocate_ui_with_layout(egui::vec2(table_w, hh), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Original vs candidate drag").strong());
+                if r.pareto.len() > 1 {
+                    let cur_label = match self.fui.opt_sel_pareto {
+                        None => "best compromise".into(),
+                        Some(i) => format!("Pareto #{}", i + 1),
+                    };
+                    egui::ComboBox::from_id_salt("opt_pareto_pick").width(120.0).selected_text(cur_label).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.fui.opt_sel_pareto, None, "best compromise");
+                        for i in 0..r.pareto.len() {
+                            ui.selectable_value(&mut self.fui.opt_sel_pareto, Some(i), format!("Pareto #{}", i + 1));
+                        }
+                    });
+                }
+                match cand {
+                    Some(c) if c.constraints_met() => {
+                        let base_ops = r.baseline.as_ref().map(|b| b.op_points.as_slice()).unwrap_or(&[]);
+                        let all_improved_or_met = c.op_points.iter().enumerate().all(|(i, ev)| {
+                            let bo = base_ops.get(i);
+                            ev.meets_goal(bo).unwrap_or(true)
+                                && match ev.goal {
+                                    DragGoal::Minimise => bo.filter(|o| o.converged).is_none_or(|o| ev.cd <= o.cd + 1e-7),
+                                    _ => true,
+                                }
+                        });
+                        let badge = if all_improved_or_met { "all goals met" } else { "constraints met" };
+                        ui.label(RichText::new(badge).small().color(Color32::from_rgb(80, 195, 100)));
+                    }
+                    Some(_) => {
+                        ui.label(RichText::new("drag cap violated").small().color(Color32::from_rgb(235, 130, 60)));
+                    }
+                    None => {
+                        ui.label(RichText::new("no feasible design").small().color(Color32::from_rgb(235, 90, 75)));
+                    }
+                }
+            });
+            let scroll_h = ui.available_height().max(80.0);
+            egui::ScrollArea::both().id_salt("opt_cmp_scroll").max_height(scroll_h).show(ui, |ui| {
+                let base_ops = r.baseline.as_ref().map(|b| b.op_points.as_slice()).unwrap_or(&[]);
+                let cand_ops = cand.map(|c| c.op_points.as_slice()).unwrap_or(&[]);
+                let nrows = base_ops.len().max(cand_ops.len());
+                egui::Grid::new("opt_cmp_grid").striped(true).spacing([10.0, 4.0]).show(ui, |ui| {
+                    for h in ["Point", "Re", "CL", "Goal", "Original CD", "Candidate CD", "Delta", "alpha"] {
+                        ui.label(RichText::new(h).small().strong());
+                    }
+                    ui.end_row();
+                    for i in 0..nrows {
+                        let bo = base_ops.get(i);
+                        let co = cand_ops.get(i);
+                        let lbl = co.or(bo).map(|e| e.label.as_str()).unwrap_or("-");
+                        let re = co.or(bo).map(|e| e.re).unwrap_or(0.0);
+                        let cl = co.or(bo).map(|e| e.target_cl).unwrap_or(0.0);
+                        let goal = co.or(bo).map(|e| e.goal).unwrap_or(DragGoal::Minimise);
+                        ui.label(lbl);
+                        ui.monospace(format!("{re:.0}"));
+                        ui.monospace(format!("{cl:.3}"));
+                        let goal_txt = match goal {
+                            DragGoal::Minimise => "minimise".into(),
+                            DragGoal::AtMostOriginal => "<= orig".into(),
+                            DragGoal::AtMost { cd } => format!("<= {cd:.5}"),
+                            DragGoal::Target { cd } => format!("= {cd:.5}"),
+                        };
+                        ui.label(RichText::new(goal_txt).small());
+                        match bo {
+                            Some(b) if b.converged => ui.monospace(format!("{:.5}", b.cd)),
+                            _ => ui.label("-"),
+                        };
+                        match co {
+                            Some(c) if c.converged => ui.monospace(format!("{:.5}", c.cd)),
+                            _ => ui.label("-"),
+                        };
+                        match (bo, co) {
+                            (Some(b), Some(c)) if b.converged && c.converged && b.cd > 1e-9 => {
+                                let d = c.cd - b.cd;
+                                let pct = d / b.cd * 100.0;
+                                let met = c.meets_goal(Some(b)).unwrap_or(true);
+                                let col = if !met {
+                                    Color32::from_rgb(235, 90, 75)
+                                } else if d < -1e-6 {
+                                    Color32::from_rgb(80, 195, 100)
+                                } else if d > 1e-6 {
+                                    Color32::from_rgb(235, 165, 70)
+                                } else {
+                                    ui.visuals().text_color()
+                                };
+                                ui.label(RichText::new(format!("{d:+.5} ({pct:+.1}%)")).monospace().color(col));
+                            }
+                            _ => {
+                                ui.label("-");
+                            }
+                        }
+                        match co {
+                            Some(c) if c.converged => ui.monospace(format!("{:.2}°", c.alpha)),
+                            _ => ui.label("-"),
+                        };
+                        ui.end_row();
+                    }
+                });
+                if let Some(sp) = meta.spar {
+                    let bt = r.baseline.as_ref().and_then(|b| b.spar_thickness);
+                    let ct = cand.and_then(|c| c.spar_thickness);
+                    match (bt, ct) {
+                        (Some(b), Some(c)) => {
+                            let ok = c + 1e-6 >= sp.min_thickness;
+                            let col = if ok { Color32::from_rgb(80, 195, 100) } else { Color32::from_rgb(235, 90, 75) };
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "Spar thickness at x/c {:.2}: original {:.2}%  ->  candidate {:.2}%  (min {:.2}% {})",
+                                    sp.x,
+                                    b * 100.0,
+                                    c * 100.0,
+                                    sp.min_thickness * 100.0,
+                                    if ok { "OK" } else { "TOO THIN" }
+                                ))
+                                .small()
+                                .color(col),
+                            );
+                        }
+                        (Some(b), None) => {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "Spar thickness at x/c {:.2}: original {:.2}% (min {:.2}%)",
+                                    sp.x,
+                                    b * 100.0,
+                                    sp.min_thickness * 100.0,
+                                ))
+                                .small(),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        });
+
+        ui.allocate_ui_with_layout(egui::vec2(plot_w, hh), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+            let title = if meta.all_target_goals { "Target CD error (normalised)" } else { "Weighted CD / original" };
+            ui.label(RichText::new(title).strong());
+            let plot_h = ui.available_height().max(80.0);
+            Plot::new("opthist").height(plot_h).x_axis_label("iteration").show(ui, |pu| {
+                let pts: Vec<[f64; 2]> = r.history.iter().filter(|(_, v)| v.is_finite()).map(|(i, v)| [*i as f64, *v]).collect();
+                if !meta.all_target_goals {
+                    pu.hline(egui_plot::HLine::new("original", 1.0).color(Color32::GRAY).style(egui_plot::LineStyle::dashed_dense()));
+                }
+                pu.line(Line::new("best", PlotPoints::from(pts.clone())).color(series_color(2)));
+                pu.points(Points::new("best", PlotPoints::from(pts)).radius(3.0_f32).color(series_color(2)));
+            });
+        });
+    }
+}
+
+fn selected_optim_candidate(r: &OptimResult, sel: Option<usize>) -> Option<&Candidate> {
+    sel.and_then(|i| r.pareto.get(i)).or(r.best.as_ref()).filter(|c| c.constraints_met())
 }
 
 #[cfg(test)]
 mod polar_label_regressions {
     use super::*;
+    use foiley_app::{JobManager, Project};
+    use foiley_plane::analysis::{Method, PlaneOpp, PlanePolar, PlanePolarDef, PolarKind, StripResult};
 
     #[test]
     fn labels_show_exact_re_and_only_disambiguate_settings_collisions() {
@@ -1286,6 +2327,165 @@ mod polar_label_regressions {
         assert!(labels[1].name.contains("Re=300100"));
         assert_ne!(labels[0].name, labels[2].name);
         assert_ne!(labels[0].key, labels[2].key);
+    }
+
+    #[test]
+    fn section_optimiser_loads_3d_points_and_reruns_study_on_plane_copy() {
+        let mut project = Project::starter();
+        let plane = project.planes[0].clone();
+        let make_opp = |alpha: f64, v: f64, cl: f64, cd: f64, local_cl: f64| PlaneOpp {
+            alpha,
+            velocity: v,
+            cl,
+            cd,
+            strips: vec![
+                StripResult { wing: 0, span_pos: 0.72, chord: 0.247, cl: local_cl, re: v * 0.247 / 1.5e-5, cdv: 0.009, alpha_eff: alpha, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let polar = PlanePolar {
+            name: "T2-Vlm2".into(),
+            plane: plane.name.clone(),
+            def: Some(PlanePolarDef { kind: PolarKind::FixedLift, method: Method::Vlm2, viscous: false, ..Default::default() }),
+            points: vec![
+                make_opp(0.0, 14.5, 0.16, 0.013, 0.18),
+                make_opp(4.0, 8.2, 0.52, 0.019, 0.58),
+                make_opp(8.0, 6.4, 0.88, 0.038, 0.96),
+            ],
+            ..Default::default()
+        };
+        project.add_plane_polar(polar);
+
+        let mut app = App::from_project(project, JobManager::new(1), true);
+        app.open_section_optimiser((plane.name.clone(), "T2-Vlm2".into()), 0, 0.72);
+
+        assert_eq!(app.module, crate::Module::FoilDesign);
+        assert_eq!(app.sel_foil.as_deref(), Some("NACA 2412"));
+        assert!(app.fui.opt_multipoint);
+        assert_eq!(app.fui.opt.operating_points.len(), 3);
+        assert_eq!(app.fui.opt.operating_points[0].label, "Slow flight");
+        assert_eq!(app.fui.opt.operating_points[0].goal, DragGoal::AtMostOriginal);
+        assert_eq!(app.fui.opt.operating_points[1].label, "Cruise");
+        assert_eq!(app.fui.opt.operating_points[1].goal, DragGoal::Minimise);
+        assert_eq!(app.fui.opt.operating_points[2].label, "Fast glide");
+        assert!(app.fui.opt.spar.is_some());
+        assert!(app.fui.opt_3d_origin.is_some());
+
+        // Saving and rerunning creates a new foil + plane copy without mutating the original plane
+        let cand = Candidate {
+            genes: vec![],
+            foil: app.project.foil("NACA 2412").unwrap().clone(),
+            cl: 0.58,
+            cd: 0.008,
+            cm: -0.05,
+            cpmin: -1.1,
+            objectives: vec![0.008],
+            scores: vec![0.008],
+            feasible: true,
+            op_points: vec![],
+            spar_thickness: Some(0.118),
+            violation: 0.0,
+        };
+        let meta = OptimRunMeta {
+            base_foil: "NACA 2412".into(),
+            spar: app.fui.opt.spar,
+            origin: app.fui.opt_3d_origin.clone(),
+            all_target_goals: false,
+        };
+        app.save_and_rerun_3d_study(&cand, &meta);
+        assert_eq!(app.module, crate::Module::PlaneAnalysis);
+        assert!(app.project.foil("NACA 2412 opt").is_some());
+        assert_eq!(app.project.planes.len(), 2);
+        assert_eq!(app.project.planes[0].wings[0].sections[0].foil_right, "NACA 2412");
+        assert_eq!(app.project.planes[1].wings[0].sections[0].foil_right, "NACA 2412 opt");
+        assert!(app.pui.visible.contains(&(plane.name.clone(), "T2-Vlm2".into())));
+        assert!(!app.pending.is_empty(), "a 3D rerun job should have been queued");
+        app.jobs.cancel_all();
+    }
+
+    #[test]
+    fn thin_foil_spar_default_and_stale_candidate_and_transition_settings() {
+        // Thin foil (NACA 0003, ~3% t/c) must never panic when computing default spar min
+        let thin = Foil::naca("0003").unwrap();
+        let t = thin.thickness_at(0.30);
+        assert!(t > 0.02 && t < 0.04);
+        let d = default_spar_min(t);
+        assert!(d >= 0.005 && d <= t, "default_spar_min({t}) = {d}");
+
+        // Setup project with Ncrit=5 polar family AND Ncrit=9 polar family on NACA 2412
+        let mut project = Project::starter();
+        let mut fp9 = FoilPolar { foil: "NACA 2412".into(), name: "T1-Re200k-N9".into(), re: 2.0e5, ncrit: 9.0, viscous: true, polar_type: 1, ..Default::default() };
+        fp9.points.push(FoilPoint { alpha: 0.0, cl: 0.2, cd: 0.01, ..Default::default() });
+        fp9.points.push(FoilPoint { alpha: 4.0, cl: 0.6, cd: 0.012, ..Default::default() });
+        let mut fp5 = FoilPolar { foil: "NACA 2412".into(), name: "T1-Re200k-N5".into(), re: 2.0e5, ncrit: 5.0, viscous: true, polar_type: 1, ..Default::default() };
+        fp5.points.push(FoilPoint { alpha: 0.0, cl: 0.2, cd: 0.011, ..Default::default() });
+        fp5.points.push(FoilPoint { alpha: 4.0, cl: 0.6, cd: 0.014, ..Default::default() });
+        project.add_foil_polar(fp9);
+        project.add_foil_polar(fp5);
+
+        let plane = project.planes[0].clone();
+        let make_opp = |alpha: f64, v: f64, cl: f64, cd: f64, local_cl: f64| PlaneOpp {
+            alpha,
+            velocity: v,
+            cl,
+            cd,
+            strips: vec![
+                StripResult { wing: 0, span_pos: 0.72, chord: 0.247, cl: local_cl, re: v * 0.247 / 1.5e-5, cdv: 0.009, alpha_eff: alpha, ..Default::default() },
+                StripResult { wing: 1, span_pos: 0.15, chord: 0.11, cl: 0.05, re: v * 0.11 / 1.5e-5, cdv: 0.011, alpha_eff: alpha, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let mut def = PlanePolarDef { kind: PolarKind::FixedLift, method: Method::Vlm2, viscous: true, ..Default::default() };
+        def.family.ncrit = Some(5.0);
+        let polar = PlanePolar {
+            name: "T2-N5".into(),
+            plane: plane.name.clone(),
+            def: Some(def),
+            points: vec![
+                make_opp(0.0, 14.5, 0.16, 0.013, 0.18),
+                make_opp(4.0, 8.2, 0.52, 0.019, 0.58),
+                make_opp(8.0, 6.4, 0.88, 0.038, 0.96),
+            ],
+            ..Default::default()
+        };
+        project.add_plane_polar(polar);
+
+        let mut app = App::from_project(project, JobManager::new(1), true);
+        app.open_section_optimiser((plane.name.clone(), "T2-N5".into()), 0, 0.72);
+        // Must pick Ncrit=5 from the resolved family, NOT Ncrit=9 from the first polar!
+        assert!((app.fui.opt.analysis.ncrit - 5.0).abs() < 1e-9, "got ncrit {}", app.fui.opt.analysis.ncrit);
+        assert_eq!(app.fui.opt_3d_origin.as_ref().unwrap().source_analysis.as_ref().unwrap().ncrit, 5.0);
+
+        // Simulate a finished main-wing job stored in opt_job + opt_result, then switch to elevator (wing 1)
+        let dummy_job = app.jobs.submit("dummy", JobKind::FoilPoint { foil: Foil::naca("2412").unwrap(), settings: AnalysisSettings::default(), value: 2.0, is_alpha: true });
+        let main_meta = OptimRunMeta {
+            base_foil: "NACA 2412".into(),
+            spar: app.fui.opt.spar,
+            origin: app.fui.opt_3d_origin.clone(),
+            all_target_goals: false,
+        };
+        app.fui.opt_job = Some((dummy_job.id, main_meta.clone()));
+        app.fui.opt_result = Some((OptimResult::default(), main_meta));
+        let elev_pts: BTreeSet<usize> = [0, 1, 2].into_iter().collect();
+        app.apply_3d_station_points(&(plane.name.clone(), "T2-N5".into()), 1, 0.15, &elev_pts);
+        // Applying elevator points MUST detach the earlier main-wing job and result!
+        assert!(app.fui.opt_job.is_none());
+        assert!(app.fui.opt_result.is_none());
+        assert!(app.live_optim().is_none());
+        assert_eq!(app.sel_foil.as_deref(), Some("NACA 0009"));
+
+        // Foil rename updates opt_3d_origin and validation rejects stale origin after foil removal
+        app.rename_foil("NACA 0009", "Tail Foil");
+        assert_eq!(app.fui.opt_3d_origin.as_ref().unwrap().foil, "Tail Foil");
+        let origin_now = app.fui.opt_3d_origin.clone().unwrap();
+        assert!(app.validate_rerun_origin(&origin_now, "Tail Foil").is_ok());
+        // Removing all matching sections from the elevator makes rerun validation fail cleanly
+        for sec in &mut app.project.planes[0].wings[1].sections {
+            sec.foil_right = "NACA 2412".into();
+            sec.foil_left = "NACA 2412".into();
+        }
+        assert!(app.validate_rerun_origin(&origin_now, "Tail Foil").is_err());
+        app.jobs.cancel_all();
     }
 }
 

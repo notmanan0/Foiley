@@ -1,4 +1,5 @@
-//! Airfoil shape optimisation (equivalent of xflr5's Optim2d).
+//! Airfoil shape optimisation (xflr5 Optim2d single-point and Xoptfoil2-style
+//! multi-point operating-point table with structural spar thickness constraint).
 //!
 //! The design variables change the shape of the base foil.  As in 1.1 the
 //! foil is first moved and scaled to unit chord with its leading edge at the
@@ -10,9 +11,18 @@
 //! transformation) representation added to each surface, which move the
 //! thickness, camber and leading-edge radius globally without waviness.
 //! A trailing-edge flap angle can be added as a further variable.
-//! Each candidate is analysed at one operating point with the XFoil engine,
-//! and one or more objectives (Cl, Cd, Cl/Cd, Cpmin, Cm) are minimised,
-//! maximised or driven to a target value.
+//!
+//! Two evaluation modes are supported:
+//! * **Single-point mode** (`operating_points` empty): each candidate is
+//!   analysed at one angle of attack and Reynolds number, and one or more
+//!   objectives (`Cl`, `Cd`, `Cl/Cd`, `Cpmin`, `Cm`) are minimised, maximised
+//!   or driven to a target value.
+//! * **Multi-point operating-point table** (`operating_points` non-empty):
+//!   each candidate is analysed across every enabled `(Re, target CL)` row in
+//!   XFoil CL-specified mode and scored against each row's [`DragGoal`]
+//!   (`Minimise`, `AtMostOriginal`, `AtMost`, `Target`).  Optional
+//!   [`SparConstraint`] enforces a minimum `t/c` at a chordwise spar station
+//!   before calling XFoil.
 //!
 //! Two search algorithms are available, following xflr5:
 //! * [`Algorithm::Mopso`]: multi-objective particle swarm with a Pareto
@@ -24,7 +34,7 @@
 //! numbers are drawn only in the serial parts, so a run is reproducible for
 //! a given `seed`.
 
-use crate::analysis::{analyze_point, AnalysisSettings};
+use crate::analysis::{analyze_point, analyze_points, AnalysisSettings};
 use crate::foil::Foil;
 use crate::FoilError;
 use foiley_core::Progress;
@@ -107,6 +117,147 @@ impl Default for ObjectiveSpec {
     }
 }
 
+/// Drag goal for one row of the multi-point operating-point table
+/// (Xoptfoil2 style: `min-drag`, keep at or below original, cap, or target).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DragGoal {
+    /// Minimise profile drag coefficient CD at this operating point.
+    #[default]
+    Minimise,
+    /// Keep CD at or below the original (base) airfoil's CD at this point.
+    AtMostOriginal,
+    /// Keep CD at or below a fixed upper bound.
+    AtMost { cd: f64 },
+    /// Drive CD towards a target value.
+    Target { cd: f64 },
+}
+
+impl DragGoal {
+    pub fn label(&self) -> &'static str {
+        match self {
+            DragGoal::Minimise => "minimise",
+            DragGoal::AtMostOriginal => "<= original",
+            DragGoal::AtMost { .. } => "<= max CD",
+            DragGoal::Target { .. } => "target CD",
+        }
+    }
+
+    pub fn is_cap(&self) -> bool {
+        matches!(self, DragGoal::AtMostOriginal | DragGoal::AtMost { .. })
+    }
+}
+
+/// One row of the multi-point operating-point table.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OperatingPoint {
+    /// Optional human-readable label (e.g. "Slow flight", "Cruise", "Fast glide").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// Include this operating point in the optimisation.
+    pub enabled: bool,
+    /// Chord Reynolds number for this operating point.
+    pub re: f64,
+    /// Target lift coefficient CL (solved in XFoil CL-specified mode).
+    pub cl: f64,
+    /// Drag objective or cap at this operating point.
+    pub goal: DragGoal,
+    /// Relative weighting (must be positive, default 1.0).
+    pub weight: f64,
+}
+
+impl Default for OperatingPoint {
+    fn default() -> Self {
+        OperatingPoint {
+            label: String::new(),
+            enabled: true,
+            re: 2.0e5,
+            cl: 0.5,
+            goal: DragGoal::Minimise,
+            weight: 1.0,
+        }
+    }
+}
+
+impl OperatingPoint {
+    pub fn display_label(&self, index: usize) -> String {
+        if self.label.trim().is_empty() {
+            format!("OP {} (CL {:.2})", index + 1, self.cl)
+        } else {
+            self.label.clone()
+        }
+    }
+}
+
+/// Minimum airfoil thickness required at a chordwise spar station.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SparConstraint {
+    /// Chordwise spar location x/c in (0, 1), typically 0.25..0.35.
+    pub x: f64,
+    /// Minimum thickness-to-chord ratio t/c at `x` (e.g. 0.115 for 11.5%).
+    pub min_thickness: f64,
+}
+
+impl Default for SparConstraint {
+    fn default() -> Self {
+        SparConstraint { x: 0.30, min_thickness: 0.11 }
+    }
+}
+
+/// Evaluation of one airfoil at one operating-point row.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OpPointEval {
+    pub label: String,
+    pub re: f64,
+    pub target_cl: f64,
+    pub goal: DragGoal,
+    pub weight: f64,
+    pub converged: bool,
+    pub alpha: f64,
+    pub cl: f64,
+    pub cd: f64,
+    pub cm: f64,
+    pub cpmin: f64,
+    pub xtr_top: f64,
+    pub xtr_bot: f64,
+}
+
+impl OpPointEval {
+    /// Whether this evaluated row satisfies its drag goal compared to `orig`.
+    /// `Minimise` has no hard cap, so it always satisfies feasibility once converged
+    /// (use `cd < orig.cd` separately to colour improvements vs trade-offs).
+    pub fn meets_goal(&self, orig: Option<&OpPointEval>) -> Option<bool> {
+        if !self.converged {
+            return Some(false);
+        }
+        match self.goal {
+            DragGoal::AtMostOriginal => orig.filter(|o| o.converged).map(|o| self.cd <= o.cd + 1e-7),
+            DragGoal::AtMost { cd } => Some(self.cd <= cd + 1e-7),
+            DragGoal::Target { cd } => Some((self.cd - cd).abs() <= 1e-4),
+            DragGoal::Minimise => Some(true),
+        }
+    }
+}
+
+/// Evaluation of the original (base) airfoil at the same operating points and
+/// spar station, for original-versus-candidate comparison.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BaselineEval {
+    pub foil_name: String,
+    pub cl: f64,
+    pub cd: f64,
+    pub cm: f64,
+    pub cpmin: f64,
+    pub converged: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub op_points: Vec<OpPointEval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spar_thickness: Option<f64>,
+    pub max_thickness: f64,
+}
+
 /// How the genes change the shape.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -166,10 +317,18 @@ pub struct OptimSettings {
     pub flap: Option<(f64, f64)>,
     /// Flap hinge (x/c, y relative 0 = lower .. 1 = upper).
     pub hinge: (f64, f64),
-    /// Angle of attack of the design point, degrees.
+    /// Angle of attack of the design point, degrees (single-point mode).
     pub alpha: f64,
     pub analysis: AnalysisSettings,
     pub objectives: Vec<ObjectiveSpec>,
+    /// Multi-point operating-point table (Xoptfoil2 style).  When non-empty,
+    /// each candidate is evaluated at every enabled row's `(Re, target CL)`
+    /// and scored by its [`DragGoal`] instead of the single `alpha` / `objectives`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operating_points: Vec<OperatingPoint>,
+    /// Minimum thickness-to-chord ratio at a chordwise spar station.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spar: Option<SparConstraint>,
     /// Swarm / population size.
     pub population: usize,
     /// Number of iterations / generations after the initial one.
@@ -200,6 +359,25 @@ impl OptimSettings {
         ]
     }
 
+    /// Default 3-point glider table (slow flight, cruise, fast glide).
+    pub fn default_operating_points() -> Vec<OperatingPoint> {
+        vec![
+            OperatingPoint { label: "Slow flight".into(), enabled: true, re: 1.2e5, cl: 0.90, goal: DragGoal::AtMostOriginal, weight: 1.0 },
+            OperatingPoint { label: "Cruise".into(), enabled: true, re: 1.8e5, cl: 0.50, goal: DragGoal::Minimise, weight: 1.0 },
+            OperatingPoint { label: "Fast glide".into(), enabled: true, re: 2.8e5, cl: 0.20, goal: DragGoal::Minimise, weight: 1.0 },
+        ]
+    }
+
+    /// True when the multi-point operating-point table is active.
+    pub fn is_multipoint(&self) -> bool {
+        !self.operating_points.is_empty()
+    }
+
+    /// Enabled rows of the operating-point table.
+    pub fn enabled_operating_points(&self) -> Vec<OperatingPoint> {
+        self.operating_points.iter().filter(|o| o.enabled).cloned().collect()
+    }
+
     /// Shape variables per surface.
     pub fn shape_variables_per_side(&self) -> usize {
         match self.parameterization {
@@ -208,8 +386,9 @@ impl OptimSettings {
         }
     }
 
-    /// Check the shape-variable settings (the analysis settings are checked
-    /// separately): finite ranges, and counts small enough to allocate.
+    /// Check the shape-variable, operating-point and spar settings (the base
+    /// analysis settings are checked separately): finite ranges, and counts
+    /// small enough to allocate.
     pub fn validate(&self) -> Result<(), String> {
         const MAX_VARIABLES: usize = 100_000;
         if self.shape_variables_per_side() > MAX_VARIABLES {
@@ -237,6 +416,35 @@ impl OptimSettings {
         if let Some((a, b)) = self.flap {
             if !a.is_finite() || !b.is_finite() {
                 return Err("the flap angle range must be finite".into());
+            }
+        }
+        if let Some(sp) = self.spar {
+            if !sp.x.is_finite() || !(0.01..=0.99).contains(&sp.x) {
+                return Err(format!("spar station x/c = {} must be between 0.01 and 0.99", sp.x));
+            }
+            if !sp.min_thickness.is_finite() || !(0.001..=0.5).contains(&sp.min_thickness) {
+                return Err(format!("spar minimum thickness t/c = {} must be between 0.1% and 50%", sp.min_thickness));
+            }
+        }
+        for (i, op) in self.operating_points.iter().enumerate() {
+            if !op.enabled {
+                continue;
+            }
+            let name = op.display_label(i);
+            if !op.re.is_finite() || op.re <= 1.0e3 || op.re >= 1.0e10 {
+                return Err(format!("{name}: Reynolds number {} is out of the supported range 1e3..1e10", op.re));
+            }
+            if !op.cl.is_finite() || !(-3.0..=3.5).contains(&op.cl) {
+                return Err(format!("{name}: target CL {} must be between -3 and 3.5", op.cl));
+            }
+            if !op.weight.is_finite() || op.weight <= 0.0 {
+                return Err(format!("{name}: weight {} must be positive", op.weight));
+            }
+            match op.goal {
+                DragGoal::AtMost { cd } | DragGoal::Target { cd } if !cd.is_finite() || cd <= 0.0 => {
+                    return Err(format!("{name}: drag target {cd} must be positive"));
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -290,6 +498,8 @@ impl Default for OptimSettings {
             alpha: 0.0,
             analysis: AnalysisSettings { re: 1.0e6, mach: 0.0, ncrit: 9.0, xtr_top: 1.0, xtr_bot: 1.0, ..Default::default() },
             objectives: Self::default_objectives(),
+            operating_points: Vec::new(),
+            spar: None,
             population: 11,
             iterations: 30,
             inertia: 0.3,
@@ -314,18 +524,45 @@ pub struct Candidate {
     pub cd: f64,
     pub cm: f64,
     pub cpmin: f64,
-    /// Value of each enabled objective (same order as the enabled specs).
+    /// Value of each enabled objective (same order as the enabled specs, or
+    /// the objective rows in multi-point mode).
     pub objectives: Vec<f64>,
     /// Per enabled objective, the score being minimised (-value for
     /// maximise, distance outside the tolerance band for targets).
     pub scores: Vec<f64>,
-    /// Converged analysis on a valid geometry.
+    /// Converged analysis on a valid geometry satisfying geometric constraints.
     pub feasible: bool,
+    /// Per-row evaluation in multi-point mode (empty in single-point mode).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub op_points: Vec<OpPointEval>,
+    /// Thickness-to-chord ratio at `spar.x` when a spar constraint is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spar_thickness: Option<f64>,
+    /// Total normalised drag-cap constraint violation (0.0 when all caps met).
+    #[serde(default)]
+    pub violation: f64,
 }
 
 impl Candidate {
-    /// `a` dominates `b`: no worse in every score, better in one.
+    /// True when the candidate converged, met geometric constraints and
+    /// satisfied every drag cap (`<= original`, `<= max CD`).
+    pub fn constraints_met(&self) -> bool {
+        self.feasible && self.violation == 0.0 && self.violation.is_finite()
+    }
+
+    /// Constrained dominance (Deb): feasible with zero violation beats any
+    /// violation; smaller violation beats larger; equal zero violation uses
+    /// standard Pareto dominance on `scores`.
     fn dominates(&self, b: &Candidate) -> bool {
+        if !self.feasible {
+            return false;
+        }
+        if !b.feasible {
+            return true;
+        }
+        if self.violation > 0.0 || b.violation > 0.0 {
+            return self.violation < b.violation;
+        }
         let mut better = false;
         for (x, y) in self.scores.iter().zip(&b.scores) {
             if x > y {
@@ -346,9 +583,14 @@ pub struct OptimResult {
     pub best: Option<Candidate>,
     /// Non-dominated archive.
     pub pareto: Vec<Candidate>,
-    /// (iteration, first enabled objective value of `best`), iteration 0 = initial population.
+    /// (iteration, metric of `best`), iteration 0 = initial population.
+    /// Single-point: first enabled objective value; multi-point: weighted CD
+    /// ratio relative to original (1.0 = original, < 1.0 = lower drag).
     pub history: Vec<(usize, f64)>,
     pub evaluations: usize,
+    /// Evaluation of the original (base) foil for original-vs-candidate comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<BaselineEval>,
 }
 
 // ---------------------------------------------------------------- RNG
@@ -437,26 +679,12 @@ fn self_intersects(f: &Foil) -> bool {
     })
 }
 
-/// Build the foil described by `genes`: [upper shape variables..., lower
-/// shape variables..., (flap angle)].  The changes are applied to the
-/// normalised base foil and vanish at the leading and trailing edges:
-/// Hicks-Henne bumps along the outward surface normal, CST weight changes
-/// as `dy = x^0.5 (1-x) sum dA_i B_i(x)` on each surface.
-pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil, FoilError> {
-    s.validate().map_err(FoilError::Geometry)?;
-    let nb = s.shape_variables_per_side();
-    if genes.len() != s.dimension() {
-        return Err(FoilError::Geometry(format!("{} genes given, {} expected", genes.len(), s.dimension())));
-    }
-    if genes.iter().any(|g| !g.is_finite()) {
-        return Err(FoilError::Geometry("non-finite design variable".into()));
-    }
+/// Move and scale `base` to unit chord with its leading edge at the origin,
+/// keeping its chord angle (so zero genes keep the base foil's angle of
+/// attack).  Both candidate generation and baseline evaluation share this
+/// frame so dimensional / shifted foils compare identically.
+fn unit_chord_base(base: &Foil) -> Result<(Foil, Foil, usize, f64, f64), FoilError> {
     base.validate()?;
-    // Shapes are measured on the normalised foil (x/c, surface normals).
-    // The candidate is the base foil moved and scaled to unit chord with its
-    // leading edge at the origin, as in 1.1 (the flap hinge and the analysis
-    // work in x/c), but not rotated: zero genes keep the base foil's angle
-    // of attack.  The changes are rotated back into that frame.
     let b = base.normalized();
     let n = b.n();
     let ile = b.le_index();
@@ -472,11 +700,31 @@ pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil
         f.x[i] = (base.x[i] - xl) / ch;
         f.y[i] = (base.y[i] - yl) / ch;
     }
+    Ok((f, b, ile, sa, ca))
+}
+
+/// Build the foil described by `genes`: [upper shape variables..., lower
+/// shape variables..., (flap angle)].  The changes are applied to the
+/// normalised base foil and vanish at the leading and trailing edges:
+/// Hicks-Henne bumps along the outward surface normal, CST weight changes
+/// as `dy = x^0.5 (1-x) sum dA_i B_i(x)` on each surface.
+pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil, FoilError> {
+    s.validate().map_err(FoilError::Geometry)?;
+    let nb = s.shape_variables_per_side();
+    if genes.len() != s.dimension() {
+        return Err(FoilError::Geometry(format!("{} genes given, {} expected", genes.len(), s.dimension())));
+    }
+    if genes.iter().any(|g| !g.is_finite()) {
+        return Err(FoilError::Geometry("non-finite design variable".into()));
+    }
+    let (mut f, b, ile, sa, ca) = unit_chord_base(base)?;
+    let n = b.n();
     let mut displace = |i: usize, dxn: f64, dyn_: f64| {
         f.x[i] += ca * dxn - sa * dyn_;
         f.y[i] += sa * dxn + ca * dyn_;
     };
-    if nb > 0 {
+    let any_shape = nb > 0 && genes[..2 * nb].iter().any(|&g| g != 0.0);
+    if any_shape {
         for i in 1..n - 1 {
             if i == ile {
                 continue;
@@ -525,28 +773,68 @@ pub fn apply_genes(base: &Foil, s: &OptimSettings, genes: &[f64]) -> Result<Foil
 
 // ---------------------------------------------------------------- evaluation
 
+enum EvalMode {
+    Single {
+        specs: Vec<ObjectiveSpec>,
+        scales: Vec<f64>,
+    },
+    Multi {
+        ops: Vec<OperatingPoint>,
+        base_cd: Vec<f64>,
+        /// Indices into `ops` that form Pareto score dimensions (`Minimise`/`Target`).
+        /// When empty (all rows are drag caps), all rows collapse into one weighted CD ratio.
+        obj_rows: Vec<usize>,
+        /// Normalised scale per score dimension so `sum(score / scale)` is O(1).
+        scales: Vec<f64>,
+        /// Sum of cap weights (for normalising drag-cap violations).
+        cap_weight: f64,
+    },
+}
+
 struct Ctx<'a> {
     base: &'a Foil,
     s: &'a OptimSettings,
-    specs: Vec<ObjectiveSpec>,
-    /// per-objective normalisation for the scalarised score
-    scales: Vec<f64>,
+    mode: EvalMode,
     prog: &'a Progress,
     done: AtomicUsize,
     total: usize,
 }
 
 impl Ctx<'_> {
-    fn infeasible(&self, genes: Vec<f64>, foil: Foil) -> Candidate {
-        let k = self.specs.len();
-        Candidate { genes, foil, cl: 0.0, cd: 0.0, cm: 0.0, cpmin: 0.0, objectives: vec![f64::NAN; k], scores: vec![LARGE; k], feasible: false }
+    fn score_dim(&self) -> usize {
+        match &self.mode {
+            EvalMode::Single { specs, .. } => specs.len(),
+            EvalMode::Multi { scales, .. } => scales.len(),
+        }
+    }
+
+    fn infeasible(&self, genes: Vec<f64>, foil: Foil, spar_thickness: Option<f64>, op_points: Vec<OpPointEval>) -> Candidate {
+        let k = self.score_dim();
+        Candidate {
+            genes,
+            foil,
+            cl: 0.0,
+            cd: 0.0,
+            cm: 0.0,
+            cpmin: 0.0,
+            objectives: vec![f64::NAN; k],
+            scores: vec![LARGE; k],
+            feasible: false,
+            op_points,
+            spar_thickness,
+            violation: LARGE,
+        }
     }
 
     fn evaluate(&self, genes: Vec<f64>) -> Result<Candidate, FoilError> {
         foiley::set_quiet(true);
         self.prog.check()?;
-        let r = self.evaluate_inner(genes);
-        let c = r?;
+        let c = self.evaluate_inner(genes)?;
+        self.record_eval(&c)?;
+        Ok(c)
+    }
+
+    fn record_eval(&self, c: &Candidate) -> Result<(), FoilError> {
         if c.feasible {
             self.prog.count_ok();
         } else {
@@ -555,46 +843,238 @@ impl Ctx<'_> {
         let d = self.done.fetch_add(1, Ordering::Relaxed) + 1;
         self.prog.set(d as f64 / self.total.max(1) as f64);
         self.prog.check()?;
-        Ok(c)
+        Ok(())
+    }
+
+    fn score_multi_evals(&self, genes: Vec<f64>, foil: Foil, spar_thickness: Option<f64>, op_points: Vec<OpPointEval>) -> Candidate {
+        let EvalMode::Multi { ops, base_cd, obj_rows, .. } = &self.mode else {
+            unreachable!();
+        };
+        let all_ok = op_points.len() == ops.len()
+            && op_points.iter().zip(ops).all(|(ev, op)| {
+                ev.converged
+                    && ev.cd > 0.0
+                    && [ev.alpha, ev.cl, ev.cd, ev.cm, ev.cpmin].iter().all(|v| v.is_finite())
+                    && (ev.cl - op.cl).abs() < 0.015
+                    && ev.alpha.abs() < 30.0
+            });
+        if !all_ok {
+            return self.infeasible(genes, foil, spar_thickness, op_points);
+        }
+        let mut violation = 0.0;
+        let mut any_cap_violated = false;
+        for (i, (ev, op)) in op_points.iter().zip(ops).enumerate() {
+            let limit = match op.goal {
+                DragGoal::AtMostOriginal => Some(base_cd[i]),
+                DragGoal::AtMost { cd } => Some(cd),
+                _ => None,
+            };
+            if let Some(lim) = limit {
+                if ev.cd > lim + 1e-9 {
+                    any_cap_violated = true;
+                    let rel = (ev.cd - lim) / lim.max(1e-6);
+                    // Keep violation strictly positive even for tiny positive weights.
+                    let weighted = (op.weight * rel).max(rel * 1e-12);
+                    violation += if weighted > 0.0 && weighted.is_finite() { weighted } else { rel.max(f64::MIN_POSITIVE) };
+                }
+            }
+        }
+        if any_cap_violated && (violation <= 0.0 || !violation.is_finite()) {
+            violation = f64::MIN_POSITIVE;
+        }
+        let (objectives, scores) = if !obj_rows.is_empty() {
+            let mut objs = Vec::with_capacity(obj_rows.len());
+            let mut scs = Vec::with_capacity(obj_rows.len());
+            for &i in obj_rows {
+                let ev = &op_points[i];
+                objs.push(ev.cd);
+                scs.push(match ops[i].goal {
+                    DragGoal::Minimise => ev.cd,
+                    DragGoal::Target { cd } => (ev.cd - cd).abs(),
+                    _ => ev.cd,
+                });
+            }
+            (objs, scs)
+        } else {
+            let wsum: f64 = ops.iter().map(|o| o.weight).sum::<f64>().max(1e-12);
+            let ratio: f64 = op_points.iter().enumerate().map(|(i, ev)| ops[i].weight * ev.cd / base_cd[i].max(1e-6)).sum::<f64>() / wsum;
+            (vec![ratio], vec![ratio])
+        };
+        let rep_i = obj_rows.first().copied().unwrap_or(0);
+        let rep = &op_points[rep_i];
+        Candidate {
+            genes,
+            foil,
+            cl: rep.cl,
+            cd: rep.cd,
+            cm: rep.cm,
+            cpmin: rep.cpmin,
+            objectives,
+            scores,
+            feasible: true,
+            op_points,
+            spar_thickness,
+            violation,
+        }
     }
 
     fn evaluate_inner(&self, genes: Vec<f64>) -> Result<Candidate, FoilError> {
         let foil = match apply_genes(self.base, self.s, &genes) {
             Ok(f) => f,
             Err(FoilError::Cancelled) => return Err(FoilError::Cancelled),
-            Err(_) => return Ok(self.infeasible(genes, self.base.clone())),
+            Err(_) => return Ok(self.infeasible(genes, self.base.clone(), None, Vec::new())),
         };
-        let pt = match analyze_point(&foil, &self.s.analysis, self.s.alpha, true, &Progress::none()) {
-            Ok(Some(d)) => d.point,
-            Ok(None) => return Ok(self.infeasible(genes, foil)),
-            Err(FoilError::Cancelled) => return Err(FoilError::Cancelled),
-            Err(_) => return Ok(self.infeasible(genes, foil)),
-        };
-        let vals: Vec<f64> = self.specs.iter().map(|o| o.objective.value(pt.cl, pt.cd, pt.cm, pt.cpmin)).collect();
-        let ok = pt.cd > 0.0 && [pt.cl, pt.cd, pt.cm, pt.cpmin].iter().all(|v| v.is_finite()) && vals.iter().all(|v| v.is_finite());
-        if !ok {
-            return Ok(self.infeasible(genes, foil));
+        let spar_thickness = self.s.spar.map(|sp| foil.thickness_at(sp.x));
+        if let (Some(sp), Some(t)) = (self.s.spar, spar_thickness) {
+            if t + 1e-6 < sp.min_thickness {
+                return Ok(self.infeasible(genes, foil, spar_thickness, Vec::new()));
+            }
         }
-        let scores = self.specs.iter().zip(&vals).map(|(o, &v)| o.goal.score(v)).collect();
-        Ok(Candidate { genes, foil, cl: pt.cl, cd: pt.cd, cm: pt.cm, cpmin: pt.cpmin, objectives: vals, scores, feasible: true })
+        match &self.mode {
+            EvalMode::Single { specs, .. } => {
+                let pt = match analyze_point(&foil, &self.s.analysis, self.s.alpha, true, &Progress::none()) {
+                    Ok(Some(d)) => d.point,
+                    Ok(None) => return Ok(self.infeasible(genes, foil, spar_thickness, Vec::new())),
+                    Err(FoilError::Cancelled) => return Err(FoilError::Cancelled),
+                    Err(_) => return Ok(self.infeasible(genes, foil, spar_thickness, Vec::new())),
+                };
+                let vals: Vec<f64> = specs.iter().map(|o| o.objective.value(pt.cl, pt.cd, pt.cm, pt.cpmin)).collect();
+                let ok = pt.cd > 0.0 && [pt.cl, pt.cd, pt.cm, pt.cpmin].iter().all(|v| v.is_finite()) && vals.iter().all(|v| v.is_finite());
+                if !ok {
+                    return Ok(self.infeasible(genes, foil, spar_thickness, Vec::new()));
+                }
+                let scores = specs.iter().zip(&vals).map(|(o, &v)| o.goal.score(v)).collect();
+                Ok(Candidate {
+                    genes,
+                    foil,
+                    cl: pt.cl,
+                    cd: pt.cd,
+                    cm: pt.cm,
+                    cpmin: pt.cpmin,
+                    objectives: vals,
+                    scores,
+                    feasible: true,
+                    op_points: Vec::new(),
+                    spar_thickness,
+                    violation: 0.0,
+                })
+            }
+            EvalMode::Multi { ops, .. } => {
+                let specs: Vec<(f64, f64, bool)> = ops.iter().map(|op| (op.re, op.cl, false)).collect();
+                // Zero-span sub-view shares only cancellation with the optimiser progress handle.
+                let cancel_view = self.prog.sub(0.0, 0.0);
+                let pts = match analyze_points(&foil, &self.s.analysis, &specs, &cancel_view) {
+                    Ok(v) => v,
+                    Err(FoilError::Cancelled) => return Err(FoilError::Cancelled),
+                    Err(_) => return Ok(self.infeasible(genes, foil, spar_thickness, Vec::new())),
+                };
+                let op_points: Vec<OpPointEval> = ops
+                    .iter()
+                    .enumerate()
+                    .zip(pts)
+                    .map(|((i, op), pt)| make_op_eval(i, op, pt))
+                    .collect();
+                Ok(self.score_multi_evals(genes, foil, spar_thickness, op_points))
+            }
+        }
     }
 
     fn evaluate_all(&self, genes: Vec<Vec<f64>>) -> Result<Vec<Candidate>, FoilError> {
         genes.into_par_iter().map(|g| self.evaluate(g)).collect()
     }
 
-    /// Scalarised score (lower is better) used to pick the best compromise
-    /// and as the GA fitness.
+    /// Scalarised score (lower is better) among feasible candidates.
     fn scalar(&self, c: &Candidate) -> f64 {
         if !c.feasible {
             return LARGE;
         }
-        c.scores.iter().zip(&self.scales).map(|(s, k)| s / k).sum()
+        match &self.mode {
+            EvalMode::Single { scales, .. } => c.scores.iter().zip(scales).map(|(s, k)| s / k).sum(),
+            EvalMode::Multi { scales, cap_weight, .. } => {
+                let obj: f64 = c.scores.iter().zip(scales).map(|(s, k)| s / k).sum();
+                if !c.constraints_met() {
+                    1.0e4 + 1.0e3 * (c.violation / cap_weight.max(1e-12)) + obj
+                } else {
+                    obj
+                }
+            }
+        }
+    }
+
+    /// Strict feasibility-first ordering (smaller is better):
+    /// constraint-satisfying < cap-violating (by smaller violation) < infeasible.
+    fn compare_candidate(&self, a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+        match (a.feasible, b.feasible) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            (false, false) => return std::cmp::Ordering::Equal,
+            (true, true) => {}
+        }
+        match (a.constraints_met(), b.constraints_met()) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (false, false) => a.violation.total_cmp(&b.violation),
+            (true, true) => self.scalar(a).total_cmp(&self.scalar(b)),
+        }
+    }
+
+    /// Metric recorded in `OptimResult::history` for `best`.
+    fn history_metric(&self, best: Option<&Candidate>) -> f64 {
+        let Some(b) = best else { return f64::NAN };
+        if !b.constraints_met() {
+            return f64::NAN;
+        }
+        match &self.mode {
+            EvalMode::Single { .. } => b.objectives.first().copied().unwrap_or(f64::NAN),
+            EvalMode::Multi { scales, .. } => b.scores.iter().zip(scales).map(|(s, k)| s / k).sum(),
+        }
     }
 
     /// All enabled objectives satisfied (only possible with target goals).
     fn satisfied(&self, c: &Candidate) -> bool {
-        c.feasible && self.specs.iter().zip(&c.scores).all(|(o, &sc)| matches!(o.goal, Goal::Target { .. }) && sc == 0.0)
+        if !c.constraints_met() {
+            return false;
+        }
+        match &self.mode {
+            EvalMode::Single { specs, .. } => specs.iter().zip(&c.scores).all(|(o, &sc)| matches!(o.goal, Goal::Target { .. }) && sc == 0.0),
+            EvalMode::Multi { ops, .. } => !ops.is_empty() && ops.iter().all(|o| matches!(o.goal, DragGoal::Target { .. })) && c.scores.iter().all(|&sc| sc <= 1e-5),
+        }
+    }
+}
+
+fn make_op_eval(index: usize, op: &OperatingPoint, pt: Option<crate::polar::FoilPoint>) -> OpPointEval {
+    let label = op.display_label(index);
+    match pt {
+        Some(p) => OpPointEval {
+            label,
+            re: op.re,
+            target_cl: op.cl,
+            goal: op.goal,
+            weight: op.weight,
+            converged: true,
+            alpha: p.alpha,
+            cl: p.cl,
+            cd: p.cd,
+            cm: p.cm,
+            cpmin: p.cpmin,
+            xtr_top: p.xtr_top,
+            xtr_bot: p.xtr_bot,
+        },
+        None => OpPointEval {
+            label,
+            re: op.re,
+            target_cl: op.cl,
+            goal: op.goal,
+            weight: op.weight,
+            converged: false,
+            alpha: f64::NAN,
+            cl: f64::NAN,
+            cd: f64::NAN,
+            cm: f64::NAN,
+            cpmin: f64::NAN,
+            xtr_top: f64::NAN,
+            xtr_bot: f64::NAN,
+        },
     }
 }
 
@@ -603,7 +1083,7 @@ fn archive_insert(archive: &mut Vec<Candidate>, c: &Candidate) -> bool {
     if !c.feasible {
         return false;
     }
-    if archive.iter().any(|a| a.dominates(c) || a.scores == c.scores) {
+    if archive.iter().any(|a| a.dominates(c) || (a.violation == c.violation && a.scores == c.scores)) {
         return false;
     }
     archive.retain(|a| !c.dominates(a));
@@ -658,33 +1138,101 @@ fn random_genes(rng: &mut Rng, bounds: &[(f64, f64)]) -> Vec<f64> {
     bounds.iter().map(|&(lo, hi)| rng.range(lo, hi)).collect()
 }
 
+/// Draw random genes, preferring shapes that satisfy the spar thickness
+/// constraint when one is active (keeps the RNG sequence identical when
+/// `s.spar` is `None`).
+fn random_feasible_genes(rng: &mut Rng, base: &Foil, s: &OptimSettings, bounds: &[(f64, f64)]) -> Vec<f64> {
+    let mut g = random_genes(rng, bounds);
+    let Some(sp) = s.spar else { return g };
+    for _ in 0..16 {
+        if let Ok(f) = apply_genes(base, s, &g) {
+            if f.thickness_at(sp.x) + 1e-6 >= sp.min_thickness {
+                return g;
+            }
+        }
+        g = random_genes(rng, bounds);
+    }
+    g
+}
+
+/// Perturb `center` within `scale * half_width` of each gene bound, screening
+/// against an active spar constraint.  Used in multi-point mode so constrained
+/// high-dimensional CST / HH searches explore smoothly around feasible shapes.
+fn local_feasible_genes(rng: &mut Rng, base: &Foil, s: &OptimSettings, bounds: &[(f64, f64)], center: &[f64], scale: f64) -> Vec<f64> {
+    let draw = |rng: &mut Rng| -> Vec<f64> {
+        center
+            .iter()
+            .zip(bounds)
+            .map(|(&c, &(lo, hi))| {
+                let half = 0.5 * (hi - lo) * scale;
+                (c + rng.range(-half, half)).clamp(lo, hi)
+            })
+            .collect()
+    };
+    let mut g = draw(rng);
+    let Some(sp) = s.spar else { return g };
+    for _ in 0..16 {
+        if let Ok(f) = apply_genes(base, s, &g) {
+            if f.thickness_at(sp.x) + 1e-6 >= sp.min_thickness {
+                return g;
+            }
+        }
+        g = draw(rng);
+    }
+    g
+}
+
 struct Particle {
     pos: Vec<f64>,
     vel: Vec<f64>,
-    /// personal bests (position, scores)
-    best: Vec<(Vec<f64>, Vec<f64>)>,
+    /// personal bests (position, scores, violation)
+    best: Vec<(Vec<f64>, Vec<f64>, f64)>,
     cand: Option<Candidate>,
 }
 
 impl Particle {
-    fn random(rng: &mut Rng, bounds: &[(f64, f64)], nbest: usize) -> Particle {
-        let pos = random_genes(rng, bounds);
+    fn random(rng: &mut Rng, base: &Foil, s: &OptimSettings, bounds: &[(f64, f64)], nbest: usize) -> Particle {
+        let pos = random_feasible_genes(rng, base, s, bounds);
         let vel = bounds.iter().map(|&(lo, hi)| {
             let dv = (hi - lo) / 2.0;
             rng.range(-dv / 2.0, dv / 2.0)
         });
         let vel = vel.collect();
-        Particle { best: vec![(pos.clone(), Vec::new()); nbest], pos, vel, cand: None }
+        Particle { best: vec![(pos.clone(), Vec::new(), f64::INFINITY); nbest], pos, vel, cand: None }
     }
 
-    /// xflr5 `updateBest`: replace the first personal best that the current
-    /// position improves on in any objective.
+    fn around(rng: &mut Rng, base: &Foil, s: &OptimSettings, bounds: &[(f64, f64)], center: &[f64], scale: f64, nbest: usize) -> Particle {
+        let pos = local_feasible_genes(rng, base, s, bounds, center, scale);
+        let vel = bounds
+            .iter()
+            .map(|&(lo, hi)| {
+                let dv = (hi - lo) * 0.25 * scale;
+                rng.range(-dv, dv)
+            })
+            .collect();
+        Particle { best: vec![(pos.clone(), Vec::new(), f64::INFINITY); nbest], pos, vel, cand: None }
+    }
+
+    /// Constrained xflr5 `updateBest`: replace the first personal best that
+    /// the current feasible position improves on (lower violation, or better in
+    /// any objective once constraints are met).
     fn update_best(&mut self) {
         let Some(c) = &self.cand else { return };
+        if !c.feasible {
+            return;
+        }
         for b in self.best.iter_mut() {
-            if b.1.is_empty() || b.1.iter().zip(&c.scores).any(|(o, n)| o > n) {
+            let better = if b.1.is_empty() {
+                true
+            } else if c.violation > 0.0 || b.2 > 0.0 {
+                c.violation < b.2
+            } else {
+                b.1.iter().zip(&c.scores).any(|(o, n)| o > n)
+            };
+            if better {
                 b.0 = self.pos.clone();
                 b.1 = c.scores.clone();
+                b.2 = c.violation;
                 return;
             }
         }
@@ -697,81 +1245,290 @@ pub fn optimise(base: &Foil, s: &OptimSettings, prog: &Progress, on_iteration: &
     base.validate()?;
     s.validate().map_err(FoilError::Geometry)?;
     s.analysis.validate().map_err(FoilError::Geometry)?;
-    let specs = s.enabled();
-    if specs.is_empty() {
-        return Err(FoilError::Geometry("no optimisation objective is enabled".into()));
-    }
     if s.dimension() == 0 {
         return Err(FoilError::Geometry("no design variables (bumps per side = 0 and no flap)".into()));
     }
+    let multipoint = s.is_multipoint();
+    let ops = if multipoint {
+        if !s.analysis.viscous {
+            return Err(FoilError::Geometry("operating-point drag optimisation requires viscous analysis".into()));
+        }
+        let ops = s.enabled_operating_points();
+        if ops.is_empty() {
+            return Err(FoilError::Geometry("no operating point is enabled".into()));
+        }
+        ops
+    } else {
+        Vec::new()
+    };
+    let single_specs = if multipoint {
+        Vec::new()
+    } else {
+        let sp = s.enabled();
+        if sp.is_empty() {
+            return Err(FoilError::Geometry("no optimisation objective is enabled".into()));
+        }
+        sp
+    };
+
     let pop = s.population.max(2);
     let total = pop * (s.iterations + 1); // bounded by validate()
     let bounds = s.bounds();
     let mut rng = Rng::new(s.seed);
-    let mut ctx = Ctx { base, s, specs: specs.clone(), scales: vec![1.0; specs.len()], prog, done: AtomicUsize::new(0), total };
     let algo = s.algorithm.label();
-    prog.stage(format!("{algo}: evaluating initial population"));
-    prog.info(format!("{algo} optimisation of {}: {} variables, {} objective(s), population {pop}, {} iterations", base.name, s.dimension(), specs.len(), s.iterations));
+    // Solve baseline and candidates in the exact same unit-chord frame so
+    // dimensional or translated base foils produce consistent baseline drag
+    // and `AtMostOriginal` caps.
+    let (base_frame, _, _, _, _) = unit_chord_base(base)?;
+    let base_max_t = base_frame.props().thickness;
+    let base_spar_t = s.spar.map(|sp| base_frame.thickness_at(sp.x));
+    let neutral_is_base = s.flap.is_none_or(|(lo, hi)| lo.min(hi) <= 0.0 && 0.0 <= lo.max(hi));
 
-    // initial population: the base foil plus random designs
-    let mut init = vec![s.neutral_genes()];
-    while init.len() < pop {
-        init.push(random_genes(&mut rng, &bounds));
+    if let (Some(sp), Some(t)) = (s.spar, base_spar_t) {
+        if t + 1e-6 < sp.min_thickness {
+            prog.warn(format!(
+                "original foil '{}' is thinner ({:.2}%) than the spar minimum ({:.2}%) at x/c {:.2}",
+                base.name,
+                t * 100.0,
+                sp.min_thickness * 100.0,
+                sp.x
+            ));
+        }
     }
-    let cands = ctx.evaluate_all(init.clone())?;
-    // normalisation scales from the base design
-    let c0 = &cands[0];
-    ctx.scales = specs
-        .iter()
-        .enumerate()
-        .map(|(j, o)| {
-            let v = if c0.feasible { c0.objectives[j].abs() } else { 0.0 };
-            match o.goal {
-                Goal::Target { value, tolerance } => v.max(value.abs()).max(tolerance.abs()).max(1e-6),
-                _ => if v > 1e-6 { v } else { 1.0 },
+
+    // Evaluate baseline (original foil) first for multi-point mode so we know
+    // original drag per row (required for `AtMostOriginal` and scaling).
+    let (mut ctx, baseline, cached_base_evals) = if multipoint {
+        prog.stage(format!("{algo}: evaluating original foil across {} operating points", ops.len()));
+        prog.info(format!("{algo} multi-point optimisation of {}: {} variables, {} operating point(s), population {pop}, {} iterations", base.name, s.dimension(), ops.len(), s.iterations));
+        if let (Some(sp), Some(t)) = (s.spar, base_spar_t) {
+            prog.info(format!("spar constraint: t/c >= {:.2}% at x/c = {:.2} (original {:.2}%)", sp.min_thickness * 100.0, sp.x, t * 100.0));
+        }
+        let specs: Vec<(f64, f64, bool)> = ops.iter().map(|op| (op.re, op.cl, false)).collect();
+        let base_pts = analyze_points(&base_frame, &s.analysis, &specs, prog)?;
+        let op_evals: Vec<OpPointEval> = ops
+            .iter()
+            .enumerate()
+            .zip(base_pts)
+            .map(|((i, op), pt)| make_op_eval(i, op, pt))
+            .collect();
+        for (i, (op, ev)) in ops.iter().zip(&op_evals).enumerate() {
+            let valid = ev.converged && ev.cd > 0.0 && ev.cd.is_finite() && (ev.cl - op.cl).abs() < 0.015;
+            if !valid {
+                let lbl = op.display_label(i);
+                if matches!(op.goal, DragGoal::AtMostOriginal) {
+                    return Err(FoilError::Geometry(format!(
+                        "original foil '{}' did not converge at '{}' (Re {:.0}, CL {:.3}), which has a '<= original' drag goal",
+                        base.name, lbl, op.re, op.cl
+                    )));
+                }
+                prog.warn(format!("original foil '{}' did not converge at '{}' (Re {:.0}, CL {:.3})", base.name, lbl, op.re, op.cl));
             }
-        })
-        .collect();
-    if !c0.feasible {
-        prog.warn(format!("the base foil did not converge at alpha = {}", s.alpha));
-    }
+        }
+        let base_cd: Vec<f64> = ops
+            .iter()
+            .zip(&op_evals)
+            .map(|(op, ev)| {
+                if ev.converged && ev.cd > 1e-6 && ev.cd.is_finite() {
+                    ev.cd
+                } else if let DragGoal::AtMost { cd } | DragGoal::Target { cd } = op.goal {
+                    cd.max(1e-4)
+                } else {
+                    0.01
+                }
+            })
+            .collect();
+        let obj_rows: Vec<usize> = ops.iter().enumerate().filter(|(_, o)| !o.goal.is_cap()).map(|(i, _)| i).collect();
+        let scales: Vec<f64> = if !obj_rows.is_empty() {
+            let wsum: f64 = obj_rows.iter().map(|&i| ops[i].weight).sum::<f64>().max(1e-12);
+            obj_rows.iter().map(|&i| base_cd[i] * wsum / ops[i].weight).collect()
+        } else {
+            vec![1.0]
+        };
+        let cap_weight: f64 = ops.iter().filter(|o| o.goal.is_cap()).map(|o| o.weight).sum::<f64>().max(1.0);
+        let rep_i = obj_rows.first().copied().unwrap_or(0);
+        let rep = &op_evals[rep_i];
+        let baseline = BaselineEval {
+            foil_name: base.name.clone(),
+            cl: rep.cl,
+            cd: rep.cd,
+            cm: rep.cm,
+            cpmin: rep.cpmin,
+            converged: op_evals.iter().all(|e| e.converged),
+            op_points: op_evals.clone(),
+            spar_thickness: base_spar_t,
+            max_thickness: base_max_t,
+        };
+        let ctx = Ctx {
+            base,
+            s,
+            mode: EvalMode::Multi { ops, base_cd, obj_rows, scales, cap_weight },
+            prog,
+            done: AtomicUsize::new(0),
+            total,
+        };
+        (ctx, Some(baseline), Some(op_evals))
+    } else {
+        prog.stage(format!("{algo}: evaluating initial population"));
+        prog.info(format!("{algo} optimisation of {}: {} variables, {} objective(s), population {pop}, {} iterations", base.name, s.dimension(), single_specs.len(), s.iterations));
+        let ctx = Ctx {
+            base,
+            s,
+            mode: EvalMode::Single { scales: vec![1.0; single_specs.len()], specs: single_specs.clone() },
+            prog,
+            done: AtomicUsize::new(0),
+            total,
+        };
+        (ctx, None, None)
+    };
 
-    let mut result = OptimResult::default();
+    // initial population: the base foil plus random designs (in multi-point mode,
+    // half explore locally around the base foil so constrained runs improve promptly)
+    let neutral = s.neutral_genes();
+    let mut init = vec![neutral.clone()];
+    let local_count = if multipoint { (pop - 1) / 2 } else { 0 };
+    for k in 0..(pop - 1) {
+        if k < local_count {
+            init.push(local_feasible_genes(&mut rng, base, s, &bounds, &neutral, 0.35));
+        } else {
+            init.push(random_feasible_genes(&mut rng, base, s, &bounds));
+        }
+    }
+    let cands = if let (Some(base_evals), true) = (cached_base_evals, neutral_is_base) {
+        // Reuse the already-solved unit-chord baseline operating points for
+        // cands[0] when neutral_genes() reproduces base_frame (saves 1 candidate
+        // evaluation and guarantees exact agreement with AtMostOriginal).
+        let c0 = match apply_genes(base, s, &init[0]) {
+            Ok(foil) => {
+                let spar_ok = s.spar.is_none_or(|sp| base_spar_t.unwrap_or(0.0) + 1e-6 >= sp.min_thickness);
+                if spar_ok {
+                    ctx.score_multi_evals(init[0].clone(), foil, base_spar_t, base_evals)
+                } else {
+                    ctx.infeasible(init[0].clone(), foil, base_spar_t, base_evals)
+                }
+            }
+            Err(_) => ctx.infeasible(init[0].clone(), base_frame.clone(), base_spar_t, base_evals),
+        };
+        ctx.record_eval(&c0)?;
+        let mut rest = ctx.evaluate_all(init[1..].to_vec())?;
+        let mut all = Vec::with_capacity(pop);
+        all.push(c0);
+        all.append(&mut rest);
+        all
+    } else {
+        ctx.evaluate_all(init.clone())?
+    };
+
+    // Single-point normalisation scales and baseline from cands[0] (or unit-chord base foil).
+    let baseline = if let Some(b) = baseline {
+        b
+    } else {
+        let c0 = &cands[0];
+        if let EvalMode::Single { specs, scales } = &mut ctx.mode {
+            *scales = specs
+                .iter()
+                .enumerate()
+                .map(|(j, o)| {
+                    let v = if c0.feasible { c0.objectives[j].abs() } else { 0.0 };
+                    match o.goal {
+                        Goal::Target { value, tolerance } => v.max(value.abs()).max(tolerance.abs()).max(1e-6),
+                        _ => if v > 1e-6 { v } else { 1.0 },
+                    }
+                })
+                .collect();
+        }
+        if !c0.feasible {
+            prog.warn(format!("the base foil did not converge at alpha = {}", s.alpha));
+        }
+        if neutral_is_base && c0.feasible {
+            BaselineEval {
+                foil_name: base.name.clone(),
+                cl: c0.cl,
+                cd: c0.cd,
+                cm: c0.cm,
+                cpmin: c0.cpmin,
+                converged: true,
+                op_points: Vec::new(),
+                spar_thickness: base_spar_t,
+                max_thickness: base_max_t,
+            }
+        } else {
+            let pt = analyze_point(&base_frame, &s.analysis, s.alpha, true, &Progress::none()).ok().flatten().map(|d| d.point);
+            match pt {
+                Some(p) => BaselineEval {
+                    foil_name: base.name.clone(),
+                    cl: p.cl,
+                    cd: p.cd,
+                    cm: p.cm,
+                    cpmin: p.cpmin,
+                    converged: true,
+                    op_points: Vec::new(),
+                    spar_thickness: base_spar_t,
+                    max_thickness: base_max_t,
+                },
+                None => BaselineEval {
+                    foil_name: base.name.clone(),
+                    spar_thickness: base_spar_t,
+                    max_thickness: base_max_t,
+                    ..Default::default()
+                },
+            }
+        }
+    };
+
+    let mut result = OptimResult { baseline: Some(baseline), ..Default::default() };
     let mut archive: Vec<Candidate> = Vec::new();
+    // Track the best constraint-satisfying compromise independently of archive
+    // crowding so crowding trim can never discard it and infeasible/cap-violating
+    // candidates are never delivered as `result.best` or `result.pareto`.
+    let mut best_feasible: Option<Candidate> = None;
+    let update_best = |best_feasible: &mut Option<Candidate>, c: &Candidate, ctx: &Ctx| {
+        if c.constraints_met() && best_feasible.as_ref().is_none_or(|b| ctx.scalar(c) < ctx.scalar(b)) {
+            *best_feasible = Some(c.clone());
+        }
+    };
     for c in &cands {
         archive_insert(&mut archive, c);
+        update_best(&mut best_feasible, c, &ctx);
     }
     archive_trim(&mut archive, s.archive_size);
 
-    let report = |it: usize, archive: &[Candidate], extra: Option<&Candidate>, result: &mut OptimResult, ctx: &Ctx| -> bool {
-        let mut best: Option<&Candidate> = archive.iter().min_by(|a, b| ctx.scalar(a).total_cmp(&ctx.scalar(b)));
-        if let Some(e) = extra {
-            if best.map(|b| ctx.scalar(e) < ctx.scalar(b)).unwrap_or(e.feasible) {
-                best = Some(e);
+    let report = |it: usize, archive: &[Candidate], best_feasible: Option<&Candidate>, result: &mut OptimResult, ctx: &Ctx| -> bool {
+        let delivered_pareto: Vec<Candidate> = archive.iter().filter(|a| a.constraints_met()).cloned().collect();
+        result.best = best_feasible.cloned();
+        result.pareto = delivered_pareto;
+        result.evaluations = ctx.done.load(Ordering::Relaxed);
+        let v = ctx.history_metric(result.best.as_ref());
+        result.history.push((it, v));
+        match &ctx.mode {
+            EvalMode::Single { specs, .. } => {
+                ctx.prog.stage(format!("{algo} iteration {it}/{} - best {} {}", s.iterations, specs[0].objective.label(), fmt_val(v)));
+            }
+            EvalMode::Multi { .. } => {
+                let status = match &result.best {
+                    Some(_) => format!("weighted CD {:.3}x orig", v),
+                    None if archive.iter().any(|a| a.feasible) => "seeking feasible drag caps".into(),
+                    None => "no converged design".into(),
+                };
+                ctx.prog.stage(format!("{algo} iteration {it}/{} - {status}", s.iterations));
             }
         }
-        result.best = best.cloned();
-        result.pareto = archive.to_vec();
-        result.evaluations = ctx.done.load(Ordering::Relaxed);
-        let v = result.best.as_ref().map(|b| b.objectives[0]).unwrap_or(f64::NAN);
-        result.history.push((it, v));
-        ctx.prog.stage(format!("{algo} iteration {it}/{} - best {} {}", s.iterations, specs[0].objective.label(), fmt_val(v)));
         on_iteration(it, result);
-        archive.iter().any(|a| ctx.satisfied(a))
+        best_feasible.is_some_and(|b| ctx.satisfied(b)) || result.pareto.iter().any(|a| ctx.satisfied(a))
     };
 
-    let mut done = report(0, &archive, None, &mut result, &ctx);
+    let mut done = report(0, &archive, best_feasible.as_ref(), &mut result, &ctx);
 
     match s.algorithm {
         Algorithm::Mopso => {
-            let nbest = specs.len().min(3);
+            let nbest = ctx.score_dim().clamp(1, 3);
             let mut swarm: Vec<Particle> = init
                 .into_iter()
                 .zip(cands)
                 .map(|(g, c)| {
-                    let mut p = Particle::random(&mut rng, &bounds, nbest);
+                    let mut p = Particle::random(&mut rng, base, s, &bounds, nbest);
                     p.pos = g;
-                    p.best = vec![(p.pos.clone(), Vec::new()); nbest];
+                    p.best = vec![(p.pos.clone(), Vec::new(), f64::INFINITY); nbest];
                     p.cand = Some(c);
                     p.update_best();
                     p
@@ -786,7 +1543,12 @@ pub fn optimise(base: &Foil, s: &OptimSettings, prog: &Progress, on_iteration: &
                     let in_front = p.cand.as_ref().map(|c| archive.iter().any(|a| a.genes == c.genes)).unwrap_or(false);
                     let regen = (rng.f64() < s.regen_probability && !in_front) || !feasible || archive.is_empty();
                     if regen {
-                        let np = Particle::random(&mut rng, &bounds, nbest);
+                        let np = if multipoint && !archive.is_empty() && rng.f64() < 0.6 {
+                            let anchor = &archive[rng.below(archive.len())].genes;
+                            Particle::around(&mut rng, base, s, &bounds, anchor, 0.30, nbest)
+                        } else {
+                            Particle::random(&mut rng, base, s, &bounds, nbest)
+                        };
                         p.pos = np.pos;
                         p.vel = np.vel;
                         p.best = np.best;
@@ -810,33 +1572,37 @@ pub fn optimise(base: &Foil, s: &OptimSettings, prog: &Progress, on_iteration: &
                 // evaluate (parallel)
                 let cands = ctx.evaluate_all(swarm.iter().map(|p| p.pos.clone()).collect())?;
                 for (p, c) in swarm.iter_mut().zip(cands) {
+                    update_best(&mut best_feasible, &c, &ctx);
                     p.cand = Some(c);
                     p.update_best();
                     archive_insert(&mut archive, p.cand.as_ref().unwrap());
                 }
                 archive_trim(&mut archive, s.archive_size);
-                done = report(it, &archive, None, &mut result, &ctx);
+                done = report(it, &archive, best_feasible.as_ref(), &mut result, &ctx);
                 it += 1;
             }
         }
         Algorithm::Genetic => {
             let mut popn: Vec<Candidate> = cands;
-            let mut elite: Candidate = popn.iter().min_by(|a, b| ctx.scalar(a).total_cmp(&ctx.scalar(b))).cloned().unwrap();
+            let mut elite: Candidate = popn.iter().min_by(|a, b| ctx.compare_candidate(a, b)).cloned().unwrap();
             let mut it = 1;
             while it <= s.iterations && !done {
                 prog.check()?;
-                // roulette selection on (worst feasible - score)
-                let sc: Vec<f64> = popn.iter().map(|c| ctx.scalar(c)).collect();
-                let feas: Vec<f64> = sc.iter().cloned().filter(|v| *v < LARGE).collect();
-                let worst = feas.iter().cloned().fold(f64::MIN, f64::max);
-                let bestv = feas.iter().cloned().fold(f64::MAX, f64::min);
-                let margin = 0.05 * (worst - bestv).max(0.0) + 1e-12;
-                let w: Vec<f64> = sc.iter().map(|&v| if v < LARGE { worst - v + margin } else { 0.0 }).collect();
+                // Feasibility-first rank-based selection: constraint-satisfying
+                // designs always rank ahead of cap violators without a large
+                // penalty swamping selection pressure among feasible candidates.
+                let mut feas_idx: Vec<usize> = (0..popn.len()).filter(|&i| popn[i].feasible).collect();
+                feas_idx.sort_by(|&a, &b| ctx.compare_candidate(&popn[a], &popn[b]));
+                let m = feas_idx.len();
+                let mut w = vec![0.0; popn.len()];
+                for (rank, &idx) in feas_idx.iter().enumerate() {
+                    w[idx] = (m - rank) as f64;
+                }
                 let wsum: f64 = w.iter().sum();
                 let mut genes: Vec<Vec<f64>> = (0..pop)
                     .map(|_| {
                         if wsum <= 0.0 {
-                            return random_genes(&mut rng, &bounds);
+                            return random_feasible_genes(&mut rng, base, s, &bounds);
                         }
                         let mut r = rng.f64() * wsum;
                         for (i, wi) in w.iter().enumerate() {
@@ -878,27 +1644,38 @@ pub fn optimise(base: &Foil, s: &OptimSettings, prog: &Progress, on_iteration: &
                     clamp_genes(g, &bounds);
                 }
                 popn = ctx.evaluate_all(genes)?;
-                // elitism: the best design so far replaces the worst child
-                let (iw, _) = popn.iter().enumerate().max_by(|a, b| ctx.scalar(a.1).total_cmp(&ctx.scalar(b.1))).unwrap();
-                let (ib, cb) = popn.iter().enumerate().min_by(|a, b| ctx.scalar(a.1).total_cmp(&ctx.scalar(b.1))).unwrap();
-                if ctx.scalar(cb) < ctx.scalar(&elite) {
+                // elitism: the best design so far (feasibility-first) replaces the worst child
+                let (iw, _) = popn.iter().enumerate().max_by(|a, b| ctx.compare_candidate(a.1, b.1)).unwrap();
+                let (ib, cb) = popn.iter().enumerate().min_by(|a, b| ctx.compare_candidate(a.1, b.1)).unwrap();
+                if ctx.compare_candidate(cb, &elite) == std::cmp::Ordering::Less {
                     elite = popn[ib].clone();
                 } else {
                     popn[iw] = elite.clone();
                 }
                 for c in &popn {
                     archive_insert(&mut archive, c);
+                    update_best(&mut best_feasible, c, &ctx);
                 }
                 archive_trim(&mut archive, s.archive_size);
-                done = report(it, &archive, Some(&elite), &mut result, &ctx) || ctx.satisfied(&elite);
+                done = report(it, &archive, best_feasible.as_ref(), &mut result, &ctx);
                 it += 1;
             }
         }
     }
     prog.set(1.0);
     if let Some(b) = &result.best {
-        let parts: Vec<String> = specs.iter().zip(&b.objectives).map(|(o, v)| format!("{} {}", o.objective.label(), fmt_val(*v))).collect();
-        prog.info(format!("{algo} finished after {} evaluations: {}", result.evaluations, parts.join(", ")));
+        match &ctx.mode {
+            EvalMode::Single { specs, .. } => {
+                let parts: Vec<String> = specs.iter().zip(&b.objectives).map(|(o, v)| format!("{} {}", o.objective.label(), fmt_val(*v))).collect();
+                prog.info(format!("{algo} finished after {} evaluations: {}", result.evaluations, parts.join(", ")));
+            }
+            EvalMode::Multi { .. } => {
+                let parts: Vec<String> = b.op_points.iter().map(|e| format!("{} CD {:.5}", e.label, e.cd)).collect();
+                prog.info(format!("{algo} finished after {} evaluations: {}", result.evaluations, parts.join(", ")));
+            }
+        }
+    } else if multipoint {
+        prog.warn(format!("{algo} finished without any design satisfying all constraints"));
     } else {
         prog.warn(format!("{algo} finished without any converged design"));
     }
@@ -1065,5 +1842,177 @@ mod tests {
         assert!(best.feasible && !r.pareto.is_empty());
         assert!(r.pareto.iter().all(|c| c.objectives.len() == 2));
         eprintln!("GA best Cl {:.4} Cd {:.5}, pareto {}", best.cl, best.cd, r.pareto.len());
+    }
+
+    #[test]
+    fn multipoint_glider_section_reduces_drag_keeps_slow_and_spar() {
+        let base = Foil::naca("2412").unwrap();
+        let s = OptimSettings {
+            algorithm: Algorithm::Mopso,
+            parameterization: Parameterization::Cst,
+            cst_order: 4,
+            cst_max_delta: 0.04,
+            operating_points: vec![
+                OperatingPoint { label: "Slow flight".into(), enabled: true, re: 1.15e5, cl: 0.90, goal: DragGoal::AtMostOriginal, weight: 1.0 },
+                OperatingPoint { label: "Cruise".into(), enabled: true, re: 1.75e5, cl: 0.50, goal: DragGoal::Minimise, weight: 1.0 },
+                OperatingPoint { label: "Fast glide".into(), enabled: true, re: 2.70e5, cl: 0.20, goal: DragGoal::Minimise, weight: 1.0 },
+            ],
+            spar: Some(SparConstraint { x: 0.30, min_thickness: 0.115 }),
+            population: 10,
+            iterations: 8,
+            archive_size: 2, // also checks crowding trim never worsens MOPSO history
+            seed: 42,
+            ..Default::default()
+        };
+        let r = optimise(&base, &s, &Progress::none(), &|_, _| {}).unwrap();
+        let base_eval = r.baseline.as_ref().expect("baseline evaluation");
+        assert_eq!(base_eval.op_points.len(), 3);
+        assert!(base_eval.op_points.iter().all(|p| p.converged));
+        let base_spar = base_eval.spar_thickness.expect("baseline spar thickness");
+        assert!((base_spar - 0.12).abs() < 2e-3, "base spar t/c = {base_spar}");
+
+        let best = r.best.as_ref().expect("best candidate");
+        assert!(best.constraints_met(), "violation {}", best.violation);
+        assert_eq!(best.op_points.len(), 3);
+        let best_spar = best.spar_thickness.expect("best spar thickness");
+        assert!(best_spar + 1e-6 >= 0.115, "spar violated: {best_spar}");
+        // Slow flight drag must stay at or below original
+        assert!(
+            best.op_points[0].cd <= base_eval.op_points[0].cd + 1e-7,
+            "slow cd {} > orig {}",
+            best.op_points[0].cd,
+            base_eval.op_points[0].cd
+        );
+        // Weighted cruise + fast drag ratio must strictly improve and never worsen across iterations
+        assert_eq!(r.history.len(), 9);
+        assert!(r.history.last().unwrap().1 < 0.99, "expected >1% weighted drag reduction, got {:?}", r.history);
+        assert!(r.history.windows(2).all(|w| w[1].1 <= w[0].1 + 1e-12), "history regressed: {:?}", r.history);
+        assert!(
+            best.op_points[1].cd < base_eval.op_points[1].cd || best.op_points[2].cd < base_eval.op_points[2].cd,
+            "expected drag reduction in cruise or fast glide"
+        );
+        eprintln!(
+            "multi-point best: slow {:.5} (orig {:.5}), cruise {:.5} (orig {:.5}), fast {:.5} (orig {:.5}), spar {:.2}%, ratio {:.4}",
+            best.op_points[0].cd,
+            base_eval.op_points[0].cd,
+            best.op_points[1].cd,
+            base_eval.op_points[1].cd,
+            best.op_points[2].cd,
+            base_eval.op_points[2].cd,
+            best_spar * 100.0,
+            r.history.last().unwrap().1
+        );
+    }
+
+    #[test]
+    fn scaled_base_foil_matches_unit_chord_baseline() {
+        let unit = Foil::naca("2412").unwrap();
+        let mut scaled = unit.clone();
+        for x in &mut scaled.x {
+            *x = 2.5 * *x + 12.0;
+        }
+        for y in &mut scaled.y {
+            *y = 2.5 * *y - 4.0;
+        }
+        let s = OptimSettings {
+            algorithm: Algorithm::Mopso,
+            parameterization: Parameterization::Cst,
+            cst_order: 3,
+            cst_max_delta: 0.02,
+            operating_points: vec![
+                OperatingPoint { label: "Slow".into(), enabled: true, re: 1.15e5, cl: 0.90, goal: DragGoal::AtMostOriginal, weight: 1.0 },
+                OperatingPoint { label: "Cruise".into(), enabled: true, re: 1.75e5, cl: 0.50, goal: DragGoal::Minimise, weight: 1.0 },
+            ],
+            population: 3,
+            iterations: 0,
+            seed: 5,
+            ..Default::default()
+        };
+        let ru = optimise(&unit, &s, &Progress::none(), &|_, _| {}).unwrap();
+        let rs = optimise(&scaled, &s, &Progress::none(), &|_, _| {}).unwrap();
+        let bu = ru.baseline.as_ref().unwrap();
+        let bs = rs.baseline.as_ref().unwrap();
+        for (a, b) in bu.op_points.iter().zip(&bs.op_points) {
+            assert!((a.cd - b.cd).abs() < 1e-7, "scaled baseline CD {} != unit {}", b.cd, a.cd);
+        }
+        // Re-evaluating the returned zero-gene foil must match the cached baseline CD.
+        let best_s = rs.best.as_ref().unwrap();
+        let check = analyze_points(&best_s.foil, &s.analysis, &[(1.15e5, 0.90, false)], &Progress::none()).unwrap();
+        assert!((check[0].unwrap().cd - best_s.op_points[0].cd).abs() < 1e-7);
+    }
+
+    #[test]
+    fn impossible_drag_cap_and_tiny_weight_deliver_no_best() {
+        let base = Foil::naca("2412").unwrap();
+        for algo in [Algorithm::Mopso, Algorithm::Genetic] {
+            let s = OptimSettings {
+                algorithm: algo,
+                parameterization: Parameterization::Cst,
+                cst_order: 2,
+                cst_max_delta: 0.02,
+                operating_points: vec![
+                    OperatingPoint { label: "Impossible".into(), enabled: true, re: 1.5e5, cl: 0.50, goal: DragGoal::AtMost { cd: 1.0e-7 }, weight: 1.0e-300 },
+                    OperatingPoint { label: "Cruise".into(), enabled: true, re: 2.0e5, cl: 0.40, goal: DragGoal::Minimise, weight: 1.0 },
+                ],
+                population: 4,
+                iterations: 2,
+                seed: 1,
+                ..Default::default()
+            };
+            let r = optimise(&base, &s, &Progress::none(), &|_, _| {}).unwrap();
+            assert!(r.best.is_none(), "{algo:?} must not return a cap-violating best design");
+            assert!(r.pareto.is_empty(), "{algo:?} must not return cap-violating Pareto designs");
+            assert!(r.baseline.is_some());
+        }
+    }
+
+    #[test]
+    fn multipoint_validation_and_ga_respect_spar_and_caps() {
+        let base = Foil::naca("2412").unwrap();
+        // Validation rejects empty enabled operating points, bad spar, bad weight, inviscid
+        let mut bad = OptimSettings {
+            operating_points: vec![OperatingPoint { enabled: false, ..Default::default() }],
+            ..Default::default()
+        };
+        assert!(matches!(optimise(&base, &bad, &Progress::none(), &|_, _| {}), Err(FoilError::Geometry(_))));
+        bad.operating_points[0].enabled = true;
+        bad.analysis.viscous = false;
+        assert!(matches!(optimise(&base, &bad, &Progress::none(), &|_, _| {}), Err(FoilError::Geometry(_))));
+        bad.analysis.viscous = true;
+        bad.spar = Some(SparConstraint { x: 1.5, min_thickness: 0.12 });
+        assert!(bad.validate().is_err());
+        bad.spar = Some(SparConstraint { x: 0.30, min_thickness: 0.115 });
+        bad.operating_points[0].weight = 0.0;
+        assert!(bad.validate().is_err());
+
+        // GA multi-point respects spar thickness and drag cap
+        let ga = OptimSettings {
+            algorithm: Algorithm::Genetic,
+            parameterization: Parameterization::Cst,
+            cst_order: 3,
+            cst_max_delta: 0.03,
+            operating_points: vec![
+                OperatingPoint { label: "Slow".into(), enabled: true, re: 1.3e5, cl: 0.85, goal: DragGoal::AtMostOriginal, weight: 1.0 },
+                OperatingPoint { label: "Cruise".into(), enabled: true, re: 2.0e5, cl: 0.45, goal: DragGoal::Minimise, weight: 1.0 },
+            ],
+            spar: Some(SparConstraint { x: 0.30, min_thickness: 0.118 }),
+            population: 6,
+            iterations: 2,
+            seed: 3,
+            ..Default::default()
+        };
+        let r = optimise(&base, &ga, &Progress::none(), &|_, _| {}).unwrap();
+        let best = r.best.as_ref().expect("GA best");
+        let base_eval = r.baseline.as_ref().unwrap();
+        assert!(best.constraints_met());
+        assert!(best.spar_thickness.unwrap() + 1e-6 >= 0.118);
+        assert!(best.op_points[0].cd <= base_eval.op_points[0].cd + 1e-7);
+        assert!(best.op_points[1].cd <= base_eval.op_points[1].cd + 1e-7);
+
+        // JSON roundtrip preserves operating_points and spar
+        let json = serde_json::to_string(&ga).unwrap();
+        let back: OptimSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.operating_points, ga.operating_points);
+        assert_eq!(back.spar, ga.spar);
     }
 }

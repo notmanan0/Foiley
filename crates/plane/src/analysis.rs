@@ -864,6 +864,399 @@ impl PlanePolar {
         }
         s
     }
+
+    /// Map a strip's `wing` index to the corresponding `(plane_wing_index, &Wing)` in `plane`.
+    /// LLT always stores `wing = 0` for the main wing.
+    fn wing_for_strip<'a>(&self, plane: &'a Plane, strip_wing: usize) -> Option<(usize, &'a crate::geom::Wing)> {
+        if self.def.as_ref().is_some_and(|d| d.method == Method::Llt) && strip_wing == 0 {
+            let idx = plane.wings.iter().position(|w| w.kind == crate::geom::WingKind::Main).unwrap_or(0);
+            plane.wings.get(idx).map(|w| (idx, w))
+        } else {
+            plane.wings.get(strip_wing).map(|w| (strip_wing, w))
+        }
+    }
+
+    /// Resolve a strip's `wing` index to the plane's `wings` index (accounting for LLT).
+    pub fn wing_index_for_strip(&self, plane: &Plane, strip_wing: usize) -> Option<usize> {
+        self.wing_for_strip(plane, strip_wing).map(|(idx, _)| idx)
+    }
+
+    /// Human-readable wing name for a strip's `wing` index.
+    pub fn wing_name_for_strip(&self, plane: Option<&Plane>, strip_wing: usize) -> String {
+        plane
+            .and_then(|pl| self.wing_for_strip(pl, strip_wing))
+            .map(|(_, w)| w.name.clone())
+            .unwrap_or_else(|| format!("wing {strip_wing}"))
+    }
+
+    /// Distinct strip wing indices recorded across all of this polar's points.
+    pub fn strip_wings(&self) -> Vec<usize> {
+        let mut ws: Vec<usize> = self.points.iter().flat_map(|p| p.strips.iter().map(|s| s.wing)).collect();
+        ws.sort_unstable();
+        ws.dedup();
+        ws
+    }
+
+    /// Spanwise stations recorded for `wing` (strip wing index), sorted by `span_pos`.
+    pub fn wing_stations(&self, plane: Option<&Plane>, wing: usize) -> Vec<WingStation> {
+        let Some(opp) = self.points.iter().find(|p| p.strips.iter().any(|s| s.wing == wing)) else {
+            return Vec::new();
+        };
+        let resolved = plane.and_then(|pl| self.wing_for_strip(pl, wing));
+        let wing_name = resolved.map(|(_, w)| w.name.clone()).unwrap_or_else(|| format!("wing {wing}"));
+        let two_sided = resolved.is_none_or(|(_, w)| w.two_sided);
+        let strip_positions: Vec<f64> = opp.strips.iter().filter(|s| s.wing == wing).map(|s| s.span_pos).collect();
+        let (min_pos, max_pos) = if let Some((_, w)) = resolved {
+            if w.two_sided {
+                let semi = (0.5 * w.planform_span()).max(1e-9);
+                (0.0, semi)
+            } else {
+                let y0 = w.sections.first().map(|s| s.y).unwrap_or(0.0);
+                let y1 = w.sections.last().map(|s| s.y).unwrap_or(y0 + w.planform_span());
+                let lo = y0.min(y1);
+                let hi = y0.max(y1).max(lo + 1e-9);
+                (lo, hi)
+            }
+        } else {
+            let lo = strip_positions.iter().copied().fold(f64::INFINITY, f64::min);
+            let hi = strip_positions.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            if lo < 0.0 && hi > 0.0 {
+                (0.0, lo.abs().max(hi.abs()).max(1e-9))
+            } else {
+                (lo, hi.max(lo + 1e-9))
+            }
+        };
+        let mut out: Vec<WingStation> = opp
+            .strips
+            .iter()
+            .filter(|s| s.wing == wing)
+            .map(|s| {
+                let (foil, foil_blend) = match resolved.and_then(|(_, w)| w.foil_at(s.span_pos)) {
+                    Some((a, b, _t)) if a == b => (Some(a.to_string()), None),
+                    Some((a, b, t)) => {
+                        let dom = if t < 0.5 { a } else { b };
+                        (Some(dom.to_string()), Some((a.to_string(), b.to_string(), t)))
+                    }
+                    None => (None, None),
+                };
+                let span_frac = if two_sided {
+                    (s.span_pos.abs() / max_pos.max(1e-9)).clamp(0.0, 1.0)
+                } else {
+                    ((s.span_pos - min_pos) / (max_pos - min_pos).max(1e-9)).clamp(0.0, 1.0)
+                };
+                WingStation {
+                    wing,
+                    wing_name: wing_name.clone(),
+                    span_pos: s.span_pos,
+                    span_frac,
+                    chord: s.chord,
+                    foil,
+                    foil_blend,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.span_pos.total_cmp(&b.span_pos));
+        out
+    }
+
+    /// Strip on `wing` nearest to `span_pos` at `self.points[point_index]`.
+    /// When `span_pos` is off-centreline (`|span_pos| > 1e-6`), strips on the
+    /// same side of the centreline are preferred so a missing strip never
+    /// silently matches the opposite wing half.
+    pub fn strip_at(&self, point_index: usize, wing: usize, span_pos: f64) -> Option<&StripResult> {
+        let opp = self.points.get(point_index)?;
+        let on_wing = |s: &&StripResult| s.wing == wing && s.span_pos.is_finite();
+        let best_same = if span_pos.abs() > 1e-6 {
+            opp.strips
+                .iter()
+                .filter(|s| on_wing(s) && s.span_pos.signum() == span_pos.signum())
+                .min_by(|a, b| (a.span_pos - span_pos).abs().total_cmp(&(b.span_pos - span_pos).abs()))
+        } else {
+            None
+        };
+        if best_same.is_some() {
+            return best_same;
+        }
+        let best_any = opp
+            .strips
+            .iter()
+            .filter(on_wing)
+            .min_by(|a, b| (a.span_pos - span_pos).abs().total_cmp(&(b.span_pos - span_pos).abs()))?;
+        if span_pos.abs() > 1e-6 && best_any.span_pos.signum() != span_pos.signum() && (best_any.span_pos - span_pos).abs() > 0.05 {
+            return None;
+        }
+        Some(best_any)
+    }
+
+    /// Local section operating conditions at `(wing, span_pos)` for `self.points[point_index]`.
+    pub fn station_point(&self, point_index: usize, wing: usize, span_pos: f64, label: impl Into<String>) -> Option<StationPoint> {
+        let opp = self.points.get(point_index)?;
+        let s = self.strip_at(point_index, wing, span_pos)?;
+        Some(StationPoint {
+            point_index,
+            label: label.into(),
+            alpha: opp.alpha,
+            velocity: opp.velocity,
+            plane_cl: opp.cl,
+            plane_cd: opp.cd,
+            plane_ld: opp.ld(),
+            span_pos: s.span_pos,
+            chord: s.chord,
+            re: s.re,
+            cl: s.cl,
+            cdv: s.cdv,
+            alpha_eff: s.alpha_eff,
+            out_of_polar: s.out_of_polar,
+            envelope: s.envelope,
+            default_goal: foiley_foil::optim::DragGoal::Minimise,
+        })
+    }
+
+    /// Automatically pick up to three representative flight regimes at `(wing, span_pos)`:
+    /// * Speed-varying lift sweeps (T2 fixed lift, T3 glide): **Slow flight** (high CL / min sink,
+    ///   `<= original` drag cap), **Cruise** (best L/D), **Fast glide** (low positive CL / high speed).
+    /// * Fixed-alpha speed sweeps (T4): **Slow flight** (lowest speed, `<= original`), **Cruise**
+    ///   (mid speed / best L/D), **Fast glide** (highest speed).
+    /// * Fixed-speed sweeps (T1): **High CL** (`<= original`), **Best L/D**, **Low CL**.
+    /// * Near-duplicate `(Re, local Cl)` points (e.g. T5 sideslip / T7 stability) are collapsed so
+    ///   one operating point is never triple-weighted.
+    pub fn pick_flight_regimes(&self, wing: usize, span_pos: f64) -> Vec<StationPoint> {
+        use foiley_foil::optim::DragGoal;
+
+        let raw: Vec<(usize, &PlaneOpp, &StripResult)> = self
+            .points
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| {
+                let s = self.strip_at(i, wing, span_pos)?;
+                if s.re.is_finite()
+                    && s.re > 1.0e3
+                    && s.cl.is_finite()
+                    && o.cl.is_finite()
+                    && o.cd.is_finite()
+                    && o.cd > 0.0
+                    && o.velocity.is_finite()
+                    && o.velocity > 0.0
+                {
+                    Some((i, o, s))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if raw.is_empty() {
+            return Vec::new();
+        }
+
+        // Collapse near-duplicate (Re, local Cl) states (e.g. T5 sideslip or T7
+        // stability sweeps), keeping the cleanest / highest-L/D representative.
+        let mut valid: Vec<(usize, &PlaneOpp, &StripResult)> = Vec::with_capacity(raw.len());
+        for cand in raw {
+            let near = valid.iter_mut().find(|(_, _, es)| {
+                let re_diff = (cand.2.re - es.re).abs() / cand.2.re.max(es.re).max(1.0);
+                let cl_diff = (cand.2.cl - es.cl).abs();
+                re_diff < 0.015 && cl_diff < 0.015
+            });
+            if let Some(slot) = near {
+                let better = (cand.1.beta.abs() + 1e-6 < slot.1.beta.abs())
+                    || ((cand.1.beta.abs() - slot.1.beta.abs()).abs() <= 1e-6 && cand.1.ld() > slot.1.ld());
+                if better {
+                    *slot = cand;
+                }
+            } else {
+                valid.push(cand);
+            }
+        }
+
+        let make = |idx: usize, label: &str, goal: DragGoal| -> Option<StationPoint> {
+            let mut pt = self.station_point(idx, wing, span_pos, label)?;
+            pt.default_goal = goal;
+            Some(pt)
+        };
+
+        let kind = self.def.as_ref().map(|d| d.kind);
+        let (v_min, v_max) = valid.iter().fold((f64::INFINITY, 0.0f64), |(lo, hi), (_, o, _)| (lo.min(o.velocity), hi.max(o.velocity)));
+        let (cl_min, cl_max) = valid.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (_, o, _)| (lo.min(o.cl), hi.max(o.cl)));
+        let v_varies = (v_max - v_min) / v_max.max(1e-9) > 0.05;
+        let speed_sweep = kind == Some(PolarKind::FixedAlpha) || (v_varies && (cl_max - cl_min) < 0.05);
+
+        if speed_sweep {
+            // Order by actual airspeed: slowest (lowest Re) -> mid -> fastest (highest Re).
+            valid.sort_by(|a, b| a.1.velocity.total_cmp(&b.1.velocity));
+            if valid.len() == 1 {
+                return make(valid[0].0, "Cruise", DragGoal::Minimise).into_iter().collect();
+            }
+            if valid.len() == 2 {
+                return [
+                    make(valid[0].0, "Slow flight", DragGoal::AtMostOriginal),
+                    make(valid[1].0, "Fast glide", DragGoal::Minimise),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+            }
+            let slow_idx = valid[0].0;
+            let fast_idx = valid.last().unwrap().0;
+            let interior = &valid[1..valid.len() - 1];
+            let mid_v = 0.5 * (valid[0].1.velocity + valid.last().unwrap().1.velocity);
+            let cruise_idx = interior
+                .iter()
+                .min_by(|a, b| (a.1.velocity - mid_v).abs().total_cmp(&(b.1.velocity - mid_v).abs()))
+                .map(|x| x.0)
+                .unwrap_or(valid[valid.len() / 2].0);
+            return [
+                make(slow_idx, "Slow flight", DragGoal::AtMostOriginal),
+                make(cruise_idx, "Cruise", DragGoal::Minimise),
+                make(fast_idx, "Fast glide", DragGoal::Minimise),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+        }
+
+        // Lift-varying sweep (T2, T3, T1, T6, T8): keep positive-lift states whenever any exist.
+        let pos: Vec<_> = valid.iter().copied().filter(|(_, o, s)| o.cl > 0.05 && s.cl > 0.05).collect();
+        if !pos.is_empty() {
+            valid = pos;
+        }
+        let (lbl_slow, lbl_cruise, lbl_fast) = if v_varies {
+            ("Slow flight", "Cruise", "Fast glide")
+        } else {
+            ("High CL", "Best L/D", "Low CL")
+        };
+
+        // Sort by ascending whole-aircraft CL (fast/low-CL -> cruise -> slow/high-CL),
+        // tie-breaking by descending velocity.
+        valid.sort_by(|a, b| a.1.cl.total_cmp(&b.1.cl).then_with(|| b.1.velocity.total_cmp(&a.1.velocity)));
+        if valid.len() == 1 {
+            return make(valid[0].0, lbl_cruise, DragGoal::Minimise).into_iter().collect();
+        }
+        if valid.len() == 2 {
+            return [
+                make(valid[1].0, lbl_slow, DragGoal::AtMostOriginal),
+                make(valid[0].0, lbl_cruise, DragGoal::Minimise),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+        }
+
+        // Cruise: highest L/D among interior points so slow and fast stay distinct.
+        let interior = &valid[1..valid.len() - 1];
+        let cruise_pos = 1 + interior
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.1.ld().total_cmp(&b.1.1.ld()))
+            .map(|(k, _)| k)
+            .unwrap_or(0);
+        let cruise_idx = valid[cruise_pos].0;
+
+        // Slow flight: above cruise CL, favour highest CL^1.5/CD (minimum sink)
+        // within an attached-flow, in-envelope section CL (<= 1.25 when available).
+        let slow_slice = &valid[cruise_pos + 1..];
+        let attached_in_env: Vec<_> = slow_slice.iter().copied().filter(|(_, _, s)| s.cl <= 1.25 && !s.out_of_polar).collect();
+        let attached: Vec<_> = slow_slice.iter().copied().filter(|(_, _, s)| s.cl <= 1.25).collect();
+        let slow_pool = if !attached_in_env.is_empty() {
+            &attached_in_env
+        } else if !attached.is_empty() {
+            &attached
+        } else {
+            slow_slice
+        };
+        let sink_score = |o: &PlaneOpp| o.cl.max(0.0).powf(1.5) / o.cd.max(1e-12);
+        let slow_idx = slow_pool
+            .iter()
+            .max_by(|a, b| sink_score(a.1).total_cmp(&sink_score(b.1)))
+            .map(|x| x.0)
+            .unwrap_or(valid.last().unwrap().0);
+
+        // Fast glide: below cruise CL, lowest positive CL >= 0.12 (preferring in-envelope),
+        // or the lowest positive CL below cruise.
+        let fast_slice = &valid[..cruise_pos];
+        let fast_idx = fast_slice
+            .iter()
+            .find(|(_, o, s)| o.cl >= 0.12 && s.cl >= 0.08 && !s.out_of_polar)
+            .or_else(|| fast_slice.iter().find(|(_, o, s)| o.cl >= 0.12 && s.cl >= 0.08))
+            .or_else(|| fast_slice.first())
+            .map(|x| x.0)
+            .unwrap_or(valid[0].0);
+
+        [
+            make(slow_idx, lbl_slow, DragGoal::AtMostOriginal),
+            make(cruise_idx, lbl_cruise, DragGoal::Minimise),
+            make(fast_idx, lbl_fast, DragGoal::Minimise),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// Summary of one spanwise wing station available in a 3D polar.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WingStation {
+    /// Strip wing index in `PlaneOpp::strips`.
+    pub wing: usize,
+    pub wing_name: String,
+    /// Signed developed span position, m (negative = port, positive = starboard).
+    pub span_pos: f64,
+    /// Fraction of wing semi-span (`|span_pos| / (b/2)` for symmetric wings, or
+    /// `(span_pos - root) / span` for one-sided surfaces), in 0..=1.
+    pub span_frac: f64,
+    pub chord: f64,
+    /// Dominant foil name at this station (when a `Plane` was supplied).
+    pub foil: Option<String>,
+    /// If the station lies between two different foils: `(inner, outer, fraction)`.
+    pub foil_blend: Option<(String, String, f64)>,
+}
+
+/// Local 2D operating point extracted from one 3D polar point at a wing station.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StationPoint {
+    /// Index into `PlanePolar::points`.
+    pub point_index: usize,
+    /// Regime or point label (e.g. "Slow flight", "Cruise", "Fast glide").
+    pub label: String,
+    pub alpha: f64,
+    pub velocity: f64,
+    pub plane_cl: f64,
+    pub plane_cd: f64,
+    pub plane_ld: f64,
+    pub span_pos: f64,
+    pub chord: f64,
+    pub re: f64,
+    pub cl: f64,
+    pub cdv: f64,
+    pub alpha_eff: f64,
+    /// True if viscous lookup clamped or missed the 2D polar envelope.
+    #[serde(default)]
+    pub out_of_polar: bool,
+    /// Raw [`foiley_plane::foildb::Envelope`] code recorded on the strip.
+    #[serde(default)]
+    pub envelope: u8,
+    /// Default drag goal recommended for this regime (`AtMostOriginal` for slow/high-CL).
+    #[serde(default)]
+    pub default_goal: foiley_foil::optim::DragGoal,
+}
+
+impl StationPoint {
+    /// Convert this 3D station point into an optimiser operating-point row,
+    /// preserving the extracted Reynolds number without clamping.
+    pub fn to_operating_point(&self, goal: foiley_foil::optim::DragGoal, weight: f64) -> foiley_foil::optim::OperatingPoint {
+        foiley_foil::optim::OperatingPoint {
+            label: self.label.clone(),
+            enabled: true,
+            re: self.re.round(),
+            cl: (self.cl * 1000.0).round() / 1000.0,
+            goal,
+            weight,
+        }
+    }
+
+    /// Convert using this regime's recommended [`Self::default_goal`] and weight 1.0.
+    pub fn to_default_operating_point(&self) -> foiley_foil::optim::OperatingPoint {
+        self.to_operating_point(self.default_goal, 1.0)
+    }
 }
 
 /// A CSV field for an optional coefficient (empty when absent).
@@ -1712,4 +2105,204 @@ fn run_stability(ctx: &Ctx, polar: &mut PlanePolar, prog: &Progress, on_point: &
         sub.set(1.0);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod station_tests {
+    use super::*;
+    use crate::geom::Plane;
+
+    #[test]
+    fn wing_stations_and_flight_regimes_extract_slow_cruise_fast() {
+        let plane = Plane::default_plane("NACA 2412", "NACA 0009");
+        let make_opp = |alpha: f64, v: f64, cl: f64, cd: f64, local_cl: f64| PlaneOpp {
+            alpha,
+            velocity: v,
+            cl,
+            cd,
+            strips: vec![
+                StripResult { wing: 0, span_pos: -0.75, chord: 0.245, cl: local_cl, re: v * 0.245 / 1.5e-5, cdv: 0.01, alpha_eff: alpha, ..Default::default() },
+                StripResult { wing: 0, span_pos: 0.25, chord: 0.282, cl: local_cl * 1.05, re: v * 0.282 / 1.5e-5, cdv: 0.01, alpha_eff: alpha, ..Default::default() },
+                StripResult { wing: 0, span_pos: 0.75, chord: 0.245, cl: local_cl, re: v * 0.245 / 1.5e-5, cdv: 0.01, alpha_eff: alpha, ..Default::default() },
+                StripResult { wing: 0, span_pos: 1.35, chord: 0.201, cl: local_cl * 0.78, re: v * 0.201 / 1.5e-5, cdv: 0.01, alpha_eff: alpha, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let polar = PlanePolar {
+            name: "T2-Vlm2".into(),
+            plane: plane.name.clone(),
+            def: Some(PlanePolarDef { kind: PolarKind::FixedLift, method: Method::Vlm2, ..Default::default() }),
+            points: vec![
+                make_opp(0.0, 14.5, 0.16, 0.013, 0.18), // fast glide (L/D = 12.3)
+                make_opp(2.0, 10.2, 0.34, 0.015, 0.38), // L/D = 22.7
+                make_opp(4.0, 8.2, 0.52, 0.019, 0.58),  // cruise (best L/D = 27.4)
+                make_opp(6.0, 7.1, 0.70, 0.028, 0.77),  // L/D = 25.0, CL^1.5/CD = 20.9
+                make_opp(8.0, 6.4, 0.88, 0.038, 0.96),  // slow flight (max CL^1.5/CD = 21.7)
+                make_opp(10.0, 5.9, 1.04, 0.056, 1.13), // higher drag -> CL^1.5/CD = 18.9
+            ],
+            ..Default::default()
+        };
+
+        let stations = polar.wing_stations(Some(&plane), 0);
+        assert_eq!(stations.len(), 4);
+        assert_eq!(stations[2].foil.as_deref(), Some("NACA 2412"));
+        assert!((stations[2].span_frac - 0.5).abs() < 1e-6);
+
+        let regimes = polar.pick_flight_regimes(0, 0.75);
+        assert_eq!(regimes.len(), 3);
+        assert_eq!(regimes[0].label, "Slow flight");
+        assert_eq!(regimes[1].label, "Cruise");
+        assert_eq!(regimes[2].label, "Fast glide");
+        assert!((regimes[0].cl - 0.96).abs() < 1e-9);
+        assert!((regimes[1].cl - 0.58).abs() < 1e-9);
+        assert!((regimes[2].cl - 0.18).abs() < 1e-9);
+        assert!(regimes[2].re > regimes[1].re && regimes[1].re > regimes[0].re);
+
+        let op = regimes[1].to_operating_point(foiley_foil::optim::DragGoal::Minimise, 1.0);
+        assert_eq!(op.label, "Cruise");
+        assert!((op.cl - 0.58).abs() < 1e-3);
+        assert!(op.re > 1.0e5);
+        assert_eq!(regimes[0].default_goal, foiley_foil::optim::DragGoal::AtMostOriginal);
+        assert_eq!(regimes[1].default_goal, foiley_foil::optim::DragGoal::Minimise);
+    }
+
+    #[test]
+    fn regime_picking_handles_t4_speed_sweep_t1_t5_short_and_offset_fin() {
+        use crate::geom::{Wing, WingKind, WingSection};
+        use foiley_foil::optim::DragGoal;
+
+        let make_pt = |alpha: f64, v: f64, beta: f64, cl: f64, cd: f64, local_cl: f64, y: f64| PlaneOpp {
+            alpha,
+            velocity: v,
+            beta,
+            cl,
+            cd,
+            strips: vec![StripResult { wing: 0, span_pos: y, chord: 0.25, cl: local_cl, re: v * 0.25 / 1.5e-5, cdv: 0.01, alpha_eff: alpha, ..Default::default() }],
+            ..Default::default()
+        };
+
+        // T4 fixed-alpha speed sweep (10, 20, 30 m/s): Slow flight MUST be 10 m/s, Fast glide 30 m/s!
+        let t4 = PlanePolar {
+            name: "T4".into(),
+            plane: "P".into(),
+            def: Some(PlanePolarDef { kind: PolarKind::FixedAlpha, method: Method::Vlm2, ..Default::default() }),
+            points: vec![
+                make_pt(3.0, 10.0, 0.0, 0.450, 0.020, 0.48, 0.5),
+                make_pt(3.0, 20.0, 0.0, 0.451, 0.017, 0.48, 0.5),
+                make_pt(3.0, 30.0, 0.0, 0.452, 0.016, 0.48, 0.5),
+            ],
+            ..Default::default()
+        };
+        let r4 = t4.pick_flight_regimes(0, 0.5);
+        assert_eq!(r4.len(), 3);
+        assert_eq!(r4[0].label, "Slow flight");
+        assert_eq!(r4[0].default_goal, DragGoal::AtMostOriginal);
+        assert!((r4[0].velocity - 10.0).abs() < 1e-6);
+        assert_eq!(r4[1].label, "Cruise");
+        assert!((r4[1].velocity - 20.0).abs() < 1e-6);
+        assert_eq!(r4[2].label, "Fast glide");
+        assert!((r4[2].velocity - 30.0).abs() < 1e-6);
+
+        // T1 fixed-speed sweep: labels reflect CL rather than misleading airspeed names
+        let t1 = PlanePolar {
+            name: "T1".into(),
+            plane: "P".into(),
+            def: Some(PlanePolarDef { kind: PolarKind::FixedSpeed, method: Method::Vlm2, ..Default::default() }),
+            points: vec![
+                make_pt(0.0, 15.0, 0.0, 0.20, 0.012, 0.22, 0.5),
+                make_pt(4.0, 15.0, 0.0, 0.55, 0.018, 0.60, 0.5),
+                make_pt(8.0, 15.0, 0.0, 0.90, 0.036, 0.98, 0.5),
+            ],
+            ..Default::default()
+        };
+        let r1 = t1.pick_flight_regimes(0, 0.5);
+        assert_eq!(r1.len(), 3);
+        assert_eq!(r1[0].label, "High CL");
+        assert_eq!(r1[0].default_goal, DragGoal::AtMostOriginal);
+        assert_eq!(r1[1].label, "Best L/D");
+        assert_eq!(r1[2].label, "Low CL");
+
+        // T5 sideslip with near-identical (Re, local Cl) collapses to 1 Cruise point (not 3 duplicates!)
+        let t5 = PlanePolar {
+            name: "T5".into(),
+            plane: "P".into(),
+            def: Some(PlanePolarDef { kind: PolarKind::Sideslip, method: Method::Vlm2, ..Default::default() }),
+            points: vec![
+                make_pt(3.0, 15.0, -5.0, 0.45, 0.020, 0.480, 0.5),
+                make_pt(3.0, 15.0, 0.0, 0.45, 0.018, 0.482, 0.5),
+                make_pt(3.0, 15.0, 5.0, 0.45, 0.020, 0.481, 0.5),
+            ],
+            ..Default::default()
+        };
+        let r5 = t5.pick_flight_regimes(0, 0.5);
+        assert_eq!(r5.len(), 1);
+        assert_eq!(r5[0].default_goal, DragGoal::Minimise);
+        assert_eq!(r5[0].point_index, 1, "beta=0 should be kept");
+
+        // Fewer than 3 positive-CL points must NOT pick a negative-CL point as Fast glide
+        let mixed = PlanePolar {
+            name: "T2".into(),
+            plane: "P".into(),
+            def: Some(PlanePolarDef { kind: PolarKind::FixedLift, method: Method::Vlm2, ..Default::default() }),
+            points: vec![
+                make_pt(-4.0, 15.0, 0.0, -0.25, 0.018, -0.22, 0.5),
+                make_pt(2.0, 11.0, 0.0, 0.35, 0.015, 0.38, 0.5),
+                make_pt(6.0, 7.5, 0.0, 0.75, 0.028, 0.80, 0.5),
+            ],
+            ..Default::default()
+        };
+        let rm = mixed.pick_flight_regimes(0, 0.5);
+        assert_eq!(rm.len(), 2);
+        assert!(rm.iter().all(|p| p.cl > 0.0));
+
+        // Offset one-sided fin: span_frac stays in [0, 1] and Wing::foil_at blends cleanly
+        let fin = Wing {
+            name: "Fin".into(),
+            kind: WingKind::Fin,
+            two_sided: false,
+            symmetric: true,
+            close_inner: false,
+            position: Vec3::ZERO,
+            rx: 90.0,
+            ry: 0.0,
+            mass: 0.0,
+            point_masses: vec![],
+            sections: vec![
+                WingSection::new(0.20, 0.22, 0.0, "Root"),
+                WingSection::new(0.60, 0.14, 0.0, "Tip"),
+            ],
+        };
+        let (fa, fb, ft) = fin.foil_at(0.30).expect("fin foil_at");
+        assert_eq!((fa, fb), ("Root", "Tip"));
+        assert!((ft - 0.25).abs() < 1e-12, "blend t = {ft}");
+        assert_eq!(fin.dominant_foil_at(0.30), Some("Root"));
+        assert_eq!(fin.dominant_foil_at(0.50), Some("Tip"));
+        let mut pl = Plane::default_plane("NACA 2412", "NACA 0009");
+        pl.wings.push(fin);
+        let fin_idx = pl.wings.len() - 1;
+        let fin_polar = PlanePolar {
+            name: "Fin".into(),
+            plane: pl.name.clone(),
+            points: vec![
+                PlaneOpp { alpha: 0.0, velocity: 12.0, cl: 0.3, cd: 0.02, strips: vec![], ..Default::default() },
+                PlaneOpp {
+                    alpha: 2.0,
+                    velocity: 12.0,
+                    cl: 0.5,
+                    cd: 0.02,
+                    strips: vec![
+                        StripResult { wing: fin_idx, span_pos: 0.25, chord: 0.21, cl: 0.1, re: 1.5e5, ..Default::default() },
+                        StripResult { wing: fin_idx, span_pos: 0.55, chord: 0.15, cl: 0.1, re: 1.1e5, ..Default::default() },
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(fin_polar.strip_wings(), vec![fin_idx]);
+        let fsts = fin_polar.wing_stations(Some(&pl), fin_idx);
+        assert_eq!(fsts.len(), 2);
+        assert!((fsts[0].span_frac - 0.125).abs() < 1e-6, "got {}", fsts[0].span_frac);
+        assert!((fsts[1].span_frac - 0.875).abs() < 1e-6, "got {}", fsts[1].span_frac);
+    }
 }

@@ -274,14 +274,22 @@ impl AutoPlan {
 type FamilyParams = AnalysisSettings;
 
 /// The settings for the family the plan fills for a foil, and that family
-/// if it exists already.  The selection's values (defaults where it leaves
-/// them open) when it matches nothing yet.
-fn family_params(db: &FoilDb, foil: &str, def: &PlanePolarDef) -> Result<(FamilyParams, Option<FamilyId>), String> {
+/// if it exists already.  The selection's values (falling back to `fallback`,
+/// then `AnalysisSettings::default()`, where `sel` leaves them open) when it
+/// matches nothing yet.
+fn family_params(db: &FoilDb, foil: &str, def: &PlanePolarDef, fallback: Option<&AnalysisSettings>) -> Result<(FamilyParams, Option<FamilyId>), String> {
     let sel = &def.family;
-    let d = AnalysisSettings::default();
+    let d = fallback.cloned().unwrap_or_default();
     let hits = db.families_of(foil).into_iter().filter(|&i| db.family(i).key.flap_deg == 0.0 && sel.matches(&db.family(i).key)).count();
     if hits == 0 {
-        let fresh = AnalysisSettings { mach: sel.mach.unwrap_or(d.mach), ncrit: sel.ncrit.unwrap_or(d.ncrit), ncrit_bot: sel.ncrit_bot, xtr_top: sel.xtr_top.unwrap_or(d.xtr_top), xtr_bot: sel.xtr_bot.unwrap_or(d.xtr_bot), ..d };
+        let fresh = AnalysisSettings {
+            mach: sel.mach.unwrap_or(d.mach),
+            ncrit: sel.ncrit.unwrap_or(d.ncrit),
+            ncrit_bot: sel.ncrit_bot.or(d.ncrit_bot),
+            xtr_top: sel.xtr_top.unwrap_or(d.xtr_top),
+            xtr_bot: sel.xtr_bot.unwrap_or(d.xtr_bot),
+            ..d
+        };
         return Ok((fresh, None));
     }
     let id = db.resolve(foil, sel)?.expect("a matching family exists");
@@ -303,6 +311,20 @@ fn missing(want: &[f64], have: &[f64]) -> Vec<f64> {
 /// Mach / Ncrit / trips, and the same for every flap angle its deflected
 /// strips use; stations and angles already covered are left out.
 pub fn plan(plane: &Plane, foils: &[Foil], db: &FoilDb, def: &PlanePolarDef, count: usize) -> Result<AutoPlan, String> {
+    plan_with_defaults(plane, foils, db, def, count, &HashMap::new())
+}
+
+/// Like [`plan`], using per-foil fallback [`AnalysisSettings`] (e.g. from a
+/// baseline foil's resolved polar family) for foils that have no matching
+/// 2D polar family yet.
+pub fn plan_with_defaults(
+    plane: &Plane,
+    foils: &[Foil],
+    db: &FoilDb,
+    def: &PlanePolarDef,
+    count: usize,
+    foil_defaults: &HashMap<String, AnalysisSettings>,
+) -> Result<AutoPlan, String> {
     if !(def.viscous || def.method == Method::Llt) || count == 0 {
         return Ok(AutoPlan::default());
     }
@@ -322,7 +344,7 @@ pub fn plan(plane: &Plane, foils: &[Foil], db: &FoilDb, def: &PlanePolarDef, cou
     };
     for c in &cov.foils {
         let Some(foil) = foils.iter().find(|f| f.name == c.foil) else { continue };
-        let (params, base) = family_params(db, &c.foil, def)?;
+        let (params, base) = family_params(db, &c.foil, def, foil_defaults.get(&c.foil))?;
         let lo = c.re.0.max(1e4);
         let want = re_list_geometric(lo, c.re.1.max(lo * 1.2), count.max(2));
         let have = |id: Option<FamilyId>| id.map(|i| db.family(i).polars.iter().map(|p| p.re).collect::<Vec<f64>>()).unwrap_or_default();

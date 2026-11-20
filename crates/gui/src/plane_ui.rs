@@ -32,6 +32,10 @@ pub struct PlaneUi {
     pub sel_point: usize,
     pub plots: [(usize, usize); 4],
     pub span_var: usize,
+    /// Selected wing index (strip wing index) in the span station inspector.
+    pub sel_station_wing: usize,
+    /// Selected span position (m) for "Optimise this wing section".
+    pub sel_station_y: Option<f64>,
     pub cam: Camera,
     view_cache: Option<MeshCache>,
     mesh_key: Option<CachedMeshKey>,
@@ -69,6 +73,8 @@ impl Default for PlaneUi {
             sel_point: 0,
             plots: [(0, 4), (5, 4), (0, 9), (0, 13)],
             span_var: 0,
+            sel_station_wing: 0,
+            sel_station_y: None,
             cam: Camera::default(),
             view_cache: None,
             mesh_key: None,
@@ -525,11 +531,14 @@ impl App {
             target.follow_plane_edit(before, &edited);
         }
         for pending in &mut self.pending {
-            if let Pending::CadImport { plane } = &mut pending.action {
-                if plane == old_name {
-                    plane.clone_from(&edited.name);
-                }
+            match &mut pending.action {
+                Pending::CadImport { plane } if plane == old_name => plane.clone_from(&edited.name),
+                Pending::Optimise { meta, .. } if edited.name != *old_name => meta.follow_plane_rename(old_name, &edited.name),
+                _ => {}
             }
+        }
+        if edited.name != *old_name {
+            self.fui.follow_plane_rename(old_name, &edited.name);
         }
         self.project.planes[self.sel_plane] = edited;
     }
@@ -1054,8 +1063,16 @@ impl App {
         self.run_3d(plane)
     }
 
-    fn run_3d(&mut self, plane: &Plane) {
-        let mut def = self.pui.def.clone();
+    /// Run a 3D analysis with an explicit definition, auto-polar count and
+    /// per-foil default 2D polar settings (without overwriting `self.pui.def`
+    /// or `self.pui.auto_polars`).
+    pub(crate) fn run_3d_with_def(
+        &mut self,
+        plane: &Plane,
+        mut def: PlanePolarDef,
+        auto_polars: usize,
+        foil_defaults: &HashMap<String, foiley_foil::AnalysisSettings>,
+    ) {
         if def.name.is_empty() {
             def.name = def.auto_name();
         }
@@ -1070,8 +1087,8 @@ impl App {
             return;
         }
         let title = format!("{} - {}", plane.name, def.name);
-        if (def.viscous || def.method == Method::Llt) && self.pui.auto_polars > 0 {
-            match auto::plan(plane, &self.project.foils, &db, &def, self.pui.auto_polars) {
+        if (def.viscous || def.method == Method::Llt) && auto_polars > 0 {
+            match auto::plan_with_defaults(plane, &self.project.foils, &db, &def, auto_polars, foil_defaults) {
                 Ok(plan) if !plan.is_empty() => {
                     self.notify(format!("computing {} first", plan.describe()), false);
                     self.submit(format!("2D polars for {}", plane.name), JobKind::AutoPolars { batches: plan.batches }, Pending::AutoPolarsThen(Box::new((plane.clone(), def, PolarTarget::new(plane)))));
@@ -1085,6 +1102,12 @@ impl App {
             }
         }
         self.submit(title, JobKind::PlanePolar { plane: plane.clone(), db: (*db).clone(), def }, Pending::PlanePolar(PolarTarget::new(plane)));
+    }
+
+    fn run_3d(&mut self, plane: &Plane) {
+        let def = self.pui.def.clone();
+        let auto_polars = self.pui.auto_polars;
+        self.run_3d_with_def(plane, def, auto_polars, &HashMap::new());
     }
 
     fn analysis_preview(&mut self, selected: Option<usize>) -> AnalysisPreview {
@@ -1276,14 +1299,83 @@ impl App {
         let preview = self.pui.show_3d.then(|| self.analysis_preview(selected));
         ui.separator();
         let rest = ui.available_height();
+        let left_w = if self.pui.show_3d { (w * 0.45).max(200.0) } else { w };
+        let mut open_optim: Option<((String, String), usize, f64)> = None;
         ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(if self.pui.show_3d { w * 0.45 } else { w });
+            ui.allocate_ui_with_layout(egui::vec2(left_w, rest), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                ui.set_max_width(left_w);
                 ui.horizontal(|ui| {
                     ui.label("span distribution:");
                     widgets::pick(ui, "spanvar", &mut self.pui.span_var, &SPANVARS);
                 });
-                Plot::new("span").height(rest - 30.0).legend(Legend::default()).x_axis_label("span position (m)").show(ui, |pu| {
+                // Wing station picker & "Optimise this wing section" shortcut
+                let mut active_station_y: Option<f64> = None;
+                if let Some(p) = selected.map(|i| &self.project.plane_polars[i]) {
+                    let wings = p.strip_wings();
+                    if !wings.is_empty() {
+                        if !wings.contains(&self.pui.sel_station_wing) {
+                            self.pui.sel_station_wing = wings[0];
+                            self.pui.sel_station_y = None;
+                        }
+                        let st_wing = self.pui.sel_station_wing;
+                        let polar_plane = self.project.planes.iter().find(|pl| pl.name == p.plane);
+                        let stations = p.wing_stations(polar_plane, st_wing);
+                        if !stations.is_empty() {
+                            // Default to a starboard mid-span station (~45% semi-span)
+                            let sel_idx = match self.pui.sel_station_y {
+                                Some(y) => stations.iter().enumerate().min_by(|a, b| (a.1.span_pos - y).abs().total_cmp(&(b.1.span_pos - y).abs())).map(|(i, _)| i).unwrap_or(0),
+                                None => {
+                                    let idx = stations
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, s)| s.span_pos >= 0.0)
+                                        .min_by(|a, b| (a.1.span_frac - 0.45).abs().total_cmp(&(b.1.span_frac - 0.45).abs()))
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(stations.len() / 2);
+                                    self.pui.sel_station_y = Some(stations[idx].span_pos);
+                                    idx
+                                }
+                            };
+                            let st = &stations[sel_idx];
+                            active_station_y = Some(st.span_pos);
+                            ui.horizontal_wrapped(|ui| {
+                                if wings.len() > 1 {
+                                    egui::ComboBox::from_id_salt("stwing").width(86.0).selected_text(&st.wing_name).show_ui(ui, |ui| {
+                                        for &wi in &wings {
+                                            let wname = p.wing_name_for_strip(polar_plane, wi);
+                                            if ui.selectable_value(&mut self.pui.sel_station_wing, wi, wname).changed() {
+                                                self.pui.sel_station_y = None;
+                                            }
+                                        }
+                                    });
+                                }
+                                let st_label = format!("y {:.3} m ({:.0}%)", st.span_pos, st.span_frac * 100.0);
+                                egui::ComboBox::from_id_salt("stpos").width(120.0).selected_text(st_label).show_ui(ui, |ui| {
+                                    for s in &stations {
+                                        let txt = format!("y {:+.3} m ({:.0}%, c {:.3} m)", s.span_pos, s.span_frac * 100.0, s.chord);
+                                        if ui.selectable_label((s.span_pos - st.span_pos).abs() < 1e-6, txt).clicked() {
+                                            self.pui.sel_station_y = Some(s.span_pos);
+                                        }
+                                    }
+                                });
+                                if let Some(sr) = p.strip_at(self.pui.sel_point, st_wing, st.span_pos) {
+                                    let foil_txt = st.foil.as_deref().unwrap_or("");
+                                    ui.label(RichText::new(format!("Cl {:.3}  Re {:.0}k  {foil_txt}", sr.cl, sr.re / 1e3)).small());
+                                }
+                                if ui
+                                    .button(RichText::new("Optimise this wing section").strong())
+                                    .on_hover_text("Load slow flight, cruise and fast glide from this wing station into the 2D airfoil optimiser (or click the span plot to pick a station)")
+                                    .clicked()
+                                {
+                                    open_optim = Some(((p.plane.clone(), p.name.clone()), st_wing, st.span_pos));
+                                }
+                            });
+                        }
+                    }
+                }
+                let mut clicked_span_y: Option<f64> = None;
+                let plot_h = ui.available_height().max(80.0);
+                Plot::new("span").height(plot_h).legend(Legend::default()).x_axis_label("span position (m)").show(ui, |pu| {
                     if let Some(p) = selected.map(|i| &self.project.plane_polars[i]) {
                         if let Some(o) = p.points.get(self.pui.sel_point) {
                             let mac = p.ref_dims.2.max(1e-9);
@@ -1310,13 +1402,29 @@ impl App {
                                         [s.span_pos, v]
                                     })
                                     .collect();
-                                let name = plane.wings.get(wi).map(|w| w.name.clone()).unwrap_or_else(|| format!("wing {wi}"));
+                                if pts.is_empty() {
+                                    continue;
+                                }
+                                let name = p.wing_name_for_strip(Some(plane), wi);
                                 pu.line(Line::new(name.clone(), PlotPoints::from(pts.clone())).color(series_color(wi)));
                                 pu.points(Points::new(name, PlotPoints::from(pts)).radius(1.5_f32).color(series_color(wi)));
+                            }
+                            if let Some(sy) = active_station_y {
+                                pu.vline(egui_plot::VLine::new("selected station", sy).color(Color32::from_rgb(255, 200, 60)).style(egui_plot::LineStyle::dashed_dense()));
+                            }
+                            if pu.response().clicked() {
+                                if let Some(c) = pu.pointer_coordinate() {
+                                    clicked_span_y = Some(c.x);
+                                }
                             }
                         }
                     }
                 });
+                if let (Some(cx), Some(p)) = (clicked_span_y, selected.map(|i| &self.project.plane_polars[i])) {
+                    if let Some(sr) = p.strip_at(self.pui.sel_point, self.pui.sel_station_wing, cx) {
+                        self.pui.sel_station_y = Some(sr.span_pos);
+                    }
+                }
             });
             if let Some(preview) = preview.as_ref() {
                 ui.vertical(|ui| {
@@ -1328,6 +1436,9 @@ impl App {
                 });
             }
         });
+        if let Some((polar_key, wing, span_pos)) = open_optim {
+            self.open_section_optimiser(polar_key, wing, span_pos);
+        }
     }
 
     pub fn stability(&mut self, ui: &mut egui::Ui) {

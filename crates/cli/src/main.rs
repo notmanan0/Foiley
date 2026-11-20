@@ -326,12 +326,27 @@ enum FoilCmd {
         src: FoilSrc,
         #[command(flatten)]
         x: XfoilOpts,
-        /// design angle of attack, degrees
+        /// design angle of attack, degrees (single-point mode)
         #[arg(long, default_value_t = 2.0, allow_hyphen_values = true)]
         alpha: f64,
-        /// objectives "cl/cd:max,cd:min,cl:0.6[:tol],cm:0,cpmin:max"
+        /// objectives "cl/cd:max,cd:min,cl:0.6[:tol],cm:0,cpmin:max" (single-point mode)
         #[arg(long, default_value = "cl/cd:max")]
         objectives: String,
+        /// multi-point operating row "[label:]Re:CL[:min|max-orig|<=CD|=CD[:weight]]" (repeatable)
+        #[arg(long = "op", allow_hyphen_values = true)]
+        op: Vec<String>,
+        /// populate slow/cruise/fast operating points from a 3D polar in --project (name, "Plane/Polar", or "auto" = latest polar with strips)
+        #[arg(long)]
+        from_3d_polar: Option<String>,
+        /// wing index in the plane (0 = first wing, usually main wing) for --from-3d-polar
+        #[arg(long, default_value_t = 0)]
+        wing: usize,
+        /// span station for --from-3d-polar: metres (e.g. "0.72") or semi-span percent (e.g. "45%")
+        #[arg(long, allow_hyphen_values = true)]
+        station: Option<String>,
+        /// minimum thickness at spar "x/c,min_tc" (e.g. "0.30,0.115" or "0.30,11.5%")
+        #[arg(long)]
+        spar: Option<String>,
         /// mopso or ga
         #[arg(long, default_value = "mopso")]
         algorithm: String,
@@ -359,6 +374,12 @@ enum FoilCmd {
         flap: Option<String>,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// custom name for the optimised foil
+        #[arg(long)]
+        name: Option<String>,
+        /// add the optimised foil to this project file (created if missing)
+        #[arg(long)]
+        save: Option<PathBuf>,
         /// output .dat of the best design
         #[arg(short, long)]
         out: Option<PathBuf>,
@@ -676,10 +697,37 @@ fn guard_paths(outputs: &[&Option<PathBuf>], inputs: &[&Option<PathBuf>]) -> Res
     Ok(())
 }
 
-/// Write a file through a temporary sibling and a rename, after checking
-/// again that it is none of `protected`: a link or junction created while
-/// the command ran, or a hard link, cannot redirect it onto an input.
+/// Preflight an output file destination before starting a long computation:
+/// check device permissions, reject directories, and ensure the parent exists.
+fn preflight_output(path: &Path, allow_device: bool) -> Result<(), String> {
+    if is_device(path) {
+        return if allow_device {
+            Ok(())
+        } else {
+            Err(format!("{}: cannot write a project file to a device", path.display()))
+        };
+    }
+    if path.file_name().is_none() {
+        return Err(format!("{}: not a file name", path.display()));
+    }
+    if path.is_dir() {
+        return Err(format!("{}: is a directory", path.display()));
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(format!("{}: parent directory '{}' does not exist", path.display(), parent.display()));
+    }
+    Ok(())
+}
+
+/// Write a file through an exclusively created temporary sibling and a rename,
+/// after checking again that it is none of `protected`: a link or junction
+/// created while the command ran, or a hard link, cannot redirect it onto an input.
 fn publish(path: &Path, bytes: &[u8], protected: &[&Option<PathBuf>]) -> Result<(), String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     // a device or pipe (NUL, /dev/null, /dev/stdout) holds no file to
     // overwrite and cannot be replaced by a rename: write to it directly
     if is_device(path) {
@@ -690,9 +738,24 @@ fn publish(path: &Path, bytes: &[u8], protected: &[&Option<PathBuf>]) -> Result<
             return Err(format!("the output {} is the input file {}: it would be overwritten", path.display(), p.display()));
         }
     }
-    let name = path.file_name().ok_or_else(|| format!("{}: not a file name", path.display()))?;
-    let tmp = path.with_file_name(format!(".{}.{}.tmp", name.to_string_lossy(), std::process::id()));
-    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let name = path.file_name().ok_or_else(|| format!("{}: not a file name", path.display()))?.to_string_lossy();
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let pid = std::process::id();
+    let (mut file, tmp) = loop {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".{name}.{pid}.{seq}.tmp"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+            Ok(f) => break (f, candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", candidate.display())),
+        }
+    };
+    if let Err(e) = file.write_all(bytes).and_then(|_| file.flush()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", tmp.display()));
+    }
+    drop(file);
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {e}", path.display())
@@ -1378,15 +1441,34 @@ fn real_main() -> Result<(), String> {
                     }
                 }
             }
-            FoilCmd::Optimize { src, x, alpha, objectives, algorithm, population, iterations, shape, bumps, amplitude, cst_order, cst_delta, flap, seed, out, pareto } => {
-                guard_paths(&[&out, &pareto], &[&src.project, &src.foil_file()])?;
+            FoilCmd::Optimize { src, x, alpha, objectives, op, from_3d_polar, wing, station, spar, algorithm, population, iterations, shape, bumps, amplitude, cst_order, cst_delta, flap, seed, name, save, out, pareto } => {
+                // --save may update --project in place, but may never overwrite
+                // a foil input file or collide with --out / --pareto.
+                guard_paths(&[&out, &pareto], &[&src.project, &src.foil_file(), &save])?;
+                guard_paths(&[&save], &[&src.foil_file()])?;
+                if let Some(p) = &out {
+                    preflight_output(p, true)?;
+                }
+                if let Some(p) = &pareto {
+                    preflight_output(p, true)?;
+                }
+                if let Some(p) = &save {
+                    preflight_output(p, false)?;
+                }
                 use foiley_foil::optim::{Algorithm, Goal, Objective, ObjectiveSpec, OptimSettings, Parameterization};
                 let proj = load_project(&src.project)?;
+                // Pre-load an existing separate --save project up front so a corrupt
+                // or unreadable target fails before running XFoil.
+                let mut preloaded_save = match &save {
+                    Some(p) if p.exists() && src.project.as_ref().is_none_or(|pr| !same_file(p, pr)) => Some(Project::load(p)?),
+                    _ => None,
+                };
                 let foil = resolve_foil(&src.foil, &proj)?;
                 let mut st = OptimSettings {
                     algorithm: match algorithm.to_lowercase().as_str() {
                         "ga" | "genetic" => Algorithm::Genetic,
-                        _ => Algorithm::Mopso,
+                        "mopso" | "pso" => Algorithm::Mopso,
+                        o => return Err(format!("--algorithm must be mopso or ga, not '{o}'")),
                     },
                     analysis: x.settings()?,
                     alpha,
@@ -1404,6 +1486,27 @@ fn real_main() -> Result<(), String> {
                     seed,
                     ..OptimSettings::default()
                 };
+                if let Some(sp_str) = spar {
+                    st.spar = Some(parse_spar(&sp_str)?);
+                }
+                if let Some(pol_spec) = from_3d_polar {
+                    let polar = select_3d_polar(&proj, Some(&pol_spec))?;
+                    let (chosen, regimes) = extract_3d_station_regimes(&proj, polar, wing, station.as_deref())?;
+                    eprintln!(
+                        "  3D station: {} / {} {} y = {:.3} m ({:.0}% span, c = {:.3} m, foil {})",
+                        polar.plane,
+                        polar.name,
+                        chosen.wing_name,
+                        chosen.span_pos,
+                        chosen.span_frac * 100.0,
+                        chosen.chord,
+                        chosen.foil.as_deref().unwrap_or("-")
+                    );
+                    st.operating_points = regimes.iter().map(|sp| sp.to_default_operating_point()).collect();
+                }
+                for spec in &op {
+                    st.operating_points.push(parse_op_point(spec)?);
+                }
                 if let Some(f) = flap {
                     let v = parse_list(&f)?;
                     if v.len() != 2 {
@@ -1411,44 +1514,88 @@ fn real_main() -> Result<(), String> {
                     }
                     st.flap = Some((v[0], v[1]));
                 }
-                st.objectives = objectives
-                    .split(',')
-                    .filter(|t| !t.trim().is_empty())
-                    .map(|t| {
-                        let parts: Vec<&str> = t.trim().split(':').collect();
-                        let obj = match parts[0].to_lowercase().as_str() {
-                            "cl" => Objective::Cl,
-                            "cd" => Objective::Cd,
-                            "cl/cd" | "ld" => Objective::ClCd,
-                            "cpmin" => Objective::Cpmin,
-                            "cm" => Objective::Cm,
-                            o => return Err(format!("unknown objective '{o}'")),
-                        };
-                        let goal = match parts.get(1).map(|s| s.to_lowercase()) {
-                            None => Goal::Maximise,
-                            Some(g) if g == "max" => Goal::Maximise,
-                            Some(g) if g == "min" => Goal::Minimise,
-                            Some(g) => Goal::Target { value: g.parse().map_err(|_| format!("bad target '{g}'"))?, tolerance: parts.get(2).and_then(|t| t.parse().ok()).unwrap_or(1e-3) },
-                        };
-                        Ok(ObjectiveSpec { objective: obj, enabled: true, goal })
-                    })
-                    .collect::<Result<_, String>>()?;
+                if !st.is_multipoint() {
+                    st.objectives = objectives
+                        .split(',')
+                        .filter(|t| !t.trim().is_empty())
+                        .map(|t| {
+                            let parts: Vec<&str> = t.trim().split(':').collect();
+                            let obj = match parts[0].to_lowercase().as_str() {
+                                "cl" => Objective::Cl,
+                                "cd" => Objective::Cd,
+                                "cl/cd" | "ld" => Objective::ClCd,
+                                "cpmin" => Objective::Cpmin,
+                                "cm" => Objective::Cm,
+                                o => return Err(format!("unknown objective '{o}'")),
+                            };
+                            let goal = match parts.get(1).map(|s| s.to_lowercase()) {
+                                None => Goal::Maximise,
+                                Some(g) if g == "max" => Goal::Maximise,
+                                Some(g) if g == "min" => Goal::Minimise,
+                                Some(g) => Goal::Target { value: g.parse().map_err(|_| format!("bad target '{g}'"))?, tolerance: parts.get(2).and_then(|t| t.parse().ok()).unwrap_or(1e-3) },
+                            };
+                            Ok(ObjectiveSpec { objective: obj, enabled: true, goal })
+                        })
+                        .collect::<Result<_, String>>()?;
+                }
+                // Validate settings cleanly before spawning the solver so errors
+                // do not carry an "invalid airfoil geometry:" wrapper.
+                st.validate()?;
+                st.analysis.validate()?;
+                let spar_opt = st.spar;
                 if let JobOutput::Optimise(r) = run_job(&mut mgr, &mut ui, &format!("optimise {}", foil.name), JobKind::Optimise { foil: foil.clone(), settings: st })? {
-                    let best = r.best.as_ref().ok_or("no feasible design found")?;
-                    println!("# {} evaluations, {} Pareto designs", r.evaluations, r.pareto.len());
-                    println!("# base:  see `foiley foil point`; best: CL {:.4} CD {:.5} CL/CD {:.2} Cm {:.4} Cpmin {:.3}", best.cl, best.cd, best.cl / best.cd.max(1e-12), best.cm, best.cpmin);
-                    if let Some(p) = pareto {
-                        let mut s = String::from("index,CL,CD,CL/CD,Cm,Cpmin\n");
-                        for (i, c) in r.pareto.iter().enumerate() {
-                            s.push_str(&format!("{i},{:.5},{:.6},{:.3},{:.5},{:.4}\n", c.cl, c.cd, c.cl / c.cd.max(1e-12), c.cm, c.cpmin));
-                        }
-                        publish(&p, s.as_bytes(), &[&src.project, &src.foil_file(), &out])?;
+                    let best = r.best.as_ref().filter(|c| c.constraints_met()).ok_or("no feasible design satisfied all constraints")?;
+                    if !best.op_points.is_empty() {
+                        print_multipoint_summary(&r, spar_opt);
+                    } else {
+                        println!("# {} evaluations, {} Pareto designs", r.evaluations, r.pareto.len());
+                        println!("# base:  see `foiley foil point`; best: CL {:.4} CD {:.5} CL/CD {:.2} Cm {:.4} Cpmin {:.3}", best.cl, best.cd, best.cl / best.cd.max(1e-12), best.cm, best.cpmin);
                     }
                     let mut f = best.foil.clone();
-                    f.name = format!("{} opt", foil.name);
-                    match &out {
-                        Some(o) => publish(o, f.to_dat().as_bytes(), &[&src.project, &src.foil_file()])?,
-                        None => print!("{}", f.to_dat()),
+                    f.name = name.unwrap_or_else(|| format!("{} opt", foil.name));
+                    if let Some(p) = &pareto {
+                        let s = if !best.op_points.is_empty() {
+                            let mut h = String::from("index,violation,spar_tc");
+                            for (k, ev) in best.op_points.iter().enumerate() {
+                                h.push(',');
+                                h.push_str(&csv_escape(&format!("cd_{k}_{}", ev.label)));
+                            }
+                            h.push('\n');
+                            for (i, c) in r.pareto.iter().enumerate() {
+                                h.push_str(&format!("{i},{:.6},{}", c.violation, c.spar_thickness.map(|t| format!("{t:.5}")).unwrap_or_default()));
+                                for ev in &c.op_points {
+                                    h.push_str(&format!(",{:.6}", ev.cd));
+                                }
+                                h.push('\n');
+                            }
+                            h
+                        } else {
+                            let mut s = String::from("index,CL,CD,CL/CD,Cm,Cpmin\n");
+                            for (i, c) in r.pareto.iter().enumerate() {
+                                s.push_str(&format!("{i},{:.5},{:.6},{:.3},{:.5},{:.4}\n", c.cl, c.cd, c.cl / c.cd.max(1e-12), c.cm, c.cpmin));
+                            }
+                            s
+                        };
+                        publish(p, s.as_bytes(), &[&src.project, &src.foil_file(), &out, &save])?;
+                    }
+                    if let Some(o) = &out {
+                        publish(o, f.to_dat().as_bytes(), &[&src.project, &src.foil_file(), &save, &pareto])?;
+                    }
+                    if let Some(path) = &save {
+                        let mut save_proj = match preloaded_save.take() {
+                            Some(p) => p,
+                            None if src.project.as_ref().is_some_and(|pr| same_file(path, pr)) => proj,
+                            None => Project::new("cli"),
+                        };
+                        let mut g = f.clone();
+                        g.name = save_proj.unique_foil_name(&g.name);
+                        let saved_name = g.name.clone();
+                        save_proj.foils.push(g);
+                        save_proj.save(path)?;
+                        eprintln!("  saved foil '{saved_name}' to {}", path.display());
+                    }
+                    if out.is_none() {
+                        print!("{}", f.to_dat());
                     }
                 }
             }
@@ -1881,11 +2028,25 @@ enum Step {
         #[serde(default = "six")]
         auto_polars: usize,
     },
-    /// optimise a foil; the best design is added to the project as "<foil> opt"
+    /// optimise a foil; the best design is added to the project as `name` or "<foil> opt"
     Optimize {
         foil: String,
         #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        from_3d: Option<From3dSpec>,
+        #[serde(default)]
         settings: foiley_foil::optim::OptimSettings,
+    },
+    /// copy a plane under a new name, optionally replacing a wing foil
+    CopyPlane {
+        #[serde(default)]
+        plane: Option<String>,
+        name: String,
+        #[serde(default)]
+        wing: Option<usize>,
+        #[serde(default)]
+        replace_foil: Option<(String, String)>,
     },
     /// replace a plane's fuselage with an STL / STEP surface
     ImportFuselage {
@@ -1896,6 +2057,202 @@ enum Step {
         #[serde(default)]
         scale: Option<f64>,
     },
+}
+
+#[derive(serde::Deserialize)]
+struct From3dSpec {
+    #[serde(default)]
+    polar: Option<String>,
+    #[serde(default)]
+    wing: usize,
+    #[serde(default)]
+    station_y: Option<f64>,
+    #[serde(default)]
+    station_frac: Option<f64>,
+}
+
+/// Escape a single CSV field per RFC 4180 (normalising newlines).
+fn csv_escape(s: &str) -> String {
+    let clean = s.replace(['\r', '\n'], " ");
+    if clean.contains([',', '"']) {
+        format!("\"{}\"", clean.replace('"', "\"\""))
+    } else {
+        clean
+    }
+}
+
+/// Parse `--spar "x/c,min_tc"` (fraction or `%`).
+fn parse_spar(spec: &str) -> Result<foiley_foil::optim::SparConstraint, String> {
+    let parts: Vec<&str> = spec.split([',', ':']).map(|t| t.trim()).collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err("--spar needs x/c,min_tc (e.g. 0.30,0.115 or 0.30,11.5%)".into());
+    }
+    let sx: f64 = parts[0].parse().map_err(|_| format!("bad spar x/c '{}'", parts[0]))?;
+    let mt: f64 = if let Some(pct) = parts[1].strip_suffix('%') {
+        pct.trim().parse::<f64>().map_err(|_| format!("bad spar thickness '{}'", parts[1]))? / 100.0
+    } else {
+        parts[1].parse().map_err(|_| format!("bad spar thickness '{}'", parts[1]))?
+    };
+    if !sx.is_finite() || !mt.is_finite() {
+        return Err("--spar values must be finite".into());
+    }
+    Ok(foiley_foil::optim::SparConstraint { x: sx, min_thickness: mt })
+}
+
+/// Resolve a 3D polar with strip results from `proj`.
+/// `None` or `Some("auto")` selects the latest polar with strips; an explicit
+/// name (`"Polar"` or `"Plane/Polar"`) must match uniquely.
+fn select_3d_polar<'a>(proj: &'a Project, spec: Option<&str>) -> Result<&'a PlanePolar, String> {
+    let with_strips: Vec<&PlanePolar> = proj.plane_polars.iter().filter(|p| p.points.iter().any(|o| !o.strips.is_empty())).collect();
+    if with_strips.is_empty() {
+        return Err("no 3D polar with strip results in project".into());
+    }
+    match spec {
+        None => Ok(*with_strips.last().unwrap()),
+        Some(s) if s.eq_ignore_ascii_case("auto") => Ok(*with_strips.last().unwrap()),
+        Some(s) => {
+            let hits: Vec<&PlanePolar> = with_strips
+                .into_iter()
+                .filter(|p| p.name == s || format!("{}/{}", p.plane, p.name) == s)
+                .collect();
+            match hits.len() {
+                1 => Ok(hits[0]),
+                0 => Err(format!("no 3D polar matching '{s}' with strip results in project")),
+                n => {
+                    let names: Vec<String> = hits.iter().map(|p| format!("{}/{}", p.plane, p.name)).collect();
+                    Err(format!("{n} 3D polars match '{s}' ({}); disambiguate with 'Plane/Polar'", names.join(", ")))
+                }
+            }
+        }
+    }
+}
+
+/// Pick a wing station on `polar` and extract representative flight regimes.
+fn extract_3d_station_regimes(
+    proj: &Project,
+    polar: &PlanePolar,
+    wing: usize,
+    station: Option<&str>,
+) -> Result<(foiley_plane::WingStation, Vec<foiley_plane::StationPoint>), String> {
+    let plane = proj.planes.iter().find(|pl| pl.name == polar.plane);
+    let stations = polar.wing_stations(plane, wing);
+    if stations.is_empty() {
+        return Err(format!("polar '{}' has no stations on wing {wing}", polar.name));
+    }
+    let chosen = match station {
+        Some(st_str) if st_str.trim().ends_with('%') => {
+            let pct: f64 = st_str
+                .trim()
+                .trim_end_matches('%')
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad --station '{st_str}'"))?;
+            if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+                return Err(format!("--station '{st_str}' percentage must be between 0% and 100%"));
+            }
+            let frac = pct / 100.0;
+            stations
+                .iter()
+                .filter(|s| s.span_pos >= 0.0)
+                .min_by(|a, b| (a.span_frac - frac).abs().total_cmp(&(b.span_frac - frac).abs()))
+                .unwrap_or(&stations[stations.len() / 2])
+        }
+        Some(st_str) => {
+            let y: f64 = st_str.trim().parse().map_err(|_| format!("bad --station '{st_str}'"))?;
+            if !y.is_finite() {
+                return Err(format!("--station '{st_str}' must be a finite span position"));
+            }
+            stations.iter().min_by(|a, b| (a.span_pos - y).abs().total_cmp(&(b.span_pos - y).abs())).unwrap()
+        }
+        None => stations
+            .iter()
+            .filter(|s| s.span_pos >= 0.0)
+            .min_by(|a, b| (a.span_frac - 0.45).abs().total_cmp(&(b.span_frac - 0.45).abs()))
+            .unwrap_or(&stations[stations.len() / 2]),
+    }
+    .clone();
+    let regimes = polar.pick_flight_regimes(wing, chosen.span_pos);
+    if regimes.is_empty() {
+        return Err(format!("could not extract valid operating points from 3D polar '{}' at y = {:.3} m", polar.name, chosen.span_pos));
+    }
+    Ok((chosen, regimes))
+}
+
+/// Parse `--op "[label:]Re:CL[:goal[:weight]]"`.
+fn parse_op_point(spec: &str) -> Result<foiley_foil::optim::OperatingPoint, String> {
+    use foiley_foil::optim::{DragGoal, OperatingPoint};
+    let parts: Vec<&str> = spec.split(':').map(|t| t.trim()).collect();
+    if parts.len() < 2 {
+        return Err(format!("--op '{spec}' needs [label:]Re:CL[:min|max-orig|<=CD|=CD[:weight]]"));
+    }
+    let (label, rest) = if parts[0].parse::<f64>().is_ok() {
+        (String::new(), &parts[..])
+    } else {
+        (parts[0].to_string(), &parts[1..])
+    };
+    if rest.len() < 2 || rest.len() > 4 {
+        return Err(format!("--op '{spec}' needs [label:]Re:CL[:min|max-orig|<=CD|=CD[:weight]] (got {} trailing fields)", rest.len()));
+    }
+    let re: f64 = rest[0].parse().map_err(|_| format!("bad Reynolds number '{}' in --op '{spec}'", rest[0]))?;
+    let cl: f64 = rest[1].parse().map_err(|_| format!("bad target CL '{}' in --op '{spec}'", rest[1]))?;
+    if !re.is_finite() || !cl.is_finite() {
+        return Err(format!("Re and CL in --op '{spec}' must be finite"));
+    }
+    let goal = match rest.get(2).map(|s| s.to_lowercase()) {
+        None => DragGoal::Minimise,
+        Some(g) if g.is_empty() || g == "min" || g == "minimise" || g == "minimize" || g == "min-drag" => DragGoal::Minimise,
+        Some(g) if g == "max-orig" || g == "<=orig" || g == "<=original" || g == "orig" || g == "keep" => DragGoal::AtMostOriginal,
+        Some(g) if g.starts_with("<=") => DragGoal::AtMost { cd: g[2..].trim().parse().map_err(|_| format!("bad max CD '{g}'"))? },
+        Some(g) if g.starts_with('=') => DragGoal::Target { cd: g[1..].trim().parse().map_err(|_| format!("bad target CD '{g}'"))? },
+        Some(g) if g.starts_with("target=") => DragGoal::Target { cd: g[7..].trim().parse().map_err(|_| format!("bad target CD '{g}'"))? },
+        Some(g) => return Err(format!("unknown drag goal '{g}' in --op '{spec}' (use min, max-orig, <=CD or =CD)")),
+    };
+    let weight: f64 = match rest.get(3) {
+        Some(w) if !w.is_empty() => w.parse().map_err(|_| format!("bad weight '{w}' in --op '{spec}'"))?,
+        _ => 1.0,
+    };
+    if !weight.is_finite() {
+        return Err(format!("weight in --op '{spec}' must be finite"));
+    }
+    Ok(OperatingPoint { label, enabled: true, re, cl, goal, weight })
+}
+
+fn print_multipoint_summary(r: &foiley_foil::optim::OptimResult, spar: Option<foiley_foil::optim::SparConstraint>) {
+    eprintln!("  {} evaluations, {} Pareto design(s)", r.evaluations, r.pareto.len());
+    eprintln!("  {:14} {:>9} {:>7} {:>11} {:>9} {:>9} {:>16} {:>7}", "Point", "Re", "CL", "Goal", "Orig CD", "Cand CD", "Delta", "alpha");
+    let base_ops = r.baseline.as_ref().map(|b| b.op_points.as_slice()).unwrap_or(&[]);
+    let cand = r.best.as_ref();
+    let cand_ops = cand.map(|c| c.op_points.as_slice()).unwrap_or(&[]);
+    for i in 0..base_ops.len().max(cand_ops.len()) {
+        let bo = base_ops.get(i);
+        let co = cand_ops.get(i);
+        let lbl = co.or(bo).map(|e| e.label.as_str()).unwrap_or("-");
+        let re = co.or(bo).map(|e| e.re).unwrap_or(0.0);
+        let cl = co.or(bo).map(|e| e.target_cl).unwrap_or(0.0);
+        let goal = co.or(bo).map(|e| e.goal.label()).unwrap_or("-");
+        let o_str = bo.filter(|b| b.converged).map(|b| format!("{:.5}", b.cd)).unwrap_or_else(|| "-".into());
+        let c_str = co.filter(|c| c.converged).map(|c| format!("{:.5}", c.cd)).unwrap_or_else(|| "-".into());
+        let d_str = match (bo, co) {
+            (Some(b), Some(c)) if b.converged && c.converged && b.cd > 1e-9 => format!("{:+.5} ({:+.1}%)", c.cd - b.cd, (c.cd - b.cd) / b.cd * 100.0),
+            _ => "-".into(),
+        };
+        let a_str = co.filter(|c| c.converged).map(|c| format!("{:.2}°", c.alpha)).unwrap_or_else(|| "-".into());
+        eprintln!("  {:14} {:>9.0} {:>7.3} {:>11} {:>9} {:>9} {:>16} {:>7}", lbl, re, cl, goal, o_str, c_str, d_str, a_str);
+    }
+    if let Some(sp) = spar {
+        let bt = r.baseline.as_ref().and_then(|b| b.spar_thickness);
+        let ct = cand.and_then(|c| c.spar_thickness);
+        if let (Some(b), Some(c)) = (bt, ct) {
+            eprintln!(
+                "  spar t/c @ x/c {:.2}: orig {:.2}% -> cand {:.2}% (min {:.2}% {})",
+                sp.x,
+                b * 100.0,
+                c * 100.0,
+                sp.min_thickness * 100.0,
+                if c + 1e-6 >= sp.min_thickness { "OK" } else { "TOO THIN" }
+            );
+        }
+    }
 }
 
 fn six() -> usize {
@@ -1955,16 +2312,87 @@ fn run_script(mgr: &mut JobManager, ui: &mut Ui, path: &Path) -> Result<(), Stri
                     }
                 }
             }
-            Step::Optimize { foil, settings } => {
+            Step::Optimize { foil, name, from_3d, mut settings } => {
                 let f = resolve_foil(&foil, &proj)?;
-                if let JobOutput::Optimise(r) = run_job(mgr, ui, &format!("optimise {}", f.name), JobKind::Optimise { foil: f.clone(), settings })? {
-                    if let Some(b) = r.best {
-                        let mut g = b.foil.clone();
-                        g.name = proj.unique_foil_name(&format!("{} opt", f.name));
-                        eprintln!("  best: CL {:.4} CD {:.5} -> foil '{}'", b.cl, b.cd, g.name);
-                        proj.foils.push(g);
+                if let Some(ref explicit) = name {
+                    if proj.foil(explicit).is_some() {
+                        return Err(format!("optimize: foil '{explicit}' already exists in the project (choose a distinct name)"));
                     }
                 }
+                if let Some(spec) = from_3d {
+                    let polar = select_3d_polar(&proj, spec.polar.as_deref())?;
+                    let station_str = if let Some(y) = spec.station_y {
+                        if !y.is_finite() {
+                            return Err("from_3d: station_y must be finite".into());
+                        }
+                        Some(format!("{y}"))
+                    } else if let Some(frac) = spec.station_frac {
+                        if !frac.is_finite() || !(0.0..=1.0).contains(&frac) {
+                            return Err(format!("from_3d: station_frac {frac} must be between 0 and 1"));
+                        }
+                        Some(format!("{}%", frac * 100.0))
+                    } else {
+                        None
+                    };
+                    let (chosen, regimes) = extract_3d_station_regimes(&proj, polar, spec.wing, station_str.as_deref())?;
+                    settings.operating_points = regimes.iter().map(|sp| sp.to_default_operating_point()).collect();
+                    eprintln!("  3D station: {} {} y = {:.3} m ({:.0}% span, c = {:.3} m)", polar.plane, chosen.wing_name, chosen.span_pos, chosen.span_frac * 100.0, chosen.chord);
+                }
+                settings.validate()?;
+                settings.analysis.validate()?;
+                let spar_opt = settings.spar;
+                if let JobOutput::Optimise(r) = run_job(mgr, ui, &format!("optimise {}", f.name), JobKind::Optimise { foil: f.clone(), settings })? {
+                    let b = r.best.as_ref().filter(|c| c.constraints_met()).ok_or("optimize: no feasible design satisfied all constraints")?;
+                    if !b.op_points.is_empty() {
+                        print_multipoint_summary(&r, spar_opt);
+                    }
+                    let mut g = b.foil.clone();
+                    g.name = name.unwrap_or_else(|| proj.unique_foil_name(&format!("{} opt", f.name)));
+                    eprintln!("  best -> foil '{}'", g.name);
+                    proj.foils.push(g);
+                }
+            }
+            Step::CopyPlane { plane, name, wing, replace_foil } => {
+                if proj.planes.iter().any(|p| p.name == name) {
+                    return Err(format!("copy_plane: plane '{name}' already exists in the project"));
+                }
+                let src_pl = match &plane {
+                    Some(n) => proj.planes.iter().find(|p| &p.name == n).cloned().ok_or_else(|| format!("no plane '{n}'"))?,
+                    None => proj.planes.first().cloned().ok_or("no plane loaded")?,
+                };
+                let mut copy = src_pl;
+                copy.name = name.clone();
+                if let Some(target) = wing {
+                    if target >= copy.wings.len() {
+                        return Err(format!("copy_plane: wing index {target} out of range (plane '{}' has {} wing(s))", copy.name, copy.wings.len()));
+                    }
+                }
+                if let Some((old_f, new_f)) = replace_foil {
+                    if proj.foil(&new_f).is_none() {
+                        return Err(format!("copy_plane: replacement foil '{new_f}' is not in the project"));
+                    }
+                    let mut replaced = 0usize;
+                    for (iw, w) in copy.wings.iter_mut().enumerate() {
+                        if wing.is_some_and(|target| target != iw) {
+                            continue;
+                        }
+                        for sec in &mut w.sections {
+                            if sec.foil_right == old_f {
+                                sec.foil_right = new_f.clone();
+                                replaced += 1;
+                            }
+                            if sec.foil_left == old_f {
+                                sec.foil_left = new_f.clone();
+                                replaced += 1;
+                            }
+                        }
+                    }
+                    if replaced == 0 {
+                        return Err(format!("copy_plane: no section matched foil '{old_f}'"));
+                    }
+                }
+                eprintln!("  added plane '{}'", copy.name);
+                proj.planes.push(copy);
             }
             Step::ImportFuselage { file, plane, scale } => {
                 let idx = match &plane {
@@ -2020,6 +2448,44 @@ fn main() {
             eprintln!("error: {e}");
             std::process::exit(if e == "cancelled" { 130 } else { 1 });
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+    use foiley_foil::optim::DragGoal;
+
+    #[test]
+    fn parse_op_point_and_spar_and_csv_escape() {
+        let p = parse_op_point("Slow:1.2e5:0.9:<=orig:1.5").unwrap();
+        assert_eq!(p.label, "Slow");
+        assert!((p.re - 1.2e5).abs() < 1.0);
+        assert!((p.cl - 0.9).abs() < 1e-9);
+        assert_eq!(p.goal, DragGoal::AtMostOriginal);
+        assert!((p.weight - 1.5).abs() < 1e-9);
+
+        let p2 = parse_op_point("2e5:0.5:<=0.011").unwrap();
+        assert!(p2.label.is_empty());
+        assert_eq!(p2.goal, DragGoal::AtMost { cd: 0.011 });
+
+        let p3 = parse_op_point("Cruise:1.8e5:0.5:=0.009:2").unwrap();
+        assert_eq!(p3.goal, DragGoal::Target { cd: 0.009 });
+
+        // Extra trailing fields and non-finite inputs must be rejected
+        assert!(parse_op_point("cruise:175000:0.50:min:1:extra").is_err());
+        assert!(parse_op_point("cruise:NaN:0.50:min").is_err());
+        assert!(parse_op_point("cruise:1.8e5:0.50:min:inf").is_err());
+
+        // Spar parser
+        let sp = parse_spar("0.30,11.5%").unwrap();
+        assert!((sp.x - 0.30).abs() < 1e-9 && (sp.min_thickness - 0.115).abs() < 1e-9);
+        assert!(parse_spar("0.30,0.115,extra").is_err());
+        assert!(parse_spar("NaN,0.115").is_err());
+
+        // CSV escaping
+        assert_eq!(csv_escape("cd_0_Cruise"), "cd_0_Cruise");
+        assert_eq!(csv_escape("cd_0_a,b\"c"), "\"cd_0_a,b\"\"c\"");
     }
 }
 

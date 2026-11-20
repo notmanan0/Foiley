@@ -93,18 +93,50 @@ impl Project {
         n - self.foil_polars.len()
     }
 
-    /// Save atomically (write to a temp file, then rename).  Always writes
-    /// the current format.
+    /// Save atomically (write to an exclusively created sibling temp file,
+    /// then rename).  Always writes the current format.
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+        if is_device_path(path) {
+            return Err(format!("{}: cannot save a project to a device", path.display()));
+        }
+        if path.is_dir() {
+            return Err(format!("{}: is a directory", path.display()));
+        }
+        let stem = path
+            .file_name()
+            .ok_or_else(|| format!("{}: not a file name", path.display()))?
+            .to_string_lossy();
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
         let text = if self.format == FORMAT_VERSION {
             serde_json::to_string(self)
         } else {
             serde_json::to_string(&Project { format: FORMAT_VERSION, ..self.clone() })
         }
         .map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("foiley.tmp");
-        std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+        let pid = std::process::id();
+        let (mut file, tmp) = loop {
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let candidate = dir.join(format!(".{stem}.{pid}.{seq}.tmp"));
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+                Ok(f) => break (f, candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("{}: {e}", candidate.display())),
+            }
+        };
+        if let Err(e) = file.write_all(text.as_bytes()).and_then(|_| file.flush()) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("{}: {e}", tmp.display()));
+        }
+        drop(file);
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", path.display())
+        })
     }
 
     pub fn foil(&self, name: &str) -> Option<&Foil> {
@@ -117,6 +149,14 @@ impl Project {
             return base.to_string();
         }
         (2..).map(|i| format!("{base} ({i})")).find(|n| self.foil(n).is_none()).unwrap()
+    }
+
+    /// Unique plane name derived from `base`.
+    pub fn unique_plane_name(&self, base: &str) -> String {
+        if self.planes.iter().all(|p| p.name != base) {
+            return base.to_string();
+        }
+        (2..).map(|i| format!("{base} ({i})")).find(|n| self.planes.iter().all(|p| p.name != *n)).unwrap()
     }
 
     /// Add or replace a foil (by name).  Replacing a foil's coordinates
@@ -373,6 +413,18 @@ impl Project {
     }
 }
 
+fn is_device_path(path: &Path) -> bool {
+    let reserved = cfg!(windows)
+        && path
+            .file_name()
+            .map(|n| n.to_string_lossy().trim_end_matches(':').to_ascii_uppercase())
+            .is_some_and(|n| {
+                matches!(n.as_str(), "NUL" | "CON" | "PRN" | "AUX")
+                    || ((n.starts_with("COM") || n.starts_with("LPT")) && n.len() == 4 && n.as_bytes()[3].is_ascii_digit())
+            });
+    reserved || std::fs::metadata(path).is_ok_and(|m| !m.is_file() && !m.is_dir())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +438,27 @@ mod tests {
         let q = Project::load(&f).unwrap();
         assert_eq!(q.foils.len(), 2);
         assert_eq!(q.planes.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_does_not_clobber_sibling_tmp_or_leave_device_tmp() {
+        let p = Project::starter();
+        let dir = std::env::temp_dir().join(format!("foiley_save_safe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sibling_tmp = dir.join("study.foiley.tmp");
+        std::fs::write(&sibling_tmp, "keep me intact").unwrap();
+        let dest = dir.join("study.foiley");
+        p.save(&dest).unwrap();
+        assert_eq!(std::fs::read_to_string(&sibling_tmp).unwrap(), "keep me intact");
+        assert!(Project::load(&dest).is_ok());
+        #[cfg(windows)]
+        {
+            let err = p.save(Path::new("NUL")).unwrap_err();
+            assert!(err.contains("device"), "{err}");
+            assert!(!Path::new("NUL.foiley.tmp").exists());
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

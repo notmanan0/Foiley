@@ -132,6 +132,8 @@ foiley foil inverse naca2412 --alpha 2 --segment upper,0.3,0.7 --scale 0.97 -o i
 foiley foil inverse naca2412 --mode full --segment lower,0.2,0.7 --bump 0.03 -o inv.dat  # MDES
 foiley foil optimize naca0012 --re 5e5 --alpha 3 --objectives "cl/cd:max,cm:0" -o best.dat
 foiley foil optimize naca2412 --shape cst --cst-order 5 --alpha 4 -o best.dat  # CST weights
+foiley foil optimize "NACA 2412" --project study.foiley --from-3d-polar auto --station 45% --spar 0.30,11.5% --shape cst --cst-order 4 --name "NACA 2412 opt" --save study.foiley -o opt.dat
+foiley foil optimize naca2412 --shape cst --cst-order 4 --op "Slow:1.15e5:0.90:<=orig" --op "Cruise:1.75e5:0.50:min" --op "Fast:2.70e5:0.20:min" --spar 0.30,11.5% -o opt.dat
 foiley foil gen naca "64(2)-415" -o 642415.dat      # also 23112, 0012-64, 16-212, 64A010, "2412 closed TE"
 foiley foil gen cst --upper 0.17,0.16,0.15 --lower=-0.17,-0.16,-0.15 -o cst.dat
 foiley foil gen parsec --rle 0.012 --upper 0.35,0.075,-0.6 --te 0,0.002,4,10 -o parsec.dat
@@ -181,8 +183,17 @@ the Jobs and Log panel is always visible at the bottom.
   * **Inverse design** (mixed QDES / full MDES): plot the surface speed,
     scale, bump or smooth a segment, see the target, and solve.
   * **Optimiser** (MOPSO particle swarm or genetic algorithm) with
-    Hicks–Henne bumps or CST weights and an optional flap, on Cl, Cd, Cl/Cd, Cpmin and Cm
-    (minimise, maximise or target). The best design and the score history
+    Hicks–Henne bumps or CST weights and an optional flap. Supports
+    single-alpha objectives (`Cl`, `Cd`, `Cl/Cd`, `Cpmin`, `Cm`) and a
+    multi-point operating-point table (`Re`, target `CL`, drag goal:
+    minimise, `<= original`, `<= max CD`, or target `CD`) with a chordwise
+    spar minimum-thickness floor and an original-versus-candidate drag
+    comparison table. *Use points from 3D analysis* (or *Optimise this wing
+    section* from 3D analysis) populates the table from a wing station's
+    slow-flight, cruise and fast-glide conditions, saves the candidate as a
+    new foil, duplicates the aircraft with the candidate replacing sections
+    that used the station's dominant foil on that wing, and reruns the 3D
+    study alongside the original polar. The best design and score history
     update live.
 * **2D analysis.** Polar types 1/2/3/4/6 and single points.
   * Four configurable polar plots.
@@ -247,7 +258,7 @@ approximated and skipped, and why); `foiley project` prints the same report.
 | Foil generators: NACA 4/5-digit (incl. reflexed, any CL, closed TE), 4-digit modified, 16-, 6- and 6A-series; CST with least-squares fitting; PARSEC; Kármán–Trefftz with exact solution; cambered plates | ✔ (beyond xflr5, which generates NACA 4/5-digit only) |
 | Foil design: NACA, flap, TE gap, LE radius, thickness/camber, max-point positions, repanel, derotate/normalise, interpolation | ✔ |
 | Mixed and full inverse design (QDES / MDES) | ✔ GUI and CLI (all other XFoil menus via `foiley xfoil`) |
-| Foil optimiser: MOPSO and genetic algorithm, Hicks–Henne bumps or CST weights, flap, multi-objective with Pareto archive | ✔ |
+| Foil optimiser: MOPSO and genetic algorithm, Hicks–Henne bumps or CST weights, flap, multi-point operating-point table with spar floor, 3D wing-station handoff and rerun | ✔ |
 | Planes: multi-section wings, dihedral, twist, sweep, fins, flaps (control surfaces), point masses, inertia | ✔ |
 | Fuselages: elliptic frames, NURBS (xflr5/flow5 frames), STL and STEP surfaces | ✔ (STEP: B-spline/NURBS surfaces and planar faces; other analytic surface types are skipped with a note) |
 | LLT, VLM1, VLM2, 3D panels on quads and triangles, Galerkin linear-doublet triangles, ground effect | ✔ |
