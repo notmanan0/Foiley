@@ -4,7 +4,8 @@
 //! * The required envelope comes from the operating states the definition
 //!   expands to: the alpha / speed / sideslip sweeps, the T8 list, the T6
 //!   ranges (speed, alpha, beta, mass, flaps, tilts), the T7 gains
-//!   (trimmed), and the mass for the speed of T2/T3/T7.
+//!   (trimmed), the T9 speed and elevator limits, and the mass for the speed
+//!   of T2/T3/T7.
 //! * Re per foil is V c / nu over the strips that use it (min/max chord).
 //! * The CL / alpha span comes from a cheap inviscid VLM2 pre-pass that
 //!   reuses each configuration's unit solutions (RHS combinations only).
@@ -16,7 +17,7 @@
 //!   the base foil with `flap_deg` set (`adopt`).
 
 use foiley_core::hash::Hash32;
-use foiley_core::Vec3;
+use foiley_core::{Progress, Vec3};
 use foiley_foil::batch::{re_list_geometric, BatchCase};
 use foiley_foil::{AnalysisSettings, Foil, FoilPolar, Sweep};
 use foiley_plane::analysis::{make_system, mesh_options, wind_dir, wind_normal, ControlTarget, Ctx, PolarKind, G};
@@ -90,15 +91,28 @@ struct State {
     trim: bool,
     flaps: Vec<((usize, usize), f64)>,
     tilts: Vec<(usize, f64)>,
+    elevator: Option<(usize, f64)>,
 }
 
 fn states(def: &PlanePolarDef, mass: f64) -> Vec<State> {
-    let st = |alpha: f64, beta: f64, v: Option<f64>| State { alpha, beta, v, mass, trim: false, flaps: vec![], tilts: vec![] };
+    let st = |alpha: f64, beta: f64, v: Option<f64>| State { alpha, beta, v, mass, trim: false, flaps: vec![], tilts: vec![], elevator: None };
     let range = def.range.values();
     match def.kind {
         PolarKind::FixedSpeed => range.iter().map(|&a| st(a, def.beta, Some(def.velocity))).collect(),
         PolarKind::FixedLift | PolarKind::Glide => range.iter().map(|&a| st(a, def.beta, None)).collect(),
         PolarKind::FixedAlpha => range.iter().map(|&v| st(def.alpha, def.beta, Some(v))).collect(),
+        PolarKind::TrimmedGlide => {
+            let Some(trim) = def.elevator_trim else { return vec![] };
+            let mut states = vec![];
+            for deg in trim.stations() {
+                for &speed in range.iter().enumerate().filter_map(|(i, v)| (i == 0 || i + 1 == range.len()).then_some(v)) {
+                    let mut s = st(0.0, 0.0, Some(speed));
+                    s.elevator = Some((trim.wing, deg));
+                    states.push(s);
+                }
+            }
+            states
+        }
         PolarKind::Sideslip => range.iter().map(|&b| st(def.alpha, b, Some(def.velocity))).collect(),
         PolarKind::List => def.list.iter().map(|&(a, b, v)| st(a, b, Some(v))).collect(),
         PolarKind::Control => range
@@ -136,22 +150,32 @@ fn states(def: &PlanePolarDef, mass: f64) -> Vec<State> {
     }
 }
 
-type Config = (Vec<((usize, usize), f64)>, Vec<(usize, f64)>);
+type Config = (Vec<((usize, usize), f64)>, Vec<(usize, f64)>, Option<(usize, f64)>);
 
 /// The 2D envelope `def` needs on `plane`, from an inviscid VLM2 pre-pass
 /// over its operating states (one factorization per flap / tilt setting;
 /// every state of a setting is a combination of its unit solutions).
 pub fn required(plane: &Plane, db: &FoilDb, def: &PlanePolarDef) -> Result<Coverage, String> {
+    required_with_progress(plane, db, def, &Progress::none())
+}
+
+fn required_with_progress(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, progress: &Progress) -> Result<Coverage, String> {
+    if def.kind == PolarKind::TrimmedGlide {
+        def.validate()?;
+    }
     let pre = PlanePolarDef { method: Method::Vlm2, kind: PolarKind::FixedSpeed, viscous: false, free_wake: 0, derivatives: false, keep_cp: false, ..def.clone() };
     let ctx = Ctx::new(plane, db, &pre).map_err(|e| e.to_string())?;
     let mass = ctx.inertia.mass;
+    if def.kind == PolarKind::TrimmedGlide && mass <= 0.0 {
+        return Err("trimmed glide needs a positive plane mass or an inertia override".into());
+    }
     let cog = if mass > 0.0 { ctx.inertia.cog } else { Vec3::ZERO };
     let nu = def.fluid.nu();
     let rho = def.fluid.rho;
     // group the states by configuration
     let mut groups: Vec<(Config, Vec<State>)> = Vec::new();
     for s in states(def, mass) {
-        let cfg = (s.flaps.clone(), s.tilts.clone());
+        let cfg = (s.flaps.clone(), s.tilts.clone(), s.elevator);
         match groups.iter_mut().find(|g| g.0 == cfg) {
             Some(g) => g.1.push(s),
             None => groups.push((cfg, vec![s])),
@@ -160,11 +184,17 @@ pub fn required(plane: &Plane, db: &FoilDb, def: &PlanePolarDef) -> Result<Cover
     let mut per_foil: Vec<FoilCoverage> = Vec::new();
     let (mut amin, mut amax, mut cmin, mut cmax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
     let mut n = 0;
-    for ((flaps, tilts), sts) in &groups {
+    for (i, ((flaps, tilts, elevator), sts)) in groups.iter().enumerate() {
+        progress.check().map_err(|e| e.to_string())?;
         let flaps: HashMap<(usize, usize), f64> = flaps.iter().cloned().collect();
         let tilts: HashMap<usize, f64> = tilts.iter().cloned().collect();
-        let mesh = build(plane, db, &mesh_options(&pre, &flaps, &tilts)).map_err(|e| e.to_string())?;
-        let sys = make_system(&pre, &mesh, cog, ctx.c_ref, &foiley_core::Progress::none()).map_err(|e| e.to_string())?;
+        let mut options = mesh_options(&pre, &flaps, &tilts);
+        options.elevator = *elevator;
+        let mesh = build(plane, db, &options).map_err(|e| e.to_string())?;
+        if let Some(trim) = def.elevator_trim.filter(|_| elevator.is_some()) {
+            trim.validate_mesh(plane, &mesh).map_err(|e| e.to_string())?;
+        }
+        let sys = make_system(&pre, &mesh, cog, ctx.c_ref, &progress.part(i, groups.len())).map_err(|e| e.to_string())?;
         for s in sts {
             let mut alpha = s.alpha;
             if s.trim {
@@ -200,6 +230,20 @@ pub fn required(plane: &Plane, db: &FoilDb, def: &PlanePolarDef) -> Result<Cover
             };
             if !(v > 0.0 && v.is_finite()) {
                 continue;
+            }
+            if s.elevator.is_some() {
+                // Estimate the lift balance at the speed endpoints for each
+                // elevator setting. The polar sweep adds a margin to these
+                // angles; the final trim still checks every strip's coverage.
+                let lift = |a: f64| {
+                    let r = sys.loads(wind_dir(a, 0.0) * v, Vec3::ZERO);
+                    (r.force + r.induced_force).dot(wind_normal(a)) * rho
+                };
+                let (low_alpha, high_alpha) = (-4.0, 8.0);
+                let (low_lift, high_lift) = (lift(low_alpha), lift(high_alpha));
+                if high_lift > low_lift {
+                    alpha = (low_alpha + (high_alpha - low_alpha) * (mass * G - low_lift) / (high_lift - low_lift)).clamp(-12.0, 19.0);
+                }
             }
             n += 1;
             let raw = sys.loads(wind_dir(alpha, s.beta) * v, Vec3::ZERO);
@@ -325,10 +369,23 @@ pub fn plan_with_defaults(
     count: usize,
     foil_defaults: &HashMap<String, AnalysisSettings>,
 ) -> Result<AutoPlan, String> {
+    plan_with_progress(plane, foils, db, def, count, foil_defaults, &Progress::none())
+}
+
+pub(crate) fn plan_with_progress(
+    plane: &Plane,
+    foils: &[Foil],
+    db: &FoilDb,
+    def: &PlanePolarDef,
+    count: usize,
+    foil_defaults: &HashMap<String, AnalysisSettings>,
+    progress: &Progress,
+) -> Result<AutoPlan, String> {
     if !(def.viscous || def.method == Method::Llt) || count == 0 {
         return Ok(AutoPlan::default());
     }
-    let cov = required(plane, db, def)?;
+    let cov = required_with_progress(plane, db, def, progress)?;
+    let trimmed = def.kind == PolarKind::TrimmedGlide;
     let (a0, a1) = cov.alpha;
     let sweep = Sweep::Alpha { from: (a0 - 3.0).floor().clamp(-15.0, -2.0), to: (a1 + 3.0).ceil().clamp(6.0, 22.0), step: 0.5 };
     // (family params, stations) -> foils
@@ -347,15 +404,32 @@ pub fn plan_with_defaults(
         let (params, base) = family_params(db, &c.foil, def, foil_defaults.get(&c.foil))?;
         let lo = c.re.0.max(1e4);
         let want = re_list_geometric(lo, c.re.1.max(lo * 1.2), count.max(2));
-        let have = |id: Option<FamilyId>| id.map(|i| db.family(i).polars.iter().map(|p| p.re).collect::<Vec<f64>>()).unwrap_or_default();
-        add(params.clone(), missing(&want, &have(base)), foil.clone());
+        let needed = |id: Option<FamilyId>| {
+            let have = id.map(|i| db.family(i).polars.iter().map(|p| p.re).collect::<Vec<_>>()).unwrap_or_default();
+            let mut re = missing(&want, &have);
+            // T9 always enforces the 2D envelope. A nearby Reynolds number
+            // cannot cover an endpoint that lies beyond the available family.
+            if trimmed {
+                let hi = want[want.len() - 1];
+                let low = want[0];
+                if !have.iter().any(|&h| h <= low) && re.first() != Some(&low) {
+                    re.insert(0, low);
+                }
+                if !have.iter().any(|&h| h >= hi) && re.last() != Some(&hi) {
+                    re.push(hi);
+                }
+            }
+            re
+        };
+        add(params.clone(), needed(base), foil.clone());
         let set = base.map(|b| db.flap_families(b)).unwrap_or_default();
         for &d in &c.flaps {
-            let existing = set.iter().find(|(f, _)| (f - d).abs() < 0.25).map(|x| x.1);
+            let tolerance = if trimmed { 1e-9 } else { 0.25 };
+            let existing = set.iter().find(|(f, _)| (f - d).abs() < tolerance).map(|x| x.1);
             let Some((xh, yh)) = foil.hinge else { continue };
             let Ok(mut g) = foil.with_flap(xh, yh, d) else { continue };
             g.name = deflected_name(&foil.name, d);
-            add(params.clone(), missing(&want, &have(existing)), g);
+            add(params.clone(), needed(existing), g);
         }
     }
     let batches = groups

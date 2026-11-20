@@ -144,6 +144,7 @@ foiley foil fit-cst e387.dat --order 8 --json > e387-cst.json
 foiley plane info glider.xml                     # xflr5 / flow5 XML or a .foiley project
 foiley plane analyze glider.xml --type t2 --method vlm2 --range=-2:10:1 --strips span.csv
 foiley plane analyze glider.xml --type t7 --gain 1,0,5 --gain 1,1,5 --response doublet:0.5 --response-out r.csv
+foiley plane analyze tests/data/projects/flapped.foiley --type t9 --elevator 1,-10,10 --range 7:21:1 --save trimmed.foiley
 foiley plane analyze glider.xml --method tripanel --inviscid --speed 20 -f json -o out.json
 foiley plane analyze glider.xml --method trilinear --inviscid --range=0:6:2  # Galerkin linear doublets
 foiley plane analyze glider.xml --free-wake 4 --range 2:8:2            # relaxed VLM wake
@@ -211,6 +212,8 @@ the Jobs and Log panel is always visible at the bottom.
 * **3D analysis.**
   * Polar types T1 to T8 with the methods LLT, VLM1, VLM2, quad panels and
     triangle panels.
+  * T9 elevator-trimmed glide polars with VLM2. Compare sink rate, L/D and
+    elevator deflection across the same airspeeds for two aircraft variants.
   * Optional free (relaxed) wake for VLM, drawn in the 3D view.
   * Viscous drag from the 2D polars; ground effect; altitude or water.
   * Mass overrides, flap presets, extra drag, T6 ranges and T7 gains.
@@ -220,6 +223,30 @@ the Jobs and Log panel is always visible at the bottom.
   dimensional and non-dimensional derivatives; state matrices; root locus.
   Modal time responses, and forced responses to step, pulse, doublet or
   sine control inputs (T7 gains give the control derivatives).
+
+### Elevator-trimmed glide
+
+In **3D analysis**, open `tests/data/projects/flapped.foiley` and pick **T9 –
+elevator-trimmed glide** with VLM2. Select the elevator wing, set its travel
+limits and enter the airspeed sweep in m/s. The CLI example above uses wing
+index `1` and ±10° travel. Positive deflection moves the trailing edge down.
+The elevator wing must be symmetric and two-sided, with a hinge defined on
+both end foils of at least one section. All its hinged regions move together.
+
+T9 solves the angle of attack and elevator deflection at each requested speed
+so the lift/drag resultant balances weight and the pitching moment about the
+centre of gravity is zero. It uses a rigid wake and zero sideslip. With
+viscous analysis enabled, the automatic polars sample five positions across
+the elevator travel. Speeds without a solution within the travel limits or
+without usable 2D polar coverage are left as gaps. The failure reasons appear
+in the log and JSON results.
+
+To compare an airfoil variant with the baseline, run T9, choose **Optimise
+this wing section** on the main wing, then choose **Save foil & rerun 3D
+study** after the optimiser finds a feasible candidate. Both polars remain
+visible at matched airspeeds. Studio reports the lowest sampled sink rate
+and highest sampled L/D for each aircraft and plots the required elevator
+deflection. The T9 CSV also includes `elevator_deg`.
 
 ### 3D viewport
 
@@ -264,6 +291,7 @@ approximated and skipped, and why); `foiley project` prints the same report.
 | LLT, VLM1, VLM2, 3D panels on quads and triangles, Galerkin linear-doublet triangles, ground effect | ✔ |
 | Free (relaxed) wake for VLM | ✔ |
 | Polar types T1 fixed speed, T2 fixed lift, T3 glide, T4 fixed α, T5 sideslip, T6 control, T7 stability, T8 list | ✔ |
+| T9 elevator-trimmed glide at prescribed airspeeds (Foiley extension) | ✔ (VLM2) |
 | Stability derivatives, control derivatives, state matrices, modes, root locus, modal and forced time responses | ✔ |
 | Import: xflr5 `.xfl` and flow5 `.fl5` projects (foils, polars, planes, plane polar definitions), `.plr` polars, AVL `.avl` geometry, plane/wing XML, `.dat`, XFoil polar text | ✔ (plane polar results and operating points are not imported; every import lists what it mapped, approximated and skipped; the readers were tested against byte streams built from the C++ write code and hand-written minimal files, not real project files) |
 | Export: AVL `.avl` and `.mass`, STL mesh, xflr5 XML, `.dat`, XFoil polar text, CSV, JSON | ✔ |

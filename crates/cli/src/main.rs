@@ -24,7 +24,7 @@ use foiley_foil::batch::BatchCase;
 use foiley_foil::foil::Paneling;
 use foiley_foil::{AnalysisSettings, Foil, FoilPolar, Sweep};
 use foiley_foil::gen::naca;
-use foiley_plane::analysis::{Method, PolarKind, Range, RefDims};
+use foiley_plane::analysis::{ElevatorTrim, Method, PolarKind, Range, RefDims};
 use foiley_plane::geom::Inertia;
 use foiley_plane::{Plane, PlanePolar, PlanePolarDef};
 use progress_ui::Ui;
@@ -833,11 +833,11 @@ enum PlaneCmd {
         #[arg(long)]
         save: PathBuf,
     },
-    /// Run a 3D polar (types 1-8)
+    /// Run a 3D polar
     Analyze {
         #[command(flatten)]
         src: PlaneSrc,
-        /// t1 fixed speed, t2 fixed lift, t3 glide, t4 fixed alpha, t5 sideslip, t7 stability, t8 list
+        /// t1 fixed speed, t2 fixed lift, t3 glide, t4 fixed alpha, t5 sideslip, t7 stability, t8 list, t9 trimmed glide
         #[arg(long = "type", default_value = "t1")]
         ptype: String,
         /// llt, vlm1, vlm2, panel (quads), tripanel (uniform triangles), trilinear (Galerkin)
@@ -865,9 +865,9 @@ enum PlaneCmd {
         response_time: f64,
         #[arg(long)]
         response_out: Option<PathBuf>,
-        /// sweep "from:to:step" (alpha for t1-t3, speed for t4, beta for t5, control for t7)
-        #[arg(long, default_value = "-4:10:1", allow_hyphen_values = true)]
-        range: String,
+        /// sweep "from:to:step" (alpha for t1-t3, speed for t4/t9, beta for t5, control for t7)
+        #[arg(long, allow_hyphen_values = true)]
+        range: Option<String>,
         /// speed for t1/t5, m/s
         #[arg(long, default_value_t = 15.0)]
         speed: f64,
@@ -910,6 +910,9 @@ enum PlaneCmd {
         /// T7 gain "wing,flap,deg_per_unit" (repeatable)
         #[arg(long = "gain", allow_hyphen_values = true)]
         gains: Vec<String>,
+        /// T9 elevator "wing,min_deg,max_deg" (zero-based wing index, positive trailing edge down)
+        #[arg(long, allow_hyphen_values = true)]
+        elevator: Option<String>,
         /// reference dimensions: projected, planform or "area,span,chord"
         #[arg(long, default_value = "projected")]
         reference: String,
@@ -1026,12 +1029,16 @@ fn foil_polar_table(p: &FoilPolar) -> String {
 fn plane_polar_table(p: &PlanePolar) -> String {
     let (s, b, c) = p.ref_dims;
     let mut t = format!("# {} | {} | Sref {s:.4} m2, bref {b:.3} m, cref {c:.4} m, {} unknowns\n", p.plane, p.name, p.unknowns);
-    t.push_str("  alpha   beta      V    ctrl       CL        CD      CDi      CDv        Cm        Cn    L/D     Vz\n");
+    let control = if p.def.as_ref().is_some_and(|d| d.kind == PolarKind::TrimmedGlide) { " Elev deg" } else { "    ctrl" };
+    t.push_str(&format!("  alpha   beta      V{control}       CL        CD      CDi      CDv        Cm        Cn    L/D     Vz\n"));
     for o in &p.points {
         t.push_str(&format!(
             "{:7.2} {:6.2} {:6.2} {:7.3} {:8.4} {:9.5} {:8.5} {:8.5} {:9.5} {:>9} {:6.2} {:6.3}\n",
-            o.alpha, o.beta, o.velocity, o.ctrl, o.cl, o.cd, o.cdi, o.cdv, o.cm, o.cn.map(|v| format!("{v:.5}")).unwrap_or_else(|| "-".into()), o.ld(), o.vz()
+            o.alpha, o.beta, o.velocity, o.elevator_deg.unwrap_or(o.ctrl), o.cl, o.cd, o.cdi, o.cdv, o.cm, o.cn.map(|v| format!("{v:.5}")).unwrap_or_else(|| "-".into()), o.ld(), o.vz()
         ));
+    }
+    if let Some((sink, glide)) = p.trimmed_glide_extrema() {
+        t.push_str(&format!("# minimum sampled sink {:.3} m/s at {:.2} m/s | best sampled L/D {:.2} at {:.2} m/s\n", sink.vz(), sink.velocity, glide.ld(), glide.velocity));
     }
     for o in &p.points {
         if let Some(s) = &o.stability {
@@ -1152,12 +1159,17 @@ fn ensure_polars(mgr: &mut JobManager, ui: &mut Ui, proj: &mut Project, plane: &
         return Ok(());
     }
     let db = proj.foil_db();
-    let plan = auto::plan(plane, &proj.foils, &db, def, count)?;
-    if plan.is_empty() {
-        return Ok(());
-    }
-    eprintln!("  computing {}", plan.describe());
-    if let JobOutput::Batch(pols) = run_job(mgr, ui, "2D polar mesh", JobKind::AutoPolars { batches: plan.batches })? {
+    let job = if def.kind == PolarKind::TrimmedGlide {
+        JobKind::PrepareAutoPolars { plane: plane.clone(), foils: proj.foils.clone(), db: std::sync::Arc::new(db), def: def.clone(), count, defaults: Default::default() }
+    } else {
+        let plan = auto::plan(plane, &proj.foils, &db, def, count)?;
+        if plan.is_empty() {
+            return Ok(());
+        }
+        eprintln!("  computing {}", plan.describe());
+        JobKind::AutoPolars { batches: plan.batches }
+    };
+    if let JobOutput::Batch(pols) = run_job(mgr, ui, "2D polar mesh", job)? {
         for p in pols {
             proj.add_foil_polar(p);
         }
@@ -1842,7 +1854,7 @@ fn real_main() -> Result<(), String> {
                 proj.save(&save)?;
                 eprintln!("  saved {}", save.display());
             }
-            PlaneCmd::Analyze { src, ptype, method, free_wake, wake_nseg, wake_relax, wake_tol, response, response_amp, response_time, response_out, range, speed, alpha, beta, list, inviscid, altitude, water, mass, cog, ground, derivatives, strict_envelope, flaps, gains, reference, auto_polars, llt_stations, strips, save, out } => {
+            PlaneCmd::Analyze { src, ptype, method, free_wake, wake_nseg, wake_relax, wake_tol, response, response_amp, response_time, response_out, range, speed, alpha, beta, list, inviscid, altitude, water, mass, cog, ground, derivatives, strict_envelope, flaps, gains, elevator, reference, auto_polars, llt_stations, strips, save, out } => {
                 // --save may name the input project (the polar is added to it);
                 // the other outputs may not overwrite either
                 let plane_in = Some(src.plane.clone());
@@ -1857,7 +1869,8 @@ fn real_main() -> Result<(), String> {
                     "6" => return Err("T6 control polars are defined in JSON job scripts (`foiley run`), since they need several ranges".into()),
                     "7" => PolarKind::Stability,
                     "8" => PolarKind::List,
-                    _ => return Err("--type must be t1..t8".into()),
+                    "9" => PolarKind::TrimmedGlide,
+                    _ => return Err("--type must be t1..t9".into()),
                 };
                 let method = match method.to_lowercase().as_str() {
                     "llt" => Method::Llt,
@@ -1868,7 +1881,7 @@ fn real_main() -> Result<(), String> {
                     "trilinear" => Method::TriLinear,
                     m => return Err(format!("unknown method '{m}' (llt, vlm1, vlm2, panel, tripanel, trilinear)")),
                 };
-                let (a, b, s) = parse_range(&range)?;
+                let (a, b, s) = parse_range(range.as_deref().unwrap_or("-4:10:1"))?;
                 let fluid = if water { Fluid::water() } else { let air = isa(altitude, 0.0); Fluid { rho: air.rho, mu: air.mu, a: air.a } };
                 let mut def = PlanePolarDef { kind, method, velocity: speed, alpha, beta, range: Range { from: a, to: b, step: s }, viscous: !inviscid, fluid, ground_height: ground, derivatives, ..Default::default() };
                 def.llt.stations = llt_stations;
@@ -1879,6 +1892,21 @@ fn real_main() -> Result<(), String> {
                 def.strict_envelope = strict_envelope;
                 if kind == PolarKind::Stability && a == -4.0 && b == 10.0 {
                     def.range = Range { from: 0.0, to: 0.0, step: 1.0 };
+                }
+                if kind == PolarKind::TrimmedGlide && range.is_none() {
+                    def.range = Range::TRIMMED_GLIDE_DEFAULT;
+                }
+                if let Some(spec) = elevator {
+                    if kind != PolarKind::TrimmedGlide {
+                        return Err("--elevator requires --type t9".into());
+                    }
+                    let fields: Vec<_> = spec.split(',').map(str::trim).collect();
+                    let [wing, min, max] = fields.as_slice() else { return Err("--elevator needs wing,min_deg,max_deg".into()) };
+                    def.elevator_trim = Some(ElevatorTrim {
+                        wing: wing.parse().map_err(|_| "--elevator wing must be a zero-based integer index")?,
+                        min_deg: min.parse().map_err(|_| "invalid minimum elevator deflection")?,
+                        max_deg: max.parse().map_err(|_| "invalid maximum elevator deflection")?,
+                    });
                 }
                 if let Some(l) = list {
                     def.list = l

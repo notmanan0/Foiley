@@ -1,4 +1,4 @@
-//! 3D polars: definitions (types 1-8), the drivers, and the reduction of
+//! 3D polars: definitions, the drivers, and the reduction of
 //! raw loads to coefficients and span distributions.
 
 use crate::evaluator::{Evaluator, WakeReport};
@@ -64,7 +64,9 @@ impl Method {
         let vlm = matches!(self, Method::Vlm1 | Method::Vlm2);
         let llt = self == Method::Llt;
         match setting {
+            Setting::PolarType if kind == TrimmedGlide => self == Method::Vlm2,
             Setting::PolarType => !llt || matches!(kind, FixedSpeed | FixedLift | Glide | FixedAlpha),
+            Setting::Sideslip | Setting::FreeWake | Setting::Derivatives if kind == TrimmedGlide => false,
             // every VLM driver goes through the wake-aware evaluator
             Setting::FreeWake => vlm,
             // the lifting line is a symmetric main-wing model in free air:
@@ -137,10 +139,12 @@ pub enum PolarKind {
     Stability,
     /// T8: explicit list of (alpha, beta, speed)
     List,
+    /// T9: elevator-trimmed glide at specified airspeeds (Foiley extension)
+    TrimmedGlide,
 }
 
 impl PolarKind {
-    pub const ALL: [PolarKind; 8] = [PolarKind::FixedSpeed, PolarKind::FixedLift, PolarKind::Glide, PolarKind::FixedAlpha, PolarKind::Sideslip, PolarKind::Control, PolarKind::Stability, PolarKind::List];
+    pub const ALL: [PolarKind; 9] = [PolarKind::FixedSpeed, PolarKind::FixedLift, PolarKind::Glide, PolarKind::FixedAlpha, PolarKind::Sideslip, PolarKind::Control, PolarKind::Stability, PolarKind::List, PolarKind::TrimmedGlide];
     pub fn number(self) -> u8 {
         match self {
             PolarKind::FixedSpeed => 1,
@@ -151,6 +155,7 @@ impl PolarKind {
             PolarKind::Control => 6,
             PolarKind::Stability => 7,
             PolarKind::List => 8,
+            PolarKind::TrimmedGlide => 9,
         }
     }
     pub fn label(self) -> &'static str {
@@ -163,20 +168,21 @@ impl PolarKind {
             PolarKind::Control => "T6 - control polar (ranges vs control parameter)",
             PolarKind::Stability => "T7 - stability (trimmed, modes)",
             PolarKind::List => "T8 - list of operating points",
+            PolarKind::TrimmedGlide => "T9 - elevator-trimmed glide, sweep speed",
         }
     }
     /// Name of the swept variable.
     pub fn swept(self) -> &'static str {
         match self {
             PolarKind::FixedSpeed | PolarKind::FixedLift | PolarKind::Glide => "alpha (deg)",
-            PolarKind::FixedAlpha => "speed (m/s)",
+            PolarKind::FixedAlpha | PolarKind::TrimmedGlide => "speed (m/s)",
             PolarKind::Sideslip => "beta (deg)",
             PolarKind::Control | PolarKind::Stability => "control parameter",
             PolarKind::List => "list index",
         }
     }
     pub fn needs_mass(self) -> bool {
-        matches!(self, PolarKind::FixedLift | PolarKind::Glide | PolarKind::Stability)
+        matches!(self, PolarKind::FixedLift | PolarKind::Glide | PolarKind::Stability | PolarKind::TrimmedGlide)
     }
 }
 
@@ -188,11 +194,38 @@ pub struct Range {
 }
 
 impl Range {
+    pub const TRIMMED_GLIDE_DEFAULT: Self = Self { from: 8.0, to: 20.0, step: 1.0 };
+
     pub fn values(&self) -> Vec<f64> {
         let s = if self.step == 0.0 { 1.0 } else { self.step.abs() };
         let n = ((self.to - self.from).abs() / s + 0.5).floor() as usize;
         let d = if self.to >= self.from { 1.0 } else { -1.0 };
         (0..=n.min(10_000)).map(|i| self.from + d * s * i as f64).collect()
+    }
+}
+
+/// Absolute travel limits for the ganged flaps on one elevator wing, degrees
+/// positive trailing edge down.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ElevatorTrim {
+    pub wing: usize,
+    pub min_deg: f64,
+    pub max_deg: f64,
+}
+
+impl ElevatorTrim {
+    /// Stations used to bracket trim and to provide viscous flap families.
+    pub fn stations(self) -> [f64; 5] {
+        [self.min_deg, self.min_deg * 0.75 + self.max_deg * 0.25, (self.min_deg + self.max_deg) * 0.5, self.min_deg * 0.25 + self.max_deg * 0.75, self.max_deg]
+    }
+
+    pub fn validate_mesh(self, plane: &Plane, mesh: &Mesh) -> Result<(), PlaneError> {
+        let wing = plane.wings.get(self.wing).filter(|w| w.kind == crate::geom::WingKind::Elevator && w.two_sided && w.symmetric)
+            .ok_or_else(|| PlaneError::Input("trim requires a symmetric, two-sided elevator wing".into()))?;
+        if !mesh.flaps.iter().any(|f| f.wing == self.wing) {
+            return Err(PlaneError::Input(format!("elevator '{}' has no hinged flap; mark the airfoils on both ends of an elevator section as control surfaces", wing.name)));
+        }
+        Ok(())
     }
 }
 
@@ -294,6 +327,9 @@ pub struct PlanePolarDef {
     pub gains: Vec<(ControlTarget, f64)>,
     /// preset flap deflections for all polar types, degrees
     pub flaps: Vec<((usize, usize), f64)>,
+    /// T9 elevator and travel limits
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elevator_trim: Option<ElevatorTrim>,
     /// add viscous drag interpolated from the 2D polars
     pub viscous: bool,
     /// interpolate viscous drag from the strip CL (xflr5 default) rather than its angle
@@ -366,6 +402,7 @@ impl Default for PlanePolarDef {
             ranges: vec![],
             gains: vec![],
             flaps: vec![],
+            elevator_trim: None,
             viscous: true,
             viscous_from_cl: true,
             fluid: Fluid::default(),
@@ -569,6 +606,20 @@ impl PlanePolarDef {
                 _ => {}
             },
             PolarKind::FixedAlpha if self.range.values().iter().any(|v| *v <= 0.0) => return Err("speed range of a T4 polar must be positive".into()),
+            PolarKind::TrimmedGlide => {
+                let trim = self.elevator_trim.ok_or("trimmed glide requires an elevator wing and travel limits")?;
+                fin("minimum elevator deflection", trim.min_deg)?;
+                fin("maximum elevator deflection", trim.max_deg)?;
+                if trim.min_deg >= trim.max_deg || trim.min_deg <= -90.0 || trim.max_deg >= 90.0 {
+                    return Err("elevator limits must be increasing and within (-90, 90) deg".into());
+                }
+                if self.flaps.iter().any(|&((wing, _), deg)| wing == trim.wing && deg != 0.0) {
+                    return Err("remove flap presets on the elevator wing; trimmed glide solves its absolute deflection".into());
+                }
+                if self.range.values().iter().any(|v| !v.is_finite() || *v <= 0.0) {
+                    return Err("trimmed glide airspeeds must be finite and positive".into());
+                }
+            }
             PolarKind::List => {
                 if self.list.is_empty() {
                     return Err("T8 polar needs a list of (alpha, beta, speed)".into());
@@ -691,6 +742,9 @@ pub struct PlaneOpp {
     pub beta: f64,
     pub velocity: f64,
     pub ctrl: f64,
+    /// T9 elevator deflection, degrees (+ down)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elevator_deg: Option<f64>,
     pub cl: f64,
     pub cd: f64,
     pub cdi: f64,
@@ -722,7 +776,7 @@ pub struct PlaneOpp {
     /// relaxed wake lines (free-wake VLM), for display
     #[serde(default)]
     pub wake: Vec<Vec<[f32; 3]>>,
-    /// T3 speed balance: |resultant - weight| / weight at the reported speed
+    /// T3/T9 glide balance: |resultant - weight| / weight at the reported speed
     #[serde(default)]
     pub balance_residual: Option<f64>,
     /// numerical diagnostics (when the definition asks for them)
@@ -855,14 +909,29 @@ impl PlanePolar {
         Some((b.x_cp * b.cl - a.x_cp * a.cl) / d)
     }
     pub fn to_csv(&self) -> String {
-        let mut s = String::from("alpha,beta,V,ctrl,CL,CD,CDi,CDv,CY,Cm,Cl_roll,Cn,L/D,Lift_N,Drag_N,Xcp,efficiency,Vz,root_bending\n");
+        let trimmed = self.def.as_ref().is_some_and(|d| d.kind == PolarKind::TrimmedGlide);
+        let mut s = String::from("alpha,beta,V,ctrl,CL,CD,CDi,CDv,CY,Cm,Cl_roll,Cn,L/D,Lift_N,Drag_N,Xcp,efficiency,Vz,root_bending");
+        s.push_str(if trimmed { ",elevator_deg\n" } else { "\n" });
         for p in &self.points {
             s.push_str(&format!(
-                "{:.3},{:.3},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{},{:.6},{},{},{:.4},{:.4},{:.5},{:.5},{:.4},{:.5},{:.4}\n",
+                "{:.3},{:.3},{:.4},{:.4},{:.6},{:.6},{:.6},{:.6},{},{:.6},{},{},{:.4},{:.4},{:.5},{:.5},{:.4},{:.5},{:.4}",
                 p.alpha, p.beta, p.velocity, p.ctrl, p.cl, p.cd, p.cdi, p.cdv, opt6(p.cy), p.cm, opt6(p.cr), opt6(p.cn), p.ld(), p.lift, p.drag, p.x_cp, p.efficiency, p.vz(), p.root_bending
             ));
+            if trimmed {
+                s.push(',');
+                s.push_str(&opt6(p.elevator_deg));
+            }
+            s.push('\n');
         }
         s
+    }
+
+    /// Minimum sink and best L/D among the successfully sampled T9 speeds.
+    pub fn trimmed_glide_extrema(&self) -> Option<(&PlaneOpp, &PlaneOpp)> {
+        let points = self.points.iter().filter(|o| o.elevator_deg.is_some());
+        let sink = points.clone().min_by(|a, b| a.vz().total_cmp(&b.vz()))?;
+        let glide = points.max_by(|a, b| a.ld().total_cmp(&b.ld()))?;
+        Some((sink, glide))
     }
 
     /// Map a strip's `wing` index to the corresponding `(plane_wing_index, &Wing)` in `plane`.
@@ -1114,7 +1183,7 @@ impl PlanePolar {
             .collect();
         }
 
-        // Lift-varying sweep (T2, T3, T1, T6, T8): keep positive-lift states whenever any exist.
+        // Lift-varying sweep: keep positive-lift states whenever any exist.
         let pos: Vec<_> = valid.iter().copied().filter(|(_, o, s)| o.cl > 0.05 && s.cl > 0.05).collect();
         if !pos.is_empty() {
             valid = pos;
@@ -1644,6 +1713,7 @@ impl<'a> Ctx<'a> {
             beta,
             velocity: v,
             ctrl: 0.0,
+            elevator_deg: None,
             cl,
             cd,
             cdi,
@@ -1678,7 +1748,7 @@ pub fn mesh_options(def: &PlanePolarDef, extra_flaps: &HashMap<(usize, usize), f
     for (k, v) in extra_flaps {
         *flaps.entry(*k).or_insert(0.0) += v;
     }
-    MeshOptions { thick: def.method.is_panel(), include_fuse: def.include_fuse, flaps, tilts: tilts.clone(), allow_missing_foils: def.allow_missing_foils, triangulate: matches!(def.method, Method::TriPanel | Method::TriLinear), fuse_in_thin: false, flap_normals: matches!(def.method, Method::Vlm1 | Method::Vlm2) }
+    MeshOptions { thick: def.method.is_panel(), include_fuse: def.include_fuse, flaps, tilts: tilts.clone(), allow_missing_foils: def.allow_missing_foils, triangulate: matches!(def.method, Method::TriPanel | Method::TriLinear), fuse_in_thin: false, flap_normals: matches!(def.method, Method::Vlm1 | Method::Vlm2), elevator: None }
 }
 
 /// Build and factor the solver for a mesh.
@@ -1704,7 +1774,7 @@ pub fn envelope_warning(counts: &[usize; 5], what: &str) -> Option<String> {
 
 /// With `strict_envelope`, why a point fails (any clamped or polar-less strip).
 pub fn envelope_failure(def: &PlanePolarDef, o: &PlaneOpp) -> Option<String> {
-    if !def.strict_envelope || !def.viscous {
+    if !(def.strict_envelope || def.kind == PolarKind::TrimmedGlide) || !def.viscous {
         return None;
     }
     let mut counts = [0usize; 5];
@@ -1787,7 +1857,7 @@ fn point_failure(def: &PlanePolarDef, o: &PlaneOpp) -> Option<String> {
 /// Loads of one state through the evaluator, reduced to an operating point,
 /// with its diagnostics, relaxed wake lines and wake report.
 #[allow(clippy::too_many_arguments)]
-fn evaluate(ctx: &Ctx, ev: &Evaluator, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64, prog: &Progress) -> Result<PlaneOpp, PlaneError> {
+pub(crate) fn evaluate(ctx: &Ctx, ev: &Evaluator, cog: Vec3, alpha: f64, beta: f64, v: f64, mass: f64, prog: &Progress) -> Result<PlaneOpp, PlaneError> {
     let wd = wind_dir(alpha, beta);
     let (raw, wrep) = ev.loads(wd, v, Vec3::ZERO, prog)?;
     let mut opp = ctx.reduce(ev.mesh(), &raw, cog, alpha, beta, v, mass, None);
@@ -1831,6 +1901,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
     match def.kind {
         PolarKind::Control => run_control(&ctx, &mut polar, prog, on_point)?,
         PolarKind::Stability => run_stability(&ctx, &mut polar, prog, on_point)?,
+        PolarKind::TrimmedGlide => crate::trimmed_glide::run(&ctx, &mut polar, prog, on_point)?,
         _ => {
             prog.stage("Meshing");
             let mesh = build(plane, db, &mesh_options(def, &HashMap::new(), &HashMap::new()))?;
@@ -1879,7 +1950,7 @@ pub fn run_polar(plane: &Plane, db: &FoilDb, def: &PlanePolarDef, prog: &Progres
         }
     }
     let key = |p: &PlaneOpp| match def.kind {
-        PolarKind::FixedAlpha => p.velocity,
+        PolarKind::FixedAlpha | PolarKind::TrimmedGlide => p.velocity,
         PolarKind::Sideslip => p.beta,
         PolarKind::Control | PolarKind::Stability => p.ctrl,
         PolarKind::List => 0.0,

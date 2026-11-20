@@ -207,6 +207,8 @@ pub struct MeshOptions {
     pub include_fuse: bool,
     /// flap deflections, degrees (+ = trailing edge down), keyed by (wing, flap index)
     pub flaps: HashMap<(usize, usize), f64>,
+    /// Absolute deflection of all hinged flap regions on this elevator wing.
+    pub elevator: Option<(usize, f64)>,
     /// extra tilt per wing (control polars), degrees
     pub tilts: HashMap<usize, f64>,
     /// use a flat plate for foils that are not loaded instead of failing
@@ -379,8 +381,9 @@ pub fn build(plane: &Plane, db: &FoilDb, opt: &MeshOptions) -> Result<Mesh, Plan
                     let side = if left { "left" } else { "right" };
                     mesh.flaps.push(FlapInfo { wing: iw, index: idx, name: format!("{} flap {} ({side})", wing.name, idx + 1), hinge_a: h_a, hinge_b: h_b, left, surf: is, xhinge: xh });
                     flap_id = Some(id);
-                    if let Some(d) = opt.flaps.get(&(iw, idx)) {
-                        strip_flap = *d;
+                    let deflection = opt.elevator.filter(|&(wing, _)| wing == iw).map(|(_, deg)| deg).or_else(|| opt.flaps.get(&(iw, idx)).copied());
+                    if let Some(d) = deflection {
+                        strip_flap = d;
                         if d.abs() > 1e-9 && opt.flap_normals && !opt.thick {
                             // vortex-lattice model: the sheet stays where it is and
                             // the flap panels' normals turn (see MeshOptions::flap_normals)
