@@ -374,6 +374,17 @@ impl Foil {
         0.5 * (u + l)
     }
 
+    /// Thickness-to-chord ratio t/c at chord fraction `xc` (0..1), measured
+    /// on the normalised foil (unit chord, LE at origin, chord along x).
+    pub fn thickness_at(&self, xc: f64) -> f64 {
+        if self.n() < 3 || self.validate().is_err() {
+            return 0.0;
+        }
+        let n = self.normalized();
+        let (u, l) = n.surface_y(xc.clamp(0.0, 1.0));
+        (u - l).max(0.0)
+    }
+
     /// Hash of the normalized coordinates (unit chord, LE at the origin,
     /// de-rotated), quantized to 1e-9 chord.  Name, note and hinge are not
     /// part of it.
@@ -615,6 +626,14 @@ mod tests {
         assert!((p.x_camber - 0.4).abs() < 0.03, "{p:?}");
         let (u, l) = f.surface_y(0.3);
         assert!(u > 0.07 && l < -0.03, "{u} {l}");
+        assert!((f.thickness_at(0.3) - 0.12).abs() < 2e-3, "t(0.3) = {}", f.thickness_at(0.3));
+        // thickness_at is invariant under scaling and translation
+        let mut scaled = f.clone();
+        for i in 0..scaled.n() {
+            scaled.x[i] = scaled.x[i] * 2.5 + 1.0;
+            scaled.y[i] = scaled.y[i] * 2.5 - 0.5;
+        }
+        assert!((scaled.thickness_at(0.3) - f.thickness_at(0.3)).abs() < 1e-9);
     }
 
     #[test]

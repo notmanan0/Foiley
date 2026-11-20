@@ -762,6 +762,137 @@ pub fn analyze_point(foil: &Foil, st: &AnalysisSettings, alpha_or_cl: f64, is_al
     Ok(r)
 }
 
+/// Solve several `(re, alpha_or_cl, is_alpha)` fixed-Reynolds operating points
+/// on one foil, reusing the paneled geometry and inviscid influence matrix
+/// across all points.
+pub fn analyze_points(foil: &Foil, st: &AnalysisSettings, specs: &[(f64, f64, bool)], prog: &Progress) -> Result<Vec<Option<FoilPoint>>, FoilError> {
+    foil.validate()?;
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut fixed = AnalysisSettings { polar_type: PolarType::FixedSpeed, ..st.clone() };
+    for &(re, val, _) in specs {
+        if !val.is_finite() {
+            return Err(FoilError::Geometry("operating point value must be finite".into()));
+        }
+        fixed.re = re;
+        fixed.validate().map_err(FoilError::Geometry)?;
+    }
+    foiley::set_quiet(true);
+    let mut base_xf = setup_engine(foil, &fixed, specs[0].0)?;
+    // Build the geometry-only inviscid panel matrix once for all operating points.
+    let gg_ok = catch_unwind(AssertUnwindSafe(|| {
+        if !base_xf.lgamu || !base_xf.lqaij {
+            base_xf.ggcalc();
+        }
+    }))
+    .is_ok();
+    if !gg_ok {
+        return Ok(vec![None; specs.len()]);
+    }
+    let reset_re = |xf: &mut XFoil, re: f64| {
+        xf.reinf1 = re;
+        let mut r = 0.0;
+        xf.mrcl(1.0, &mut r);
+        xf.comset();
+        xf.lvconv = false;
+        xf.lblini = false;
+        xf.lipan = false;
+        xf.lwake = false;
+    };
+    let it = fixed.max_iter;
+    let solve_step = |xf: &mut XFoil, last_ok: &mut Option<f64>, re: f64, is_alpha: bool, v: f64| -> Result<Option<FoilPoint>, FoilError> {
+        prog.check()?;
+        if let Some(p) = try_solve(xf, is_alpha, eng(is_alpha, v), it) {
+            *last_ok = Some(v);
+            return Ok(Some(p));
+        }
+        if !fixed.viscous || !fixed.recover {
+            *xf = base_xf.clone();
+            reset_re(xf, re);
+            *last_ok = None;
+            return Ok(None);
+        }
+        // 1. fresh BL from inviscid solution, more iterations
+        xf.lblini = false;
+        xf.lipan = false;
+        xf.lvconv = false;
+        if let Some(mut p) = try_solve(xf, is_alpha, eng(is_alpha, v), it * 2) {
+            p.recovered = true;
+            p.recovery = crate::polar::Recovery::ReinitBl;
+            *last_ok = Some(v);
+            return Ok(Some(p));
+        }
+        // 2. march in sub-steps from the last converged point or neighbouring points
+        let unit = if is_alpha { 1.0 } else { 0.1 };
+        let mut starts: Vec<f64> = Vec::new();
+        if let Some(s) = *last_ok {
+            if (s - v).abs() > 1e-9 {
+                starts.push(s);
+            }
+        }
+        let dir = if v < 0.0 { -1.0 } else { 1.0 };
+        for k in [1.0, -1.0, 2.0, -2.0, 4.0] {
+            starts.push(v - k * unit * dir);
+        }
+        let mut tries = 0;
+        for &start in &starts {
+            for nsub in [2usize, 4] {
+                tries += 1;
+                if tries > 6 {
+                    *xf = base_xf.clone();
+                    reset_re(xf, re);
+                    *last_ok = None;
+                    return Ok(None);
+                }
+                prog.check()?;
+                *xf = base_xf.clone();
+                reset_re(xf, re);
+                if try_solve(xf, is_alpha, eng(is_alpha, start), it).is_none() {
+                    continue;
+                }
+                let mut ok = true;
+                for k in 1..nsub {
+                    prog.check()?;
+                    let vk = start + (v - start) * k as f64 / nsub as f64;
+                    if try_solve(xf, is_alpha, eng(is_alpha, vk), it).is_none() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    if let Some(mut p) = try_solve(xf, is_alpha, eng(is_alpha, v), it) {
+                        p.recovered = true;
+                        p.recovery = crate::polar::Recovery::March { substeps: nsub as u32, attempts: tries as u32 };
+                        *last_ok = Some(v);
+                        return Ok(Some(p));
+                    }
+                }
+            }
+        }
+        *xf = base_xf.clone();
+        reset_re(xf, re);
+        *last_ok = None;
+        Ok(None)
+    };
+    let mut out = Vec::with_capacity(specs.len());
+    for &(re, v, is_alpha) in specs {
+        prog.check()?;
+        let mut xf = base_xf.clone();
+        reset_re(&mut xf, re);
+        let mut last_ok = None;
+        // warm up from zero for high angles, matching analyze_point / Marcher
+        if is_alpha && v.abs() > 6.0 && fixed.viscous {
+            let n = (v.abs() / 3.0).floor() as usize;
+            for k in 1..=n {
+                let _ = solve_step(&mut xf, &mut last_ok, re, true, v * k as f64 / (n + 1) as f64)?;
+            }
+        }
+        out.push(solve_step(&mut xf, &mut last_ok, re, is_alpha, v)?);
+    }
+    Ok(out)
+}
+
 /// Inviscid helper used in tests and quick previews.
 pub fn inviscid_cl(foil: &Foil, alpha_deg: f64) -> Option<f64> {
     let st = AnalysisSettings { viscous: false, ..Default::default() };
@@ -824,5 +955,35 @@ mod tests {
         assert!(d.point.xtr_top < d.point.xtr_bot);
         let cl = inviscid_cl(&f, 5.0).unwrap();
         assert!((cl - 0.6).abs() < 0.05, "{cl}");
+    }
+    #[test]
+    fn analyze_points_matches_analyze_point() {
+        let f = Foil::naca("2412").unwrap();
+        let st = AnalysisSettings::default();
+        let specs = [(1.1e5, 0.9, false), (1.8e5, 0.5, false), (2.8e5, 0.2, false), (3.0e4, 12.0, true)];
+        let pts = analyze_points(&f, &st, &specs, &Progress::none()).unwrap();
+        assert_eq!(pts.len(), specs.len());
+        for (&(re, val, is_alpha), got) in specs.iter().zip(&pts) {
+            let single = analyze_point(&f, &AnalysisSettings { re, ..st.clone() }, val, is_alpha, &Progress::none()).unwrap().map(|d| d.point);
+            assert_eq!(got.is_some(), single.is_some(), "parity mismatch at Re {re} val {val} is_alpha {is_alpha}");
+            if let (Some(got), Some(single)) = (got, single) {
+                assert!((got.cd - single.cd).abs() < 1e-8, "cd {} vs {}", got.cd, single.cd);
+                assert!((got.alpha - single.alpha).abs() < 1e-7, "alpha {} vs {}", got.alpha, single.alpha);
+            }
+        }
+        // Order independence (reversed specs yield the same results)
+        let mut rev = specs;
+        rev.reverse();
+        let rev_pts = analyze_points(&f, &st, &rev, &Progress::none()).unwrap();
+        for (a, b) in pts.iter().zip(rev_pts.iter().rev()) {
+            assert_eq!(a.is_some(), b.is_some());
+            if let (Some(a), Some(b)) = (a, b) {
+                assert!((a.cd - b.cd).abs() < 1e-12);
+            }
+        }
+        // Prompt cancellation
+        let c = Progress::new();
+        c.cancel();
+        assert!(matches!(analyze_points(&f, &st, &specs, &c), Err(FoilError::Cancelled)));
     }
 }
