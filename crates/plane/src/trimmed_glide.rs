@@ -15,6 +15,7 @@ const FORCE_TOL: f64 = 1e-6;
 const CM_TOL: f64 = 1e-7;
 const ALPHA_LIMIT: f64 = 30.0;
 
+#[derive(Clone)]
 struct Sample {
     x: f64,
     residual: f64,
@@ -224,13 +225,13 @@ fn solve_speed(
             break;
         }
         if let Some(lo) = previous.take().filter(|lo| !same_sign(lo, &sample)) {
-            solution = root(lo, sample, CM_TOL, at)?;
+            solution = root(lo, sample.clone(), CM_TOL, at)?;
             if solution.is_some() {
                 break;
             }
-        } else {
-            previous = Some(sample);
         }
+        // Keep this station even after a failed bracket so the next interval is still searched.
+        previous = Some(sample);
     }
     let Some(Sample {
         x: deg, mut point, ..
