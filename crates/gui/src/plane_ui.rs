@@ -955,15 +955,15 @@ impl App {
             });
         }
         section(ui, "Aerodynamics", true, |ui| {
+            if d.kind == PolarKind::TrimmedGlide && d.viscous {
+                hint(ui, "Trimmed glide requires 2D polar coverage for every strip.");
+            }
             egui::Grid::new("aero3").num_columns(2).show(ui, |ui| {
                 check(ui, "viscous drag from 2D polars", &mut d.viscous, "adds profile drag interpolated from the foils' polars at each strip's Re and CL");
                 if d.viscous || d.method == Method::Llt {
                     int(ui, "auto polar mesh (Re count)", &mut self.pui.auto_polars, 0..=20, "missing 2D polars are computed automatically over the Re range of this analysis (0 = never)");
                     check(ui, "interpolate by CL (xflr5)", &mut d.viscous_from_cl, "unchecked: interpolate by the section's effective angle of attack");
-                    if d.kind == PolarKind::TrimmedGlide {
-                        hint(ui, "Trimmed glide requires 2D polar coverage for every strip.");
-                        ui.end_row();
-                    } else {
+                    if d.kind != PolarKind::TrimmedGlide {
                         check(ui, "strict 2D polar envelope", &mut d.strict_envelope, "fail a point when any strip's Re or CL falls outside its 2D polars (instead of clamping with a warning)");
                     }
                 }
