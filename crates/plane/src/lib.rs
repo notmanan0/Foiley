@@ -9,7 +9,7 @@
 //! * [`vlm`]: vortex-lattice (horseshoe VLM1 and ring VLM2).
 //! * [`panel`]: constant source/doublet panel method (Dirichlet).
 //! * [`linear_panel`]: Galerkin linear-doublet triangles and a linear TE wake.
-//! * [`analysis`]: polar definitions (types 1-8) and the drivers.
+//! * [`analysis`]: polar definitions and the drivers.
 //! * [`evaluator`]: the wake-aware load evaluator every driver goes through.
 //! * [`stability`]: stability derivatives, state matrices, modes, time response.
 //! * [`xml`]: import of xflr5 / flow5 plane XML files.
@@ -26,6 +26,7 @@ pub mod mesh;
 pub mod panel;
 pub mod provenance;
 pub mod stability;
+mod trimmed_glide;
 pub mod vlm;
 pub mod xml;
 

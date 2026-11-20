@@ -5,6 +5,15 @@ use foiley_core::Progress;
 use foiley_plane::analysis::*;
 use foiley_plane::geom::Plane;
 
+fn set_speed_sweep_inputs(def: &mut PlanePolarDef) {
+    if matches!(def.kind, PolarKind::FixedAlpha | PolarKind::TrimmedGlide) {
+        def.range = Range { from: 5.0, to: 10.0, step: 5.0 };
+    }
+    if def.kind == PolarKind::TrimmedGlide {
+        def.elevator_trim = Some(ElevatorTrim { wing: 1, min_deg: -10.0, max_deg: 10.0 });
+    }
+}
+
 #[test]
 fn f009_t8_zero_speed_rejected() {
     let d = PlanePolarDef { kind: PolarKind::List, free_wake: 0, list: vec![(5.0, 0.0, 0.0)], ..review_def() };
@@ -73,9 +82,7 @@ fn f009_unsupported_settings_rejected() {
                 continue;
             }
             let mut d = PlanePolarDef { method: m, kind: k, beta: 2.0, ground_height: Some(1.0), fuse_drag: true, free_wake: 3, list: vec![(2.0, 1.0, 10.0)], ..review_def() };
-            if k == PolarKind::FixedAlpha {
-                d.range = Range { from: 5.0, to: 10.0, step: 5.0 };
-            }
+            set_speed_sweep_inputs(&mut d);
             d.clear_unsupported();
             assert!(d.unsupported().is_empty(), "{m:?} {k:?}: {:?}", d.unsupported());
             d.validate().unwrap_or_else(|e| panic!("{m:?} {k:?}: {e}"));
@@ -145,9 +152,7 @@ fn f009_cli_and_gui_share_supports_table() {
     for m in Method::ALL {
         for k in PolarKind::ALL {
             let mut d = PlanePolarDef { method: m, kind: k, free_wake: 0, inertia: Some(review_inertia()), list: vec![(2.0, 0.0, 10.0)], ..Default::default() };
-            if k == PolarKind::FixedAlpha {
-                d.range = Range { from: 5.0, to: 10.0, step: 5.0 };
-            }
+            set_speed_sweep_inputs(&mut d);
             assert_eq!(d.validate().is_ok(), m.supports(k, Setting::PolarType), "{m:?} {k:?}: {:?}", d.validate());
         }
     }

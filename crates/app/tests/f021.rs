@@ -4,7 +4,7 @@ use foiley_app::Project;
 use foiley_core::Progress;
 use foiley_foil::batch::{re_list_geometric, run_batch};
 use foiley_foil::{Foil, FoilPoint, FoilPolar};
-use foiley_plane::analysis::{ControlRange, ControlTarget, PolarKind, Range};
+use foiley_plane::analysis::{ControlRange, ControlTarget, ElevatorTrim, PolarKind, Range};
 use foiley_plane::foildb::Envelope;
 use foiley_plane::{run_polar, FamilySelector, Method, PlanePolarDef, WingKind};
 
@@ -134,6 +134,38 @@ fn f021_generates_deflected_families() {
     assert_eq!(o.points.len(), 3, "{:?}", o.failed);
     assert!(o.points.iter().all(|pt| pt.strips.iter().all(|s| !s.flap_clamped)));
     assert!(auto::plan(&plane, &p.foils, &db, &def, 2).unwrap().is_empty());
+}
+
+#[test]
+fn trimmed_glide_plans_viscous_coverage_across_elevator_travel() {
+    let mut project = flapped_project();
+    let plane = project.planes[0].clone();
+    let wing = plane.wings.iter().position(|w| w.kind == WingKind::Elevator).unwrap();
+    let def = PlanePolarDef {
+        kind: PolarKind::TrimmedGlide,
+        elevator_trim: Some(ElevatorTrim { wing, min_deg: -10.0, max_deg: 10.0 }),
+        range: Range { from: 18.0, to: 8.0, step: 2.0 },
+        ..Default::default()
+    };
+    let plan = auto::plan(&plane, &project.foils, &project.foil_db(), &def, 3).unwrap();
+    let tail = plan.coverage.as_ref().unwrap().foils.iter().find(|c| c.foil == "elevator 0009").unwrap();
+    assert_eq!(tail.flaps, [-10.0, -5.0, 5.0, 10.0]);
+
+    // Populate the scheduled families with in-envelope 2D data so this test
+    // tests planning and interpolation without depending on XFoil convergence.
+    for batch in plan.batches {
+        for foil in batch.foils {
+            for case in &batch.cases {
+                project.add_foil_polar(synth(&foil.name, case.re, case.mach, case.ncrit));
+            }
+        }
+    }
+    let db = project.foil_db();
+    assert!(auto::plan(&plane, &project.foils, &db, &def, 3).unwrap().is_empty());
+    let polar = run_polar(&plane, &db, &def, &Progress::none(), &|_| {}).unwrap();
+    assert!(polar.failed.is_empty(), "{:?}", polar.failed);
+    assert_eq!(polar.points.iter().map(|o| o.velocity).collect::<Vec<_>>(), [8.0, 10.0, 12.0, 14.0, 16.0, 18.0]);
+    assert!(polar.points.iter().all(|o| o.cdv > 0.0 && o.elevator_deg.is_some()));
 }
 
 #[test]

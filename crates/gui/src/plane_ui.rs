@@ -10,7 +10,7 @@ use foiley_app::{auto, CadFormat, CadImport, JobId, JobKind, JobManager};
 use foiley_core::atmosphere::{isa, Fluid};
 use foiley_core::hash::Hash32;
 use foiley_core::{Spacing, Vec3};
-use foiley_plane::analysis::{ControlRange, ControlTarget, ExtraDrag, Method, PlaneOpp, PolarKind, RefDims, Setting, StripResult};
+use foiley_plane::analysis::{ControlRange, ControlTarget, ElevatorTrim, ExtraDrag, Method, PlaneOpp, PolarKind, Range, RefDims, Setting, StripResult};
 use foiley_plane::geom::{FuseFrame, PointMass, Wing, WingKind, WingSection};
 use foiley_plane::mesh::{Mesh, MeshOptions};
 use foiley_plane::stability::{modal_initial_state, time_response};
@@ -71,7 +71,7 @@ impl Default for PlaneUi {
             visible: HashSet::new(),
             sel_polar: None,
             sel_point: 0,
-            plots: [(0, 4), (5, 4), (0, 9), (0, 13)],
+            plots: DEFAULT_3D_PLOTS,
             span_var: 0,
             sel_station_wing: 0,
             sel_station_y: None,
@@ -163,7 +163,9 @@ impl PlaneUi {
     }
 }
 
-pub const VARS3: [&str; 20] = ["alpha (deg)", "beta (deg)", "V (m/s)", "control", "CL", "CD", "CDi", "CDv", "CY", "Cm", "Cl (roll)", "Cn (yaw)", "CL/CD", "CL^1.5/CD", "Vz sink (m/s)", "efficiency e", "lift (N)", "drag (N)", "root bending (N.m)", "Xcp (m)"];
+pub const VARS3: [&str; 21] = ["alpha (deg)", "beta (deg)", "V (m/s)", "control", "CL", "CD", "CDi", "CDv", "CY", "Cm", "Cl (roll)", "Cn (yaw)", "CL/CD", "CL^1.5/CD", "Vz sink (m/s)", "efficiency e", "lift (N)", "drag (N)", "root bending (N.m)", "Xcp (m)", "Elevator (deg)"];
+const DEFAULT_3D_PLOTS: [(usize, usize); 4] = [(0, 4), (5, 4), (0, 9), (0, 13)];
+const TRIMMED_GLIDE_PLOTS: [(usize, usize); 4] = [(2, 14), (2, 12), (2, 20), (2, 0)];
 
 /// Value of plot variable `i`; NaN when the point does not have it (LLT
 /// lateral coefficients), and such points are left out of the plots.
@@ -194,35 +196,57 @@ fn var3(o: &PlaneOpp, i: usize) -> f64 {
         16 => o.lift,
         17 => o.drag,
         18 => o.root_bending,
-        _ => o.x_cp,
+        19 => o.x_cp,
+        _ => o.elevator_deg.unwrap_or(f64::NAN),
     }
 }
 
 struct LivePlotPoint {
     order: f64,
+    trimmed: bool,
     values: [f64; VARS3.len()],
 }
 
 impl LivePlotPoint {
     fn new(point: &PlaneOpp) -> Self {
         Self {
-            order: point.alpha + point.velocity + point.ctrl + point.beta,
+            order: if point.elevator_deg.is_some() { point.velocity } else { point.alpha + point.velocity + point.ctrl + point.beta },
+            trimmed: point.elevator_deg.is_some(),
             values: std::array::from_fn(|i| var3(point, i)),
         }
     }
 }
 
 enum PolarPlotPoints<'a> {
-    Completed(&'a [PlaneOpp]),
+    /// The optional increment identifies adjacent points in a T9 sweep.
+    Completed(&'a [PlaneOpp], Option<f64>),
     Running(Vec<LivePlotPoint>),
 }
 
-impl PolarPlotPoints<'_> {
+impl<'a> PolarPlotPoints<'a> {
+    fn completed(polar: &'a PlanePolar) -> Self {
+        let step = polar.def.as_ref().filter(|d| d.kind == PolarKind::TrimmedGlide).map(|d| if d.range.step == 0.0 { 1.0 } else { d.range.step.abs() });
+        Self::Completed(&polar.points, step)
+    }
+
     fn coordinates(&self, x: usize, y: usize) -> Vec<[f64; 2]> {
         let finite = |xy: &[f64; 2]| xy[0].is_finite() && xy[1].is_finite();
         match self {
-            Self::Completed(pts) => pts.iter().map(|o| [var3(o, x), var3(o, y)]).filter(finite).collect(),
+            Self::Completed(pts, _) => pts.iter().map(|o| [var3(o, x), var3(o, y)]).filter(finite).collect(),
             Self::Running(pts) => pts.iter().map(|p| [p.values[x], p.values[y]]).filter(finite).collect(),
+        }
+    }
+
+    fn line_segments(&self, x: usize, y: usize, coordinates: &[[f64; 2]]) -> Vec<Vec<[f64; 2]>> {
+        match self {
+            Self::Completed(pts, Some(step)) => pts.chunk_by(|a, b| (b.velocity - a.velocity).abs() < 1.5 * step)
+                .map(|segment| Self::Completed(segment, None).coordinates(x, y))
+                .filter(|segment| segment.len() > 1)
+                .collect(),
+            // Show solved samples while the sweep runs without joining
+            // them across speeds whose status is not yet known.
+            Self::Running(pts) if pts.first().is_some_and(|p| p.trimmed) => Vec::new(),
+            _ => vec![coordinates.to_vec()],
         }
     }
 }
@@ -238,6 +262,7 @@ fn plane_key(p: &Plane, o: &MeshOptions, project: &foiley_app::Project) -> u64 {
     o.triangulate.hash(&mut h);
     o.fuse_in_thin.hash(&mut h);
     o.flap_normals.hash(&mut h);
+    o.elevator.map(|(wing, deg)| (wing, deg.to_bits())).hash(&mut h);
     let mut f: Vec<_> = o.flaps.iter().map(|(k, v)| (*k, v.to_bits())).collect();
     f.sort();
     f.hash(&mut h);
@@ -824,10 +849,11 @@ impl App {
             d.kind = PolarKind::ALL[k];
             d.clear_unsupported();
             d.range = match d.kind {
-                PolarKind::FixedAlpha => foiley_plane::analysis::Range { from: 8.0, to: 30.0, step: 2.0 },
-                PolarKind::Sideslip => foiley_plane::analysis::Range { from: -10.0, to: 10.0, step: 2.0 },
-                PolarKind::Control | PolarKind::Stability => foiley_plane::analysis::Range { from: 0.0, to: 1.0, step: 0.25 },
-                _ => foiley_plane::analysis::Range { from: -4.0, to: 10.0, step: 1.0 },
+                PolarKind::FixedAlpha => Range { from: 8.0, to: 30.0, step: 2.0 },
+                PolarKind::Sideslip => Range { from: -10.0, to: 10.0, step: 2.0 },
+                PolarKind::Control | PolarKind::Stability => Range { from: 0.0, to: 1.0, step: 0.25 },
+                PolarKind::TrimmedGlide => Range::TRIMMED_GLIDE_DEFAULT,
+                _ => Range { from: -4.0, to: 10.0, step: 1.0 },
             };
         }
         let mut m = Method::ALL.iter().position(|x| *x == d.method).unwrap_or(2);
@@ -866,7 +892,7 @@ impl App {
             if d.kind != PolarKind::List {
                 ui.label(RichText::new(format!("sweep: {}", d.kind.swept())).strong());
                 ui.end_row();
-                let sp = if d.kind == PolarKind::FixedAlpha { 0.5 } else { 0.1 };
+                let sp = if matches!(d.kind, PolarKind::FixedAlpha | PolarKind::TrimmedGlide) { 0.5 } else { 0.1 };
                 num(ui, "  from", &mut d.range.from, sp, -1e4..=1e4, "first value of the swept variable");
                 num(ui, "  to", &mut d.range.to, sp, -1e4..=1e4, "last value");
                 num(ui, "  step", &mut d.range.step, sp * 0.1, 1e-4..=1e4, "increment");
@@ -903,13 +929,43 @@ impl App {
                 gains_editor(ui, &mut d.gains, plane);
             });
         }
+        if d.kind == PolarKind::TrimmedGlide {
+            section(ui, "Elevator trim", true, |ui| {
+                let elevators: Vec<_> = plane.wings.iter().enumerate().filter(|(_, w)| w.kind == WingKind::Elevator && w.two_sided && w.symmetric).collect();
+                if let Some(&(wing, _)) = elevators.first() {
+                    let trim = d.elevator_trim.get_or_insert(ElevatorTrim { wing, min_deg: -10.0, max_deg: 10.0 });
+                    if !elevators.iter().any(|(i, _)| *i == trim.wing) {
+                        trim.wing = wing;
+                    }
+                    egui::Grid::new("trim_elevator").num_columns(2).show(ui, |ui| {
+                        ui.label("Elevator wing");
+                        egui::ComboBox::from_id_salt("trim_elevator_wing").selected_text(&plane.wings[trim.wing].name).show_ui(ui, |ui| {
+                            for &(i, wing) in &elevators {
+                                ui.selectable_value(&mut trim.wing, i, &wing.name);
+                            }
+                        });
+                        ui.end_row();
+                        num_u(ui, "Minimum deflection", &mut trim.min_deg, 0.1, -89.0..=89.0, " deg", "positive deflects the trailing edge down");
+                        num_u(ui, "Maximum deflection", &mut trim.max_deg, 0.1, -89.0..=89.0, " deg", "all hinged sections of the elevator move together");
+                    });
+                } else {
+                    d.elevator_trim = None;
+                    hint(ui, "Add a symmetric, two-sided elevator wing with hinged foil sections in Plane design.");
+                }
+            });
+        }
         section(ui, "Aerodynamics", true, |ui| {
+            if d.kind == PolarKind::TrimmedGlide && d.viscous {
+                hint(ui, "Trimmed glide requires 2D polar coverage for every strip.");
+            }
             egui::Grid::new("aero3").num_columns(2).show(ui, |ui| {
                 check(ui, "viscous drag from 2D polars", &mut d.viscous, "adds profile drag interpolated from the foils' polars at each strip's Re and CL");
                 if d.viscous || d.method == Method::Llt {
                     int(ui, "auto polar mesh (Re count)", &mut self.pui.auto_polars, 0..=20, "missing 2D polars are computed automatically over the Re range of this analysis (0 = never)");
                     check(ui, "interpolate by CL (xflr5)", &mut d.viscous_from_cl, "unchecked: interpolate by the section's effective angle of attack");
-                    check(ui, "strict 2D polar envelope", &mut d.strict_envelope, "fail a point when any strip's Re or CL falls outside its 2D polars (instead of clamping with a warning)");
+                    if d.kind != PolarKind::TrimmedGlide {
+                        check(ui, "strict 2D polar envelope", &mut d.strict_envelope, "fail a point when any strip's Re or CL falls outside its 2D polars (instead of clamping with a warning)");
+                    }
                 }
                 widgets::check_on(ui, on_fdrag, "fuselage friction drag", &mut d.fuse_drag, "turbulent skin friction x form factor on the fuselage wetted area");
                 if d.method.is_panel() {
@@ -1087,7 +1143,15 @@ impl App {
             return;
         }
         let title = format!("{} - {}", plane.name, def.name);
+        if def.kind == PolarKind::TrimmedGlide && self.pui.plots == DEFAULT_3D_PLOTS {
+            self.pui.plots = TRIMMED_GLIDE_PLOTS;
+        }
         if (def.viscous || def.method == Method::Llt) && auto_polars > 0 {
+            if def.kind == PolarKind::TrimmedGlide {
+                let job = JobKind::PrepareAutoPolars { plane: plane.clone(), foils: self.project.foils.clone(), db, def: def.clone(), count: auto_polars, defaults: foil_defaults.clone() };
+                self.submit(format!("2D polars for {}", plane.name), job, Pending::AutoPolarsThen(Box::new((plane.clone(), def, PolarTarget::new(plane)))));
+                return;
+            }
             match auto::plan_with_defaults(plane, &self.project.foils, &db, &def, auto_polars, foil_defaults) {
                 Ok(plan) if !plan.is_empty() => {
                     self.notify(format!("computing {} first", plan.describe()), false);
@@ -1120,8 +1184,10 @@ impl App {
         let foils = polar.map(|p| p.renamed.foils.clone()).unwrap_or_default();
         let base_options = foiley_plane::analysis::mesh_options(def, &HashMap::new(), &HashMap::new());
         let (options, baseline) = if let Some(point) = point {
-            let (options, deflected) = point_mesh_options(def, point.ctrl);
-            (options, deflected.then_some(base_options))
+            let (mut options, deflected) = point_mesh_options(def, point.ctrl);
+            options.elevator = def.elevator_trim.zip(point.elevator_deg).filter(|(_, deg)| *deg != 0.0).map(|(trim, deg)| (trim.wing, deg));
+            let baseline = (deflected || options.elevator.is_some()).then_some(base_options);
+            (options, baseline)
         } else {
             (base_options, None)
         };
@@ -1202,9 +1268,11 @@ impl App {
     fn results_3d(&mut self, ui: &mut egui::Ui, plane: &Plane) {
         let selected = self.selected_plane_polar_index();
         let sel = selected.map(|i| &self.project.plane_polars[i]);
+        if self.pui.plots == DEFAULT_3D_PLOTS && sel.and_then(|p| p.def.as_ref()).is_some_and(|d| d.kind == PolarKind::TrimmedGlide) {
+            self.pui.plots = TRIMMED_GLIDE_PLOTS;
+        }
         let w = ui.available_width();
-        let h = ui.available_height();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.pui.show_3d, "3D view");
             if let Some(p) = sel {
                 if !p.points.is_empty() {
@@ -1214,6 +1282,9 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.pui.sel_point, 0..=n - 1).show_value(false));
                     let o = &p.points[self.pui.sel_point];
                     ui.label(RichText::new(format!("alpha {:.2}  V {:.2}  CL {:.4}  CD {:.5}  Cm {:.4}  L/D {:.1}", o.alpha, o.velocity, o.cl, o.cd, o.cm, o.ld())).strong());
+                    if let Some(deg) = o.elevator_deg {
+                        ui.label(format!("Elevator {deg:+.2}°"));
+                    }
                     for wn in o.warnings.iter().take(2) {
                         ui.label(RichText::new("!").color(Color32::from_rgb(230, 160, 60))).on_hover_text(wn);
                     }
@@ -1223,11 +1294,21 @@ impl App {
                 }
             }
         });
-        let mut series: Vec<_> = self.project.plane_polars
-            .iter()
-            .filter(|p| self.pui.visible.contains(&(p.plane.clone(), p.name.clone())))
-            .map(|p| (format!("{} {}", p.plane, p.name), PolarPlotPoints::Completed(&p.points)))
-            .collect();
+        let mut series = Vec::new();
+        for p in self.project.plane_polars.iter().filter(|p| self.pui.visible.contains(&(p.plane.clone(), p.name.clone()))) {
+            if p.def.as_ref().is_some_and(|d| d.kind == PolarKind::TrimmedGlide) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("{} {}", p.plane, p.name)).color(series_color(series.len())));
+                    if let Some((sink, glide)) = p.trimmed_glide_extrema() {
+                        ui.label(format!("Min sampled sink {:.3} m/s at {:.1} m/s · Best sampled L/D {:.1} at {:.1} m/s", sink.vz(), sink.velocity, glide.ld(), glide.velocity));
+                    }
+                    if !p.failed.is_empty() {
+                        ui.label(format!("{} speeds unavailable", p.failed.len())).on_hover_text(p.failed.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
+                    }
+                });
+            }
+            series.push((format!("{} {}", p.plane, p.name), PolarPlotPoints::completed(p)));
+        }
         for j in self.jobs.jobs() {
             if self.current_job(j.id) && j.kind == "3D polar" && !j.status().is_finished() {
                 // Snapshot the selectable plot values, then release the job lock before sorting and drawing.
@@ -1241,7 +1322,10 @@ impl App {
                 }
             }
         }
+        let h = ui.available_height();
         let top_h = if self.pui.show_3d { h * 0.5 } else { h * 0.62 };
+        // The colour-keyed trim summaries already name these curves.
+        let show_legend = series.len() <= 5 && !series.iter().all(|(_, points)| matches!(points, PolarPlotPoints::Completed(_, Some(_))));
         let mut clicked: Option<usize> = None;
         egui::Grid::new("plots3").num_columns(2).show(ui, |ui| {
             for k in 0..4 {
@@ -1256,18 +1340,20 @@ impl App {
                     });
                     let (xv, yv) = self.pui.plots[k];
                     let mut plot = Plot::new(format!("p3{k}")).height(top_h / 2.0 - 34.0);
-                    if series.len() <= 5 {
+                    if show_legend {
                         plot = plot.legend(Legend::default().position(egui_plot::Corner::RightBottom));
                     }
                     plot.x_axis_label(VARS3[xv]).y_axis_label(VARS3[yv]).show(ui, |pu| {
                         for (i, (name, pts)) in series.iter().enumerate() {
                             let xy = pts.coordinates(xv, yv);
                             let col = series_color(i);
-                            let mut l = Line::new(name.clone(), PlotPoints::from(xy.clone())).color(col);
-                            if matches!(pts, PolarPlotPoints::Running(_)) {
-                                l = l.style(egui_plot::LineStyle::dashed_dense());
+                            for (segment, values) in pts.line_segments(xv, yv, &xy).into_iter().enumerate() {
+                                let mut line = Line::new(name.clone(), PlotPoints::from(values)).id(egui::Id::new((name, segment))).color(col);
+                                if matches!(pts, PolarPlotPoints::Running(_)) {
+                                    line = line.style(egui_plot::LineStyle::dashed_dense());
+                                }
+                                pu.line(line);
                             }
-                            pu.line(l);
                             pu.points(Points::new(name.clone(), PlotPoints::from(xy)).radius(2.5_f32).color(col));
                         }
                         if let Some(p) = sel {
@@ -2102,12 +2188,23 @@ mod plot_regressions {
         let mut points: Vec<_> = completed.iter().rev().map(LivePlotPoint::new).collect();
         points.sort_by(|a, b| a.order.total_cmp(&b.order));
         let running = PolarPlotPoints::Running(points);
-        let completed = PolarPlotPoints::Completed(&completed);
+        let completed = PolarPlotPoints::Completed(&completed, None);
 
         for (y, label) in VARS3.iter().enumerate() {
             assert_eq!(running.coordinates(0, y), completed.coordinates(0, y), "{label}");
         }
         assert_eq!(running.coordinates(0, 8), [[3.0, 0.1]]);
+    }
+
+    #[test]
+    fn trimmed_glide_plots_break_at_a_missing_speed() {
+        let def = PlanePolarDef { kind: PolarKind::TrimmedGlide, range: Range { from: 8.0, to: 12.0, step: 1.0 }, ..Default::default() };
+        let points = [8.0, 9.0, 11.0, 12.0].into_iter().map(|velocity| PlaneOpp { velocity, elevator_deg: Some(2.0), ..Default::default() }).collect();
+        let polar = PlanePolar { def: Some(def), points, ..Default::default() };
+        let series = PolarPlotPoints::completed(&polar);
+        let (x, y) = TRIMMED_GLIDE_PLOTS[2];
+        let xy = series.coordinates(x, y);
+        assert_eq!(series.line_segments(x, y, &xy), [vec![[8.0, 2.0], [9.0, 2.0]], vec![[11.0, 2.0], [12.0, 2.0]]]);
     }
 }
 

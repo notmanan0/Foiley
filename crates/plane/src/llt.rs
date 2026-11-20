@@ -287,6 +287,7 @@ pub fn run(ctx: &Ctx, prog: &Progress, on_point: &(dyn Fn(&PlaneOpp) + Sync), fa
             beta: 0.0,
             velocity: v,
             ctrl: 0.0,
+            elevator_deg: None,
             cl: cl_t,
             cd: cdi_t + cdv_t,
             cdi: cdi_t,

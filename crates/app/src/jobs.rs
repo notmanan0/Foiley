@@ -17,7 +17,7 @@ use foiley_foil::{analyze, AnalysisSettings, Foil, FoilPolar, Sweep};
 use foiley_plane::mesh::{build, Mesh, MeshOptions};
 use foiley_plane::cad::Tri;
 use foiley_plane::{run_polar, FoilDb, Fuse, Plane, PlaneOpp, PlanePolar, PlanePolarDef};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,6 +37,8 @@ pub enum JobKind {
     Batch { foils: Vec<Foil>, cases: Vec<BatchCase>, settings: AnalysisSettings, sweep: Sweep },
     /// the batches of an `auto::plan`, one after the other (output: `Batch`)
     AutoPolars { batches: Vec<crate::auto::AutoBatch> },
+    /// Plan and generate the 2D polars on the worker (output: `Batch`).
+    PrepareAutoPolars { plane: Plane, foils: Vec<Foil>, db: Arc<FoilDb>, def: PlanePolarDef, count: usize, defaults: HashMap<String, AnalysisSettings> },
     PlanePolar { plane: Plane, db: FoilDb, def: PlanePolarDef },
     Mesh { plane: Plane, db: FoilDb, options: MeshOptions },
     /// Hash a mesh for comparison with a 3D polar's manifest; `foils` maps
@@ -148,7 +150,7 @@ impl JobKind {
         match self {
             JobKind::FoilPolar { .. } => "2D polar",
             JobKind::FoilPoint { .. } => "2D point",
-            JobKind::Batch { .. } | JobKind::AutoPolars { .. } => "2D batch",
+            JobKind::Batch { .. } | JobKind::AutoPolars { .. } | JobKind::PrepareAutoPolars { .. } => "2D batch",
             JobKind::PlanePolar { .. } => "3D polar",
             JobKind::Mesh { .. } => "mesh",
             JobKind::MeshHash { .. } => "mesh verification",
@@ -388,29 +390,14 @@ fn execute(job: &Job, kind: JobKind, notify: &Notify) -> Result<JobOutput, Strin
             }
             Ok(JobOutput::Batch(out))
         }
-        JobKind::AutoPolars { batches } => {
-            let n = batches.len();
-            let mut out = Vec::new();
-            let mut errs = 0;
-            for (k, b) in batches.iter().enumerate() {
-                let res = run_batch(&b.foils, &b.cases, &b.settings, &b.sweep, &p.part(k, n), &|r| {
-                    if let Ok(pol) = &r.polar {
-                        job.partial.lock().unwrap().foil_polars.push(pol.clone());
-                        notify();
-                    }
-                });
-                p.check().map_err(|e| e.to_string())?;
-                for r in res {
-                    match r.polar {
-                        Ok(pol) => out.push(pol),
-                        Err(_) => errs += 1,
-                    }
-                }
+        JobKind::AutoPolars { batches } => execute_auto_batches(job, &batches, p, notify),
+        JobKind::PrepareAutoPolars { plane, foils, db, def, count, defaults } => {
+            p.stage("Planning 2D polar coverage");
+            let plan = crate::auto::plan_with_progress(&plane, &foils, &db, &def, count, &defaults, &p.sub(0.0, 0.1))?;
+            if !plan.is_empty() {
+                p.info(format!("computing {}", plan.describe()));
             }
-            if errs > 0 {
-                p.warn(format!("{errs} polar(s) failed"));
-            }
-            Ok(JobOutput::Batch(out))
+            execute_auto_batches(job, &plan.batches, &p.sub(0.1, 1.0), notify)
         }
         JobKind::PlanePolar { plane, db, def } => {
             let pol = run_polar(&plane, &db, &def, p, &|o| {
@@ -466,6 +453,30 @@ fn execute(job: &Job, kind: JobKind, notify: &Notify) -> Result<JobOutput, Strin
             Ok(JobOutput::MeshHash(hash))
         }
     }
+}
+
+fn execute_auto_batches(job: &Job, batches: &[crate::auto::AutoBatch], progress: &Progress, notify: &Notify) -> Result<JobOutput, String> {
+    let mut out = Vec::new();
+    let mut errors = 0;
+    for (i, batch) in batches.iter().enumerate() {
+        let results = run_batch(&batch.foils, &batch.cases, &batch.settings, &batch.sweep, &progress.part(i, batches.len()), &|r| {
+            if let Ok(polar) = &r.polar {
+                job.partial.lock().unwrap().foil_polars.push(polar.clone());
+                notify();
+            }
+        });
+        progress.check().map_err(|e| e.to_string())?;
+        for result in results {
+            match result.polar {
+                Ok(polar) => out.push(polar),
+                Err(_) => errors += 1,
+            }
+        }
+    }
+    if errors > 0 {
+        progress.warn(format!("{errors} polar(s) failed"));
+    }
+    Ok(JobOutput::Batch(out))
 }
 
 #[cfg(test)]
