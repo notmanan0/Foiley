@@ -1502,6 +1502,23 @@ fn real_main() -> Result<(), String> {
                         chosen.chord,
                         chosen.foil.as_deref().unwrap_or("-")
                     );
+                    // The 2D flow settings come from the flags, not the 3D polar; say so
+                    // when they disagree with the foil family the polar was run on.
+                    if let Some(def) = &polar.def {
+                        let fam = &def.family;
+                        let a = &st.analysis;
+                        let differs = |s: Option<f64>, v: f64| s.is_some_and(|s| (s - v).abs() > 1e-9);
+                        if differs(fam.mach, a.mach) || differs(fam.ncrit, a.ncrit) || differs(fam.xtr_top, a.xtr_top) || differs(fam.xtr_bot, a.xtr_bot) {
+                            eprintln!(
+                                "  note: 3D polar used foil family {} but this run uses M={} Ncrit={} xtr={},{}; pass --mach/--ncrit/--xtr to match",
+                                fam.describe(),
+                                a.mach,
+                                a.ncrit,
+                                a.xtr_top,
+                                a.xtr_bot
+                            );
+                        }
+                    }
                     st.operating_points = regimes.iter().map(|sp| sp.to_default_operating_point()).collect();
                 }
                 for spec in &op {

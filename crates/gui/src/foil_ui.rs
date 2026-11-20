@@ -1412,7 +1412,6 @@ impl App {
         self.fui.opt_from_3d.span_pos = Some(actual_y);
         self.fui.opt_from_3d.selected_points = selected.clone();
         self.fui.opt_from_3d.force_open = Some(true);
-        self.fui.opt_multipoint = true;
         self.fui.opt_force_open = Some(true);
         self.fui.opt_scroll_to = true;
         self.module = crate::Module::FoilDesign;
@@ -1421,6 +1420,7 @@ impl App {
             self.notify("selected 3D polar has no valid operating points at this station", true);
             return;
         }
+        self.fui.opt_multipoint = true;
         self.apply_3d_station_points(&polar_key, wing, actual_y, &selected);
     }
 
@@ -1509,15 +1509,19 @@ impl App {
             self.fui.preview = None;
             self.fui.opt_save_name = self.project.unique_foil_name(&format!("{foil_name} opt"));
             // Inherit resolved Mach/Ncrit/trips/wake controls so 2D and 3D agree.
-            if let Some(src) = &source_analysis {
+            // With no resolvable source, reset the controls the optimiser panel does not
+            // show so an earlier station's trips/wake cannot silently carry over.
+            let d = AnalysisSettings::default();
+            let src = source_analysis.as_ref().unwrap_or(&d);
+            if source_analysis.is_some() {
                 self.fui.opt.analysis.mach = src.mach;
                 self.fui.opt.analysis.ncrit = src.ncrit;
-                self.fui.opt.analysis.ncrit_bot = src.ncrit_bot;
-                self.fui.opt.analysis.xtr_top = src.xtr_top;
-                self.fui.opt.analysis.xtr_bot = src.xtr_bot;
-                self.fui.opt.analysis.wake_length = src.wake_length;
-                self.fui.opt.analysis.wake_dissipation = src.wake_dissipation;
             }
+            self.fui.opt.analysis.ncrit_bot = src.ncrit_bot;
+            self.fui.opt.analysis.xtr_top = src.xtr_top;
+            self.fui.opt.analysis.xtr_bot = src.xtr_bot;
+            self.fui.opt.analysis.wake_length = src.wake_length;
+            self.fui.opt.analysis.wake_dissipation = src.wake_dissipation;
             // Set a practical default spar thickness constraint without panicking on thin foils.
             if let Some(f) = self.project.foil(&foil_name) {
                 let spar_x = self.fui.opt.spar.map(|sp| sp.x).unwrap_or(0.30);
@@ -1706,8 +1710,8 @@ impl App {
                         ui.checkbox(&mut op.enabled, "");
                         ui.add(egui::TextEdit::singleline(&mut op.label).desired_width(68.0).hint_text(format!("OP {}", i + 1)));
                         let re_sp = (op.re * 0.01).max(100.0);
-                        ui.add(egui::DragValue::new(&mut op.re).speed(re_sp).range(1e3..=1e8).max_decimals(0));
-                        ui.add(egui::DragValue::new(&mut op.cl).speed(0.01).range(-2.0..=2.5).fixed_decimals(3));
+                        ui.add(egui::DragValue::new(&mut op.re).speed(re_sp).range(1.001e3..=1e8).max_decimals(0));
+                        ui.add(egui::DragValue::new(&mut op.cl).speed(0.01).range(-3.0..=3.5).fixed_decimals(3));
                         ui.horizontal(|ui| {
                             let mut gi = match op.goal {
                                 DragGoal::Minimise => 0,
@@ -1824,6 +1828,29 @@ impl App {
                 num(ui, "  flap max (deg)", b, 0.5, -30.0..=30.0, "");
             }
         });
+        // Trips, bottom Ncrit and wake are inherited from a 3D station's polar but have
+        // no control here; show them whenever they differ from the defaults.
+        let d = AnalysisSettings::default();
+        let a = &o.analysis;
+        let hidden_changed = a.ncrit_bot.is_some()
+            || a.xtr_top != d.xtr_top
+            || a.xtr_bot != d.xtr_bot
+            || a.wake_length != d.wake_length
+            || a.wake_dissipation != d.wake_dissipation;
+        if hidden_changed {
+            let nb = a.ncrit_bot.map(|n| format!("Ncrit bottom {n:.1}, ")).unwrap_or_default();
+            let text = format!("inherited from 3D polar: {nb}trips x/c {:.2}/{:.2}, wake {:.2}/{:.2}", a.xtr_top, a.xtr_bot, a.wake_length, a.wake_dissipation);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(text).weak());
+                if ui.small_button("reset").on_hover_text("restore free transition and default wake").clicked() {
+                    o.analysis.ncrit_bot = d.ncrit_bot;
+                    o.analysis.xtr_top = d.xtr_top;
+                    o.analysis.xtr_bot = d.xtr_bot;
+                    o.analysis.wake_length = d.wake_length;
+                    o.analysis.wake_dissipation = d.wake_dissipation;
+                }
+            });
+        }
 
         if !self.fui.opt_multipoint {
             ui.label(RichText::new("objectives").strong());
